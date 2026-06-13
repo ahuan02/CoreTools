@@ -3,13 +3,15 @@ package com.szh;
 import com.szh.ui.MainFrame;
 import org.bytedeco.opencv.opencv_core.Mat;
 import org.bytedeco.opencv.opencv_core.Size;
-import static org.bytedeco.opencv.global.opencv_imgproc.resize;
+
 import javax.imageio.ImageIO;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.util.Objects;
+
+import static org.bytedeco.opencv.global.opencv_imgproc.resize;
 
 public class Start {
     public static void main(String[] args) {
@@ -18,7 +20,7 @@ public class Start {
             // 设置程序图标
             try {
                 BufferedImage icon = ImageIO.read(
-                        Objects.requireNonNull(Start.class.getResourceAsStream("/donna.jpg")));
+                        Objects.requireNonNull(Start.class.getResourceAsStream("/icon.png")));
                 frame.setIconImage(icon);
             } catch (IOException | IllegalArgumentException e) {
                 System.err.println("加载图标失败: " + e.getMessage());

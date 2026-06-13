@@ -1,9 +1,12 @@
 package com.szh.ui;
+
 import com.formdev.flatlaf.FlatLaf;
 import com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme;
 import com.szh.manager.ConfigManager;
-import com.szh.service.UdpService;
-import com.szh.ui.panel.*;
+import com.szh.ui.panel.AbstractCommandPanel;
+import com.szh.ui.panel.TcpPanel;
+import com.szh.ui.panel.UdpPanel;
+import com.szh.ui.panel.VideoStreamPanel;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -19,15 +22,11 @@ import java.util.Map;
 
 public class MainFrame extends JFrame {
 
-    private JTextField hostField;
-    private JTextField portField;
-    private JTextField rtspField;
     private JTextPane logPane;
     private StyleContext logStyleContext;
     private Style logStyleSend, logStyleOk, logStyleErr, logStyleTimeout, logStyleTime;
-    private final UdpService udpService = new UdpService();
     private final Map<String, AbstractCommandPanel> panels = new LinkedHashMap<>();
-    private VideoPreviewPanel videoPanel1, videoPanel2;
+    private VideoStreamPanel videoStreamPanel;
     private final ConfigManager config = new ConfigManager("app_config.properties");
     private String currentThemeClassName;
 
@@ -38,7 +37,7 @@ public class MainFrame extends JFrame {
         setJMenuBar(createMenuBar());
         loadConfig();
 
-        setTitle("DONAA软件调试工具");
+        setTitle("CoreTools");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setSize(1280, 780);
         setLocationRelativeTo(null);
@@ -70,32 +69,40 @@ public class MainFrame extends JFrame {
         UIManager.put("Component.focusWidth", 0.6f);
     }
 
+    private UdpPanel udpPanel;
+    private TcpPanel tcpPanel;
+
     private void initUI() {
         JPanel root = new JPanel(new BorderLayout(8, 8));
         root.setBorder(new EmptyBorder(10, 10, 10, 10));
 
-        // 顶部连接配置
-        root.add(createHeaderPanel(), BorderLayout.NORTH);
-
-        // 中间：左右分栏（左侧控制面板 + 右侧视频预览）
+        // 中间：左右分栏（左侧Tab + 右侧客户端列表）
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         splitPane.setDividerSize(6);
-        splitPane.setResizeWeight(0.55);
+        splitPane.setResizeWeight(0.72);
 
         // 左侧 Tab 页
         JTabbedPane tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
         enableSmoothTabScrolling(tabbedPane);
-        addTab(tabbedPane,"UDP+TCP", new NetworkPanel());
+
+        // UDP Tab
+        udpPanel = new UdpPanel();
+        addTab(tabbedPane, "UDP", udpPanel);
+
+        // TCP Tab
+        tcpPanel = new TcpPanel();
+        addTab(tabbedPane, "TCP", tcpPanel);
+
+        // 视频流 Tab
+        videoStreamPanel = new VideoStreamPanel();
+        videoStreamPanel.setLogCallback(msg -> appendLog(msg, logStyleOk));
+        addTab(tabbedPane, "视频流", videoStreamPanel);
+
         splitPane.setLeftComponent(tabbedPane);
-        // 右侧视频预览
-        videoPanel1 = new VideoPreviewPanel("视频流");
-        videoPanel1.setLogCallback(msg -> appendLog(msg, logStyleOk));
-        JSplitPane videoSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
-        videoSplit.setDividerSize(6);
-        videoSplit.setResizeWeight(0.5);
-        videoSplit.setTopComponent(videoPanel1);
-        splitPane.setRightComponent(videoSplit);
+
+        // 右侧客户端列表
+        splitPane.setRightComponent(createClientListPanel());
 
         root.add(splitPane, BorderLayout.CENTER);
 
@@ -105,50 +112,35 @@ public class MainFrame extends JFrame {
         setContentPane(root);
     }
 
+    /** 创建右侧客户端列表面板 */
+    private JPanel createClientListPanel() {
+        JPanel panel = new JPanel(new BorderLayout(4, 4));
+        panel.setMinimumSize(new Dimension(180, 100));
+
+        // 上下分栏：UDP 客户端列表在上，TCP 客户端列表在下，各占一半
+        JSplitPane clientSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        clientSplitPane.setDividerSize(6);
+        clientSplitPane.setResizeWeight(0.5);
+
+        // UDP 服务端客户端列表
+        JScrollPane udpScroll = udpPanel.getUdpClientListScroll();
+        if (udpScroll != null) {
+            clientSplitPane.setTopComponent(udpScroll);
+        }
+
+        // TCP 服务端客户端列表
+        JScrollPane tcpScroll = tcpPanel.getTcpClientListScroll();
+        if (tcpScroll != null) {
+            clientSplitPane.setBottomComponent(tcpScroll);
+        }
+
+        panel.add(clientSplitPane, BorderLayout.CENTER);
+        return panel;
+    }
+
     private void addTab(JTabbedPane tabbedPane, String title, AbstractCommandPanel panel) {
         panels.put(title, panel);
         tabbedPane.addTab(title, panel);
-    }
-
-    private JPanel createHeaderPanel() {
-        JPanel wrapper = new JPanel();
-        wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.Y_AXIS));
-
-        // ---- 第一行：设备IP + 端口 ----
-        JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 4));
-        row1.add(new JLabel("设备IP:"));
-        hostField = new JTextField("127.0.0.1", 10);
-        row1.add(hostField);
-        row1.add(new JLabel("端口:"));
-        portField = new JTextField("9000", 5);
-        row1.add(portField);
-        wrapper.add(row1);
-
-        // ---- 第二行：可见光 RTSP ----
-        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 4));
-        row2.add(new JLabel("视频流:"));
-        rtspField = new JTextField("rtmp://liteavapp.qcloud.com/live/liteavdemoplayerstreamid", 32);
-        JButton connectBtn1 = new JButton("连接");
-        connectBtn1.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
-        connectBtn1.setFocusPainted(false);
-        connectBtn1.addActionListener(e -> {
-            String url = rtspField.getText().trim();
-            if (!url.isEmpty()) {
-                new Thread(() -> {
-                    SwingUtilities.invokeLater(() -> appendLog("视频流 连接中: " + url, logStyleSend));
-                    videoPanel1.startPlayback(url);
-                }, "connect-1").start();
-            }
-        });
-        JButton stopBtn1 = new JButton("断开");
-        stopBtn1.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
-        stopBtn1.setFocusPainted(false);
-        stopBtn1.addActionListener(e -> new Thread(videoPanel1::stopPlayback, "disconnect-1").start());
-        row2.add(rtspField);
-        row2.add(connectBtn1);
-        row2.add(stopBtn1);
-        wrapper.add(row2);
-        return wrapper;
     }
 
     private JPanel createLogPanel() {
@@ -199,7 +191,7 @@ public class MainFrame extends JFrame {
         logPane.setComponentPopupMenu(popupMenu);
 
         JScrollPane scrollPane = new JScrollPane(logPane);
-        scrollPane.setPreferredSize(new Dimension(780, 160));
+        scrollPane.setPreferredSize(new Dimension(780, 260));
         scrollPane.getVerticalScrollBar().setUnitIncrement(16);
         scrollPane.getVerticalScrollBar().setBlockIncrement(80);
         enableSmoothScrolling(scrollPane);
@@ -275,37 +267,6 @@ public class MainFrame extends JFrame {
         });
     }
 
-    // ==================== 发送指令 ====================
-    private void sendCmd(String cmd) {
-        String host = hostField.getText().trim();
-        String portText = portField.getText().trim();
-
-        if (host.isEmpty() || portText.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请填写设备IP和端口", "提示", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
-        int port;
-        try {
-            port = Integer.parseInt(portText);
-        } catch (NumberFormatException e) {
-            JOptionPane.showMessageDialog(this, "端口号格式错误", "提示", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
-        appendLog(">>> " + cmd, logStyleSend);
-
-        udpService.send(host, port, cmd, response -> {
-            if (response.startsWith("OK")) {
-                appendLog("<<< " + response, logStyleOk);
-            } else if (response.startsWith("TIMEOUT")) {
-                appendLog("<<< 超时: 无响应 (3秒)", logStyleTimeout);
-            } else {
-                appendLog("<<< " + response, logStyleErr);
-            }
-        });
-    }
-
     private final SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS");
     /** 日志最大行数，超过后自动裁掉旧行 */
     private static final int MAX_LOG_LINES = 2000;
@@ -338,9 +299,6 @@ public class MainFrame extends JFrame {
     // ==================== 配置持久化 ====================
 
     private void loadConfig() {
-        hostField.setText(config.get("main.host", "127.0.0.1"));
-        portField.setText(config.get("main.port", "9000"));
-        rtspField.setText(config.get("main.rtsp", "rtmp://liteavapp.qcloud.com/live/liteavdemoplayerstreamid"));
         // 通知各面板加载配置
         for (AbstractCommandPanel panel : panels.values()) {
             panel.loadConfig(config);
@@ -348,9 +306,6 @@ public class MainFrame extends JFrame {
     }
 
     private void saveConfig() {
-        config.set("main.host", hostField.getText().trim());
-        config.set("main.port", portField.getText().trim());
-        config.set("main.rtsp", rtspField.getText().trim());
         config.set("theme", currentThemeClassName);
         // 通知各面板保存配置
         for (AbstractCommandPanel panel : panels.values()) {
