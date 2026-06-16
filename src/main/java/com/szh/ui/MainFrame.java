@@ -3,28 +3,18 @@ package com.szh.ui;
 import com.formdev.flatlaf.FlatLaf;
 import com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme;
 import com.szh.manager.ConfigManager;
-import com.szh.ui.panel.AbstractCommandPanel;
-import com.szh.ui.panel.TcpPanel;
-import com.szh.ui.panel.UdpPanel;
-import com.szh.ui.panel.VideoStreamPanel;
+import com.szh.ui.panel.*;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.border.TitledBorder;
-import javax.swing.text.*;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 public class MainFrame extends JFrame {
 
-    private JTextPane logPane;
-    private StyleContext logStyleContext;
-    private Style logStyleSend, logStyleOk, logStyleErr, logStyleTimeout, logStyleTime;
     private final Map<String, AbstractCommandPanel> panels = new LinkedHashMap<>();
     private VideoStreamPanel videoStreamPanel;
     private final ConfigManager config = new ConfigManager("app_config.properties");
@@ -53,14 +43,18 @@ public class MainFrame extends JFrame {
     }
 
     private void initGlobalFont() {
-        Font font = new Font("Microsoft YaHei", Font.PLAIN, 12);
+        currentFontFamily = config.get("font.family", "Microsoft YaHei");
+        String sizeStr = config.get("font.size", "13");
+        try { currentFontSize = Integer.parseInt(sizeStr); } catch (NumberFormatException e) { currentFontSize = 13; }
+
+        Font font = new Font(currentFontFamily, Font.PLAIN, currentFontSize);
         UIManager.put("defaultFont", font);
         UIManager.put("Label.font", font);
-        UIManager.put("Button.font", font.deriveFont(11.5f));
+        UIManager.put("Button.font", font.deriveFont(currentFontSize - 0.5f));
         UIManager.put("TextField.font", font);
         UIManager.put("ComboBox.font", font);
-        UIManager.put("TitledBorder.font", new Font("Microsoft YaHei", Font.BOLD, 12));
-        UIManager.put("TabbedPane.font", new Font("Microsoft YaHei", Font.BOLD, 12));
+        UIManager.put("TitledBorder.font", new Font(currentFontFamily, Font.BOLD, currentFontSize));
+        UIManager.put("TabbedPane.font", new Font(currentFontFamily, Font.BOLD, currentFontSize));
 
         // FlatLaf 细粒度按钮样式：更小巧精致
         UIManager.put("Button.arc", 6);
@@ -69,135 +63,101 @@ public class MainFrame extends JFrame {
         UIManager.put("Component.focusWidth", 0.6f);
     }
 
-    private UdpPanel udpPanel;
-    private TcpPanel tcpPanel;
-
     private void initUI() {
         JPanel root = new JPanel(new BorderLayout(8, 8));
         root.setBorder(new EmptyBorder(10, 10, 10, 10));
 
-        // 中间：左右分栏（左侧Tab + 右侧客户端列表）
-        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
-        splitPane.setDividerSize(6);
-        splitPane.setResizeWeight(0.72);
-
-        // 左侧 Tab 页
+        // Tab 页
         JTabbedPane tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
         enableSmoothTabScrolling(tabbedPane);
 
+        // HTTP 请求 Tab
+        HttpPanel httpPanel = new HttpPanel();
+        addTab(tabbedPane, "HTTP", httpPanel);
+
         // UDP Tab
-        udpPanel = new UdpPanel();
+        UdpPanel udpPanel = new UdpPanel();
         addTab(tabbedPane, "UDP", udpPanel);
 
         // TCP Tab
-        tcpPanel = new TcpPanel();
+        TcpPanel tcpPanel = new TcpPanel();
         addTab(tabbedPane, "TCP", tcpPanel);
 
-        // 视频流 Tab
+        // WebSocket Tab
+        WebSocketPanel wsPanel = new WebSocketPanel();
+        addTab(tabbedPane, "WebSocket", wsPanel);
+
+        // Telnet Tab
+        TelnetPanel telnetPanel = new TelnetPanel();
+        addTab(tabbedPane, "Telnet", telnetPanel);
+
+        // 视频流 Tab（内置发送/响应日志）
         videoStreamPanel = new VideoStreamPanel();
-        videoStreamPanel.setLogCallback(msg -> appendLog(msg, logStyleOk));
         addTab(tabbedPane, "视频流", videoStreamPanel);
 
-        splitPane.setLeftComponent(tabbedPane);
+        // 串口调试 Tab
+        SerialPanel serialPanel = new SerialPanel();
+        addTab(tabbedPane, "串口调试", serialPanel);
 
-        // 右侧客户端列表
-        splitPane.setRightComponent(createClientListPanel());
+        // 数据编码转换 Tab
+        DataConvertPanel convertPanel = new DataConvertPanel();
+        addTab(tabbedPane, "数据编码转换", convertPanel);
 
-        root.add(splitPane, BorderLayout.CENTER);
+        // 网络诊断 Tab
+        NetDiagnosePanel diagPanel = new NetDiagnosePanel();
+        addTab(tabbedPane, "Ping/DNS", diagPanel);
 
-        // 底部日志
-        root.add(createLogPanel(), BorderLayout.SOUTH);
+        // 扫描 Tab
+        ScanPanel scanPanel = new ScanPanel();
+        addTab(tabbedPane, "网络扫描", scanPanel);
+
+        // 日志查看 Tab
+        LogViewerPanel logViewerPanel = new LogViewerPanel();
+        addTab(tabbedPane, "日志查看", logViewerPanel);
+
+        // 十六进制查看 Tab
+        HexViewerPanel hexViewerPanel = new HexViewerPanel();
+        addTab(tabbedPane, "Hex查看", hexViewerPanel);
+
+        // 文件批量处理 Tab
+        BatchFilePanel batchFilePanel = new BatchFilePanel();
+        addTab(tabbedPane, "文件处理", batchFilePanel);
+
+        // 数据库客户端 Tab
+        DatabasePanel dbPanel = new DatabasePanel();
+        addTab(tabbedPane, "数据库", dbPanel);
+
+        // Redis 客户端 Tab
+        RedisPanel redisPanel = new RedisPanel();
+        addTab(tabbedPane, "Redis", redisPanel);
+
+        // 系统监控 Tab
+        SystemMonitorPanel sysMonitorPanel = new SystemMonitorPanel();
+        addTab(tabbedPane, "系统监控", sysMonitorPanel);
+
+        // 监听 tab 切换：控制系统监控面板的启停
+        tabbedPane.addChangeListener(e -> {
+            Component selected = tabbedPane.getSelectedComponent();
+            for (Map.Entry<String, AbstractCommandPanel> entry : panels.entrySet()) {
+                if (entry.getValue() instanceof SystemMonitorPanel smp) {
+                    if (entry.getValue() == selected) {
+                        smp.startMonitoring();
+                    } else {
+                        smp.stopMonitoring();
+                    }
+                }
+            }
+        });
+
+        root.add(tabbedPane, BorderLayout.CENTER);
 
         setContentPane(root);
-    }
-
-    /** 创建右侧客户端列表面板 */
-    private JPanel createClientListPanel() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        panel.setMinimumSize(new Dimension(180, 100));
-
-        // 上下分栏：UDP 客户端列表在上，TCP 客户端列表在下，各占一半
-        JSplitPane clientSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
-        clientSplitPane.setDividerSize(6);
-        clientSplitPane.setResizeWeight(0.5);
-
-        // UDP 服务端客户端列表
-        JScrollPane udpScroll = udpPanel.getUdpClientListScroll();
-        if (udpScroll != null) {
-            clientSplitPane.setTopComponent(udpScroll);
-        }
-
-        // TCP 服务端客户端列表
-        JScrollPane tcpScroll = tcpPanel.getTcpClientListScroll();
-        if (tcpScroll != null) {
-            clientSplitPane.setBottomComponent(tcpScroll);
-        }
-
-        panel.add(clientSplitPane, BorderLayout.CENTER);
-        return panel;
     }
 
     private void addTab(JTabbedPane tabbedPane, String title, AbstractCommandPanel panel) {
         panels.put(title, panel);
         tabbedPane.addTab(title, panel);
-    }
-
-    private JPanel createLogPanel() {
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setBorder(BorderFactory.createTitledBorder(
-                BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
-                "发送 / 响应日志",
-                TitledBorder.LEADING,
-                TitledBorder.TOP,
-                new Font("Microsoft YaHei", Font.BOLD, 13)
-        ));
-
-        logPane = new JTextPane();
-        logPane.setEditable(false);
-        logPane.setBackground(new Color(0x1E1E1E));
-        logPane.setCaretColor(new Color(0xD4D4D4));
-
-        // 创建样式
-        logStyleContext = new StyleContext();
-        Style defaultStyle = logStyleContext.addStyle("default", null);
-        StyleConstants.setFontFamily(defaultStyle, "Consolas");
-        StyleConstants.setFontSize(defaultStyle, 13);
-        StyleConstants.setForeground(defaultStyle, new Color(0xD4D4D4));
-
-        logStyleSend = logStyleContext.addStyle("send", defaultStyle);
-        StyleConstants.setForeground(logStyleSend, new Color(0x64B5F6));
-
-        logStyleOk = logStyleContext.addStyle("ok", defaultStyle);
-        StyleConstants.setForeground(logStyleOk, new Color(0x81C784));
-
-        logStyleErr = logStyleContext.addStyle("err", defaultStyle);
-        StyleConstants.setForeground(logStyleErr, new Color(0xE57373));
-
-        logStyleTimeout = logStyleContext.addStyle("timeout", defaultStyle);
-        StyleConstants.setForeground(logStyleTimeout, new Color(0xFFB74D));
-
-        logStyleTime = logStyleContext.addStyle("time", defaultStyle);
-        StyleConstants.setForeground(logStyleTime, new Color(0x888888));
-        StyleConstants.setFontSize(logStyleTime, 11);
-
-        logPane.setDocument(new DefaultStyledDocument(logStyleContext));
-
-        // 右键菜单：清除日志
-        JPopupMenu popupMenu = new JPopupMenu();
-        JMenuItem clearItem = new JMenuItem("清除日志");
-        clearItem.addActionListener(e -> logPane.setText(""));
-        popupMenu.add(clearItem);
-        logPane.setComponentPopupMenu(popupMenu);
-
-        JScrollPane scrollPane = new JScrollPane(logPane);
-        scrollPane.setPreferredSize(new Dimension(780, 260));
-        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        scrollPane.getVerticalScrollBar().setBlockIncrement(80);
-        enableSmoothScrolling(scrollPane);
-        panel.add(scrollPane, BorderLayout.CENTER);
-
-        return panel;
     }
 
     // ==================== Tab 滚轮切换 ====================
@@ -267,35 +227,6 @@ public class MainFrame extends JFrame {
         });
     }
 
-    private final SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS");
-    /** 日志最大行数，超过后自动裁掉旧行 */
-    private static final int MAX_LOG_LINES = 2000;
-    private int logLineCount = 0;
-
-    private void appendLog(String msg, Style style) {
-        try {
-            Document doc = logPane.getDocument();
-            // 超过最大行数时删除前 500 行，保持插入性能稳定
-            if (logLineCount >= MAX_LOG_LINES) {
-                Element root = doc.getDefaultRootElement();
-                int endLine = Math.min(500, root.getElementCount() - 1);
-                if (endLine > 0) {
-                    Element endElem = root.getElement(endLine);
-                    int endOffset = endElem.getEndOffset();
-                    doc.remove(0, endOffset);
-                    logLineCount -= endLine;
-                }
-            }
-            String time = "[" + sdf.format(new Date()) + "] ";
-            doc.insertString(doc.getLength(), time, logStyleTime);
-            doc.insertString(doc.getLength(), msg + "\n", style);
-            logLineCount++;
-            logPane.setCaretPosition(doc.getLength());
-        } catch (BadLocationException e) {
-            e.printStackTrace();
-        }
-    }
-
     // ==================== 配置持久化 ====================
 
     private void loadConfig() {
@@ -307,6 +238,8 @@ public class MainFrame extends JFrame {
 
     private void saveConfig() {
         config.set("theme", currentThemeClassName);
+        config.set("font.family", currentFontFamily);
+        config.set("font.size", String.valueOf(currentFontSize));
         // 通知各面板保存配置
         for (AbstractCommandPanel panel : panels.values()) {
             panel.saveConfig(config);
@@ -351,9 +284,12 @@ public class MainFrame extends JFrame {
                 getRootPane().repaint();
             });
         } catch (Exception ex) {
-            appendLog("切换主题失败: " + ex.getMessage(), logStyleErr);
+            System.err.println("切换主题失败: " + ex.getMessage());
         }
     }
+
+    private String currentFontFamily;
+    private int currentFontSize;
 
     /** 构建菜单栏，含主题选择 */
     private JMenuBar createMenuBar() {
@@ -361,7 +297,7 @@ public class MainFrame extends JFrame {
 
         // ---- 主题菜单 ----
         JMenu themeMenu = new JMenu("主题");
-        ButtonGroup group = new ButtonGroup();
+        ButtonGroup themeGroup = new ButtonGroup();
 
         // {显示名, 完整类名, "Dark"/"Light"}
         String[][] themes = {
@@ -409,7 +345,7 @@ public class MainFrame extends JFrame {
 
             JRadioButtonMenuItem item = new JRadioButtonMenuItem(name);
             item.addActionListener(e -> switchTheme(cls));
-            group.add(item);
+            themeGroup.add(item);
 
             if (cls.equals(currentThemeClassName)) {
                 item.setSelected(true);
@@ -422,6 +358,115 @@ public class MainFrame extends JFrame {
         themeMenu.add(lightMenu);
         bar.add(themeMenu);
 
+        // ---- 字体菜单 ----
+        JMenu fontMenu = new JMenu("字体");
+
+        // 字体族子菜单
+        JMenu familyMenu = new JMenu("字体族");
+        ButtonGroup familyGroup = new ButtonGroup();
+        String[] families = {
+                "Microsoft YaHei", "Consolas", "JetBrains Mono", "Fira Code",
+                "Source Code Pro", "Cascadia Code", "Monaco", "Courier New", "SimSun", "FangSong"
+        };
+
+        String savedFamily = config.get("font.family", "Microsoft YaHei");
+        currentFontFamily = savedFamily;
+        for (String f : families) {
+            JRadioButtonMenuItem item = new JRadioButtonMenuItem(f);
+            item.addActionListener(e -> switchFontFamily(f));
+            familyGroup.add(item);
+            if (f.equals(currentFontFamily)) item.setSelected(true);
+            familyMenu.add(item);
+        }
+        fontMenu.add(familyMenu);
+
+        // 字号子菜单
+        JMenu sizeMenu = new JMenu("字号");
+        ButtonGroup sizeGroup = new ButtonGroup();
+        int[] sizes = {10, 11, 12, 13, 14, 15, 16, 18, 20};
+
+        String savedSize = config.get("font.size", "13");
+        try { currentFontSize = Integer.parseInt(savedSize); } catch (NumberFormatException e) { currentFontSize = 13; }
+        for (int s : sizes) {
+            JRadioButtonMenuItem item = new JRadioButtonMenuItem(String.valueOf(s));
+            item.addActionListener(e -> switchFontSize(s));
+            sizeGroup.add(item);
+            if (s == currentFontSize) item.setSelected(true);
+            sizeMenu.add(item);
+        }
+        fontMenu.add(sizeMenu);
+
+        bar.add(fontMenu);
+
         return bar;
+    }
+
+    /** 切换字体族 */
+    private void switchFontFamily(String family) {
+        currentFontFamily = family;
+        applyFont();
+        config.set("font.family", family);
+    }
+
+    /** 切换字号 */
+    private void switchFontSize(int size) {
+        currentFontSize = size;
+        applyFont();
+        config.set("font.size", String.valueOf(size));
+    }
+
+    /** 应用当前字体到全局 */
+    private void applyFont() {
+        Font font = new Font(currentFontFamily, Font.PLAIN, currentFontSize);
+        UIManager.put("defaultFont", font);
+        UIManager.put("Label.font", font);
+        UIManager.put("Button.font", font.deriveFont(currentFontSize - 0.5f));
+        UIManager.put("TextField.font", font);
+        UIManager.put("ComboBox.font", font);
+        UIManager.put("TitledBorder.font", new Font(currentFontFamily, Font.BOLD, currentFontSize));
+        UIManager.put("TabbedPane.font", new Font(currentFontFamily, Font.BOLD, currentFontSize));
+
+        // 更新 NetUtil 中的全局字体引用
+        com.szh.ui.panel.NetUtil.updateFont(currentFontFamily, currentFontSize);
+
+        // 递归刷新所有组件字体
+        SwingUtilities.updateComponentTreeUI(this);
+        updateAllFonts(getContentPane(), font);
+
+        SwingUtilities.invokeLater(() -> {
+            getRootPane().revalidate();
+            getRootPane().repaint();
+        });
+    }
+
+    /** 递归遍历组件树，更新所有手动设置过字体的组件 */
+    private void updateAllFonts(Container root, Font font) {
+        for (Component c : root.getComponents()) {
+            if (c instanceof javax.swing.JTable) {
+                c.setFont(new Font(currentFontFamily, Font.PLAIN, currentFontSize));
+                ((javax.swing.JTable) c).setRowHeight(currentFontSize + 10);
+                ((javax.swing.JTable) c).getTableHeader().setFont(new Font(currentFontFamily, Font.PLAIN, currentFontSize));
+            } else if (c instanceof org.fife.ui.rsyntaxtextarea.RSyntaxTextArea) {
+                c.setFont(font);
+            } else if (c instanceof javax.swing.JTextPane || c instanceof javax.swing.JTextArea) {
+                c.setFont(font);
+            } else if (c instanceof javax.swing.JLabel) {
+                // 只更新非 emoji 字体
+                String family = c.getFont().getFamily();
+                if (!"Segoe UI Emoji".equals(family)) {
+                    c.setFont(new Font(currentFontFamily, c.getFont().getStyle(), currentFontSize));
+                }
+            } else if (c instanceof javax.swing.JButton) {
+                java.awt.Font old = c.getFont();
+                if (!"Segoe UI Emoji".equals(old.getFamily())) {
+                    c.setFont(new Font(currentFontFamily, old.getStyle(), currentFontSize));
+                }
+            } else if (c instanceof javax.swing.JComboBox) {
+                c.setFont(font);
+            }
+            if (c instanceof Container) {
+                updateAllFonts((Container) c, font);
+            }
+        }
     }
 }

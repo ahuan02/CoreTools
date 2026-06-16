@@ -50,11 +50,6 @@ public class UdpPanel extends AbstractCommandPanel {
         add(split, BorderLayout.CENTER);
     }
 
-    /** 获取 UDP 服务端客户端列表的 ScrollPane */
-    public JScrollPane getUdpClientListScroll() {
-        return udpServerPanel.getClientListScroll();
-    }
-
     // ==================== UDP 服务端 ====================
 
     private class UdpServerPanel extends JPanel {
@@ -73,6 +68,7 @@ public class UdpPanel extends AbstractCommandPanel {
         private DefaultListModel<String> clientListModel;
         private JList<String> clientList;
         private final Map<String, String> clientNicknames = new ConcurrentHashMap<>();
+        private final java.util.Set<String> shownIps = new java.util.HashSet<>();
 
         UdpServerPanel() {
             setLayout(new BorderLayout(4, 4));
@@ -142,8 +138,24 @@ public class UdpPanel extends AbstractCommandPanel {
             topArea.add(topPanel, BorderLayout.NORTH);
             topArea.add(replyPanel, BorderLayout.SOUTH);
 
-            add(topArea, BorderLayout.NORTH);
-            add(createLogScroll(logPane), BorderLayout.CENTER);
+            // 左侧：控件区 + 日志
+            JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
+            leftPanel.add(topArea, BorderLayout.NORTH);
+            leftPanel.add(createLogScroll(logPane), BorderLayout.CENTER);
+
+            // 右侧：客户端列表
+            JScrollPane clientScroll = new JScrollPane(clientList);
+            clientScroll.setBorder(BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
+                    "客户端列表", TitledBorder.LEADING, TitledBorder.TOP,
+                    new Font("Microsoft YaHei", Font.BOLD, 11)));
+            clientScroll.setPreferredSize(new Dimension(150, 100));
+
+            // 服务端整体：左右分栏
+            JSplitPane serverSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, clientScroll);
+            serverSplit.setResizeWeight(0.82);
+            serverSplit.setDividerSize(4);
+            add(serverSplit, BorderLayout.CENTER);
 
             btnStart.addActionListener(e -> {
                 int port;
@@ -199,7 +211,7 @@ public class UdpPanel extends AbstractCommandPanel {
 
                                 boolean isNew = !recentClients.containsKey(clientKey);
                                 recentClients.put(clientKey, new InetSocketAddress(sender.getAddress(), clientPort));
-                                if (isNew) {
+                                if (isNew && shownIps.add(clientIp)) {
                                     SwingUtilities.invokeLater(() -> clientListModel.addElement(clientIp));
                                 }
 
@@ -276,21 +288,13 @@ public class UdpPanel extends AbstractCommandPanel {
             }
         }
 
-        JScrollPane getClientListScroll() {
-            JScrollPane scroll = new JScrollPane(clientList);
-            scroll.setBorder(BorderFactory.createTitledBorder(
-                    BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
-                    "UDP 客户端", TitledBorder.LEADING, TitledBorder.TOP,
-                    new Font("Microsoft YaHei", Font.BOLD, 11)));
-            return scroll;
-        }
-
         private void stopServer() {
             running.set(false);
             try { if (selector != null) selector.close(); } catch (IOException ignored) {}
             try { if (serverChannel != null) serverChannel.close(); } catch (IOException ignored) {}
             recentClients.clear();
             clientNicknames.clear();
+            shownIps.clear();
             SwingUtilities.invokeLater(() -> clientListModel.clear());
             logSys(logPane, "UDP 服务端已停止");
         }

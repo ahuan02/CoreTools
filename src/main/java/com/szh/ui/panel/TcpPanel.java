@@ -48,11 +48,6 @@ public class TcpPanel extends AbstractCommandPanel {
         add(split, BorderLayout.CENTER);
     }
 
-    /** 获取 TCP 服务端客户端列表的 ScrollPane */
-    public JScrollPane getTcpClientListScroll() {
-        return tcpServerPanel.getClientListScroll();
-    }
-
     // ==================== TCP 服务端 ====================
 
     private class TcpServerPanel extends JPanel {
@@ -146,7 +141,23 @@ public class TcpPanel extends AbstractCommandPanel {
             clientList.setForeground(C_RECV);
             clientList.setSelectionBackground(new Color(0x3C3C3C));
             clientList.setSelectionForeground(Color.WHITE);
-            clientList.setFixedCellHeight(20);
+            clientList.setFixedCellHeight(22);
+            clientList.setCellRenderer(new ClientListRenderer());
+            clientList.addMouseListener(new java.awt.event.MouseAdapter() {
+                @Override
+                public void mouseClicked(java.awt.event.MouseEvent e) {
+                    int index = clientList.locationToIndex(e.getPoint());
+                    if (index < 0) return;
+                    java.awt.Rectangle bounds = clientList.getCellBounds(index, index);
+                    if (bounds == null) return;
+                    // 判断点击是否在右侧踢出按钮区域
+                    int btnX = bounds.x + bounds.width - 55;
+                    if (e.getX() >= btnX && e.getX() <= btnX + 50) {
+                        String item = clientListModel.get(index);
+                        kickClient(item);
+                    }
+                }
+            });
 
             logPane = createLogPane();
 
@@ -154,8 +165,24 @@ public class TcpPanel extends AbstractCommandPanel {
             topArea.add(topPanel, BorderLayout.NORTH);
             topArea.add(replyPanel, BorderLayout.SOUTH);
 
-            add(topArea, BorderLayout.NORTH);
-            add(createLogScroll(logPane), BorderLayout.CENTER);
+            // 左侧：控件区 + 日志
+            JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
+            leftPanel.add(topArea, BorderLayout.NORTH);
+            leftPanel.add(createLogScroll(logPane), BorderLayout.CENTER);
+
+            // 右侧：客户端列表
+            JScrollPane clientScroll = new JScrollPane(clientList);
+            clientScroll.setBorder(BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
+                    "客户端列表", TitledBorder.LEADING, TitledBorder.TOP,
+                    new Font("Microsoft YaHei", Font.BOLD, 11)));
+            clientScroll.setPreferredSize(new Dimension(150, 100));
+
+            // 服务端整体：左右分栏
+            JSplitPane serverSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, clientScroll);
+            serverSplit.setResizeWeight(0.82);
+            serverSplit.setDividerSize(4);
+            add(serverSplit, BorderLayout.CENTER);
 
             btnStart.addActionListener(e -> {
                 int port;
@@ -340,15 +367,6 @@ public class TcpPanel extends AbstractCommandPanel {
             }
         }
 
-        JScrollPane getClientListScroll() {
-            JScrollPane scroll = new JScrollPane(clientList);
-            scroll.setBorder(BorderFactory.createTitledBorder(
-                    BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
-                    "TCP 客户端", TitledBorder.LEADING, TitledBorder.TOP,
-                    new Font("Microsoft YaHei", Font.BOLD, 11)));
-            return scroll;
-        }
-
         private void stopServer() {
             running.set(false);
             try { if (selector != null) selector.close(); } catch (IOException ignored) {}
@@ -363,6 +381,86 @@ public class TcpPanel extends AbstractCommandPanel {
             });
             logSys(logPane, "TCP 服务端已停止");
         }
+
+        /** 踢出指定客户端 */
+        private void kickClient(String item) {
+            String display = stripKickBtn(item);
+            int ret = JOptionPane.showConfirmDialog(TcpServerPanel.this,
+                    "确定要踢出客户端 \"" + display + "\" 吗？",
+                    "确认踢出", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (ret != JOptionPane.YES_OPTION) return;
+
+            // 找出对应的 clientId（IP:port 格式）
+            String targetClientId = null;
+            for (Map.Entry<String, SocketChannel> entry : clients.entrySet()) {
+                String ip = entry.getKey().contains(":") ? entry.getKey().substring(0, entry.getKey().lastIndexOf(':')) : entry.getKey();
+                String nickname = clientNicknames.get(ip);
+                String expected = (nickname != null) ? (nickname + "(" + ip + ")") : ip;
+                if (display.equals(expected)) {
+                    targetClientId = entry.getKey();
+                    break;
+                }
+            }
+            if (targetClientId == null) return;
+            SocketChannel sc = clients.remove(targetClientId);
+            if (sc == null) return;
+            TcpClientCtx ctx = clientCtxMap.remove(sc);
+            String ip;
+            try { ip = sc.socket().getInetAddress().getHostAddress(); } catch (Exception e) { ip = "?"; }
+            try { sc.close(); } catch (IOException ignored) {}
+            final String finalIp = ip;
+            SwingUtilities.invokeLater(() -> {
+                clientCountLabel.setText(String.valueOf(clients.size()));
+                String nickname = clientNicknames.remove(finalIp);
+                if (nickname != null) {
+                    clientListModel.removeElement(nickname + "(" + finalIp + ")");
+                } else {
+                    clientListModel.removeElement(finalIp);
+                }
+            });
+            logSys(logPane, "已踢出客户端: " + targetClientId);
+        }
+
+        private static String stripKickBtn(String item) {
+            int idx = item.lastIndexOf("  [");
+            if (idx > 0) return item.substring(0, idx);
+            return item;
+        }
+
+        /** 自定义列表渲染器：左侧显示名称，右侧红色踢出按钮 */
+        private static class ClientListRenderer extends JPanel implements ListCellRenderer<String> {
+            private final JLabel nameLabel;
+            private final JLabel kickLabel;
+
+            ClientListRenderer() {
+                setLayout(new BorderLayout(0, 0));
+                setOpaque(true);
+                nameLabel = new JLabel();
+                nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+                nameLabel.setForeground(new Color(0x81C784));
+                kickLabel = new JLabel("[踢出]");
+                kickLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 10));
+                kickLabel.setForeground(new Color(0xE57373));
+                kickLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 4));
+                add(nameLabel, BorderLayout.CENTER);
+                add(kickLabel, BorderLayout.EAST);
+            }
+
+            @Override
+            public Component getListCellRendererComponent(JList<? extends String> list,
+                    String value, int index, boolean isSelected, boolean cellHasFocus) {
+                String name = stripKickBtn(value);
+                nameLabel.setText(name);
+                if (isSelected) {
+                    setBackground(new Color(0x3C3C3C));
+                    nameLabel.setForeground(Color.WHITE);
+                } else {
+                    setBackground(new Color(0x2D2D2D));
+                    nameLabel.setForeground(new Color(0x81C784));
+                }
+                return this;
+            }
+        }
     }
 
     // ==================== TCP 客户端 ====================
@@ -372,6 +470,7 @@ public class TcpPanel extends AbstractCommandPanel {
         private JTextArea sendArea;
         private JTextPane logPane;
         private JComboBox<String> encCombo, formatCombo;
+        private JButton btnConnect, btnDisconnect;
         private final List<String> history = new ArrayList<>();
         private static final int MAX_HISTORY = 50;
         private SocketChannel channel;
@@ -411,8 +510,8 @@ public class TcpPanel extends AbstractCommandPanel {
             formatCombo = createFormatCombo();
             row2.add(new JLabel("格式:"));
             row2.add(formatCombo);
-            JButton btnConnect = makeBtn("连接", new Color(0x4CAF50));
-            JButton btnDisconnect = makeBtn("断开", new Color(0xF44336));
+            btnConnect = makeBtn("连接", new Color(0x4CAF50));
+            btnDisconnect = makeBtn("断开", new Color(0xF44336));
             btnDisconnect.setEnabled(false);
             row2.add(Box.createHorizontalStrut(6));
             row2.add(btnConnect);
@@ -446,11 +545,10 @@ public class TcpPanel extends AbstractCommandPanel {
             add(topArea, BorderLayout.NORTH);
             add(createLogScroll(logPane), BorderLayout.CENTER);
 
-            btnConnect.addActionListener(e -> connect(btnConnect, btnDisconnect));
+            btnConnect.addActionListener(e -> connect());
             btnDisconnect.addActionListener(e -> {
                 disconnect();
-                btnConnect.setEnabled(true); btnDisconnect.setEnabled(false);
-                hostField.setEnabled(true); portField.setEnabled(true);
+                updateButtonState(false);
             });
             btnSend.addActionListener(e -> doSend());
             btnClear.addActionListener(e -> sendArea.setText(""));
@@ -463,7 +561,17 @@ public class TcpPanel extends AbstractCommandPanel {
             });
         }
 
-        private void connect(JButton connBtn, JButton disBtn) {
+        /** 统一更新按钮和输入框的启用/禁用状态 */
+        private void updateButtonState(boolean isConnected) {
+            SwingUtilities.invokeLater(() -> {
+                btnConnect.setEnabled(!isConnected);
+                btnDisconnect.setEnabled(isConnected);
+                hostField.setEnabled(!isConnected);
+                portField.setEnabled(!isConnected);
+            });
+        }
+
+        private void connect() {
             String host = hostField.getText().trim();
             int port;
             try { port = Integer.parseInt(portField.getText().trim()); }
@@ -484,10 +592,7 @@ public class TcpPanel extends AbstractCommandPanel {
                     selector = Selector.open();
                     channel.register(selector, SelectionKey.OP_CONNECT);
                     connected.set(true);
-                    SwingUtilities.invokeLater(() -> {
-                        connBtn.setEnabled(false); disBtn.setEnabled(true);
-                        hostField.setEnabled(false); portField.setEnabled(false);
-                    });
+                    updateButtonState(true);
                     logSys(logPane, "正在连接 " + host + ":" + port + " ...");
 
                     if (selector.select(5000) > 0) {
@@ -500,13 +605,6 @@ public class TcpPanel extends AbstractCommandPanel {
                                 if (sc.finishConnect()) {
                                     logSys(logPane, "已连接 " + host + ":" + port);
                                     key.interestOps(SelectionKey.OP_READ);
-
-                                    if (!nickname.isEmpty()) {
-                                        String hello = "[" + nickname + "]: \n";
-                                        ByteBuffer out = ByteBuffer.wrap(hello.getBytes(finalCharset));
-                                        while (out.hasRemaining()) sc.write(out);
-                                        logSend(logPane, "发送 → " + hello.trim());
-                                    }
                                 } else {
                                     logErr(logPane, "连接失败");
                                     disconnect();
@@ -569,7 +667,10 @@ public class TcpPanel extends AbstractCommandPanel {
             try { if (selector != null) selector.close(); } catch (IOException ignored) {}
             try { if (channel != null) channel.close(); } catch (IOException ignored) {}
             if (wasConnected) {
-                SwingUtilities.invokeLater(() -> logSys(logPane, "已断开"));
+                SwingUtilities.invokeLater(() -> {
+                    logSys(logPane, "已断开");
+                    updateButtonState(false);
+                });
             }
         }
 

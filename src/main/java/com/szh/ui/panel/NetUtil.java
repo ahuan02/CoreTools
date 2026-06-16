@@ -33,7 +33,12 @@ public class NetUtil {
     public static final Color C_ERR   = new Color(0xE57373);
     public static final Color C_WARN  = new Color(0xFFB74D);
     public static final Color C_BG    = new Color(0x1E1E1E);
-    public static final Font FONT_TEXT = new Font("Microsoft YaHei", Font.PLAIN, 12);
+    public static Font FONT_TEXT = new Font("Microsoft YaHei", Font.PLAIN, 13);
+
+    /** 由 MainFrame 调用，更新全局字体引用 */
+    public static void updateFont(String family, int size) {
+        FONT_TEXT = new Font(family, Font.PLAIN, size);
+    }
 
     // ===== 格式模式 =====
     public static final String[] FORMAT_MODES = {"明文 Text", "十六进制 HEX", "二进制 BIN"};
@@ -174,6 +179,7 @@ public class NetUtil {
     public static JTextPane createLogPane() {
         JTextPane pane = new JTextPane();
         pane.setEditable(false);
+        pane.setFocusable(false);
         pane.setBackground(C_BG);
         pane.setCaretColor(new Color(0xD4D4D4));
         pane.setFont(FONT_TEXT);
@@ -246,7 +252,7 @@ public class NetUtil {
         });
     }
 
-    public static void logSys(JTextPane log, String msg)  { appendLog(log, ts(), msg, C_SYS, null); }
+    public static void logSys(JTextPane log, String msg)  { appendLog( log, ts(), msg, C_SYS, null); }
     public static void logRecv(JTextPane log, String msg)  { appendLog(log, ts(), msg, C_RECV, null); }
     public static void logSend(JTextPane log, String msg)  { appendLog(log, ts(), msg, C_SEND, null); }
     public static void logErr(JTextPane log, String msg)   { appendLog(log, ts(), msg, C_ERR, null); }
@@ -261,6 +267,15 @@ public class NetUtil {
 
     public static void saveField(JTextField f, ConfigManager cfg, String key) {
         cfg.set(key, f.getText().trim());
+    }
+
+    public static void loadField(JCheckBox cb, ConfigManager cfg, String key) {
+        String v = cfg.get(key, null);
+        if (v != null && !v.isEmpty()) cb.setSelected(Boolean.parseBoolean(v));
+    }
+
+    public static void saveField(JCheckBox cb, ConfigManager cfg, String key) {
+        cfg.set(key, String.valueOf(cb.isSelected()));
     }
 
     public static void loadArea(JTextArea a, ConfigManager cfg, String key) {
