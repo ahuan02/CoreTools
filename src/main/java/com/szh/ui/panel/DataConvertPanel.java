@@ -19,7 +19,7 @@ import java.util.Base64;
 import java.util.Date;
 import java.util.TimeZone;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * 数据编码转换工具集：进制转换 / 字符串编码 / Base64 / URL编解码 / 时间戳

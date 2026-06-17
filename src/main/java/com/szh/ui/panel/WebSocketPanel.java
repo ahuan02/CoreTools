@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.*;
 import java.util.concurrent.*;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * WebSocket 面板：客户端 + 服务端合并

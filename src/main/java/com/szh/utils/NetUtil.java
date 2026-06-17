@@ -1,4 +1,4 @@
-package com.szh.ui.panel;
+package com.szh.utils;
 
 import com.szh.manager.ConfigManager;
 
@@ -34,6 +34,7 @@ public class NetUtil {
     public static final Color C_WARN  = new Color(0xFFB74D);
     public static final Color C_BG    = new Color(0x1E1E1E);
     public static Font FONT_TEXT = new Font("Microsoft YaHei", Font.PLAIN, 13);
+    public static Color TEXT_COLOR = Color.WHITE;
 
     /** 由 MainFrame 调用，更新全局字体引用 */
     public static void updateFont(String family, int size) {
@@ -224,6 +225,7 @@ public class NetUtil {
     // ==================== 日志方法 ====================
 
     public static void appendLog(JTextPane log, String prefix, String content, Color cPrefix, Color cContent) {
+        if (log == null) return;
         SwingUtilities.invokeLater(() -> {
             try {
                 StyledDocument doc = log.getStyledDocument();

@@ -12,11 +12,12 @@ import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * 串口调试面板：扫描串口、打开/关闭、收发数据
@@ -45,6 +46,7 @@ public class SerialPanel extends AbstractCommandPanel {
         private JComboBox<String> parityCombo;
         private JComboBox<String> encCombo;
         private JComboBox<String> formatCombo;
+        private JComboBox<String> flowControlCombo;
         private JTextArea sendArea;
         private JTextPane logPane;
         private JButton btnOpen, btnClose, btnRefresh, btnSend;
@@ -93,23 +95,28 @@ public class SerialPanel extends AbstractCommandPanel {
             stopBitsCombo.setPreferredSize(new Dimension(55, 24));
             row1.add(stopBitsCombo);
 
-            row1.add(new JLabel("校验:"));
-            parityCombo = new JComboBox<>(new String[]{"无", "奇校验", "偶校验", "Mark", "Space"});
-            parityCombo.setPreferredSize(new Dimension(70, 24));
-            row1.add(parityCombo);
+        row1.add(new JLabel("校验:"));
+        parityCombo = new JComboBox<>(new String[]{"无", "奇校验", "偶校验", "Mark", "Space"});
+        parityCombo.setPreferredSize(new Dimension(70, 24));
+        row1.add(parityCombo);
 
-            // 第2行：编码 + 格式 + 开关按钮
-            JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-            row2.add(new JLabel("编码:"));
-            encCombo = new JComboBox<>(new String[]{"UTF-8", "GBK", "GB2312", "ISO-8859-1", "ASCII"});
-            encCombo.setPreferredSize(new Dimension(80, 24));
-            row2.add(encCombo);
+        row1.add(new JLabel("流控:"));
+        flowControlCombo = new JComboBox<>(new String[]{"无", "硬件(RTS/CTS)", "Xon/Xoff"});
+        flowControlCombo.setPreferredSize(new Dimension(110, 24));
+        row1.add(flowControlCombo);
 
-            row2.add(new JLabel("格式:"));
-            formatCombo = createFormatCombo();
-            row2.add(formatCombo);
+        // 第2行：编码 + 格式 + 开关按钮
+        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        row2.add(new JLabel("编码:"));
+        encCombo = new JComboBox<>(new String[]{"UTF-8", "GBK", "GB2312", "ISO-8859-1", "ASCII"});
+        encCombo.setPreferredSize(new Dimension(80, 24));
+        row2.add(encCombo);
 
-            btnOpen = makeBtn("打开串口", new Color(0x4CAF50));
+        row2.add(new JLabel("格式:"));
+        formatCombo = createFormatCombo();
+        row2.add(formatCombo);
+
+        btnOpen = makeBtn("打开串口", new Color(0x4CAF50));
             btnClose = makeBtn("关闭串口", new Color(0xF44336));
             btnClose.setEnabled(false);
             row2.add(Box.createHorizontalStrut(8));
@@ -226,6 +233,8 @@ public class SerialPanel extends AbstractCommandPanel {
                 return;
             }
 
+            // 先重新枚举，刷新 jSerialComm 内部缓存，避免设备禁用/启用后获取到失效对象
+            SerialPort.getCommPorts();
             serialPort = SerialPort.getCommPort(portName);
 
             // 波特率
@@ -256,9 +265,24 @@ public class SerialPanel extends AbstractCommandPanel {
             }
 
             serialPort.setComPortParameters(baud, dataBits, stopBits, parity);
+
+            // 流控制
+            switch ((String) Objects.requireNonNull(flowControlCombo.getSelectedItem())) {
+                case "硬件(RTS/CTS)":
+                    serialPort.setFlowControl(SerialPort.FLOW_CONTROL_RTS_ENABLED | SerialPort.FLOW_CONTROL_CTS_ENABLED);
+                    break;
+                case "Xon/Xoff":
+                    serialPort.setFlowControl(SerialPort.FLOW_CONTROL_XONXOFF_IN_ENABLED | SerialPort.FLOW_CONTROL_XONXOFF_OUT_ENABLED);
+                    break;
+                default:
+                    serialPort.setFlowControl(SerialPort.FLOW_CONTROL_DISABLED);
+                    break;
+            }
+
             serialPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 0, 0);
 
-            if (!serialPort.openPort()) {
+            // 设置 OS 级收发缓冲区大小（4096 字节），间接影响 FIFO 行为
+            if (!serialPort.openPort(0, 4096, 4096)) {
                 logErr(logPane, "打开串口失败: " + portName);
                 return;
             }
@@ -266,7 +290,7 @@ public class SerialPanel extends AbstractCommandPanel {
             outputStream = serialPort.getOutputStream();
             opened.set(true);
             updatePortState(true);
-            logSys(logPane, "已打开 " + portName + " " + baud + "/" + dataBits + "/" + stopBitsCombo.getSelectedItem() + "/" + parityCombo.getSelectedItem());
+            logSys(logPane, "已打开 " + portName + " " + baud + "/" + dataBits + "/" + stopBitsCombo.getSelectedItem() + "/" + parityCombo.getSelectedItem() + " 流控:" + flowControlCombo.getSelectedItem());
 
             // 注册数据监听
             serialPort.addDataListener(new SerialPortDataListener() {
@@ -321,6 +345,7 @@ public class SerialPanel extends AbstractCommandPanel {
             if (serialPort != null) {
                 serialPort.removeDataListener();
                 serialPort.closePort();
+                serialPort = null; // 释放引用，避免后续获取到缓存失效对象
             }
             outputStream = null;
             readRemainder.setLength(0);
@@ -337,6 +362,7 @@ public class SerialPanel extends AbstractCommandPanel {
                 dataBitsCombo.setEnabled(!isOpen);
                 stopBitsCombo.setEnabled(!isOpen);
                 parityCombo.setEnabled(!isOpen);
+                flowControlCombo.setEnabled(!isOpen);
                 btnRefresh.setEnabled(!isOpen);
             });
         }
@@ -407,6 +433,7 @@ public class SerialPanel extends AbstractCommandPanel {
         loadCombo(serialPanel.stopBitsCombo, config, "serial.stopBits");
         loadCombo(serialPanel.parityCombo, config, "serial.parity");
         loadCombo(serialPanel.encCombo, config, "serial.enc");
+        loadCombo(serialPanel.flowControlCombo, config, "serial.flowControl");
     }
 
     @Override
@@ -416,5 +443,6 @@ public class SerialPanel extends AbstractCommandPanel {
         saveCombo(serialPanel.stopBitsCombo, config, "serial.stopBits");
         saveCombo(serialPanel.parityCombo, config, "serial.parity");
         saveCombo(serialPanel.encCombo, config, "serial.enc");
+        saveCombo(serialPanel.flowControlCombo, config, "serial.flowControl");
     }
 }

@@ -23,7 +23,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * UDP 调试面板：服务端 + 客户端（Java NIO 非阻塞实现）

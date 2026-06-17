@@ -10,6 +10,7 @@ version = '1.0.0'
 application {
     mainClass = 'com.szh.Start'
     applicationName = 'corTools'
+    applicationDefaultJvmArgs = ['--enable-native-access=ALL-UNNAMED']
 }
 
 // Jar 瘦身：固定名称 + 剔除签名冗余文件
@@ -33,6 +34,7 @@ repositories {
     mavenCentral()
 }
 def javacvVer = '1.5.10'
+def langchain4jVer = '1.16.2'
 dependencies {
     implementation 'com.formdev:flatlaf:3.5.4'
     implementation 'com.formdev:flatlaf-intellij-themes:3.5.4'
@@ -79,6 +81,15 @@ dependencies {
     implementation 'org.pushing-pixels:radiance-svg-transcoder:8.5.0'
     implementation 'org.pushing-pixels:radiance-svg-transcoder-gradle-plugin:8.5.0'
     implementation 'org.pushing-pixels:radiance-theming-debugger:8.5.0'
+    // ---- 各个平台底层信息获取 ----
+    implementation 'com.github.oshi:oshi-benchmark:7.3.1'
+
+    // ---- ssh连接
+    implementation 'org.apache.sshd:sshd-mina:3.0.0-M4'
+
+    // ---- langchain4j
+    implementation "dev.langchain4j:langchain4j-open-ai:${langchain4jVer}"
+    implementation "dev.langchain4j:langchain4j:${langchain4jVer}"
 }
 // 强制 UTF-8 编译
 tasks.compileJava {

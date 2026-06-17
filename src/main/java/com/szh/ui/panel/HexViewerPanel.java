@@ -11,7 +11,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.*;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * 十六进制文件编辑器（简易版）：十六进制 + ASCII 双视图，适合查看二进制文件、固件、报文原始数据

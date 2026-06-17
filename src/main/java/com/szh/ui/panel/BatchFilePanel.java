@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;

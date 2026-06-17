@@ -17,7 +17,7 @@ import java.util.List;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * 日志查看 / 分析工具：分段加载超大文件、关键词过滤高亮、搜索跳转、导出、级别筛选

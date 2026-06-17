@@ -4,6 +4,7 @@ import com.formdev.flatlaf.FlatLaf;
 import com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme;
 import com.szh.manager.ConfigManager;
 import com.szh.ui.panel.*;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -61,6 +62,19 @@ public class MainFrame extends JFrame {
         UIManager.put("Button.minimumWidth", 0);
         UIManager.put("Button.margin", new Insets(3, 10, 3, 10));
         UIManager.put("Component.focusWidth", 0.6f);
+
+        // 全局文字颜色
+        String colorStr = config.get("font.color", "");
+        if (!colorStr.isEmpty()) {
+            try {
+                currentTextColor = new Color(Integer.parseInt(colorStr));
+            } catch (NumberFormatException e) {
+                currentTextColor = Color.WHITE;
+            }
+        } else {
+            currentTextColor = Color.WHITE;
+        }
+        applyTextColor();
     }
 
     private void initUI() {
@@ -71,6 +85,15 @@ public class MainFrame extends JFrame {
         JTabbedPane tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
         enableSmoothTabScrolling(tabbedPane);
+
+        // 系统监控 Tab
+        SystemMonitorPanel sysMonitorPanel = new SystemMonitorPanel();
+        addTab(tabbedPane, "系统监控", sysMonitorPanel);
+
+
+        // 串口调试 Tab
+        SerialPanel serialPanel = new SerialPanel();
+        addTab(tabbedPane, "串口调试", serialPanel);
 
         // HTTP 请求 Tab
         HttpPanel httpPanel = new HttpPanel();
@@ -95,10 +118,6 @@ public class MainFrame extends JFrame {
         // 视频流 Tab（内置发送/响应日志）
         videoStreamPanel = new VideoStreamPanel();
         addTab(tabbedPane, "视频流", videoStreamPanel);
-
-        // 串口调试 Tab
-        SerialPanel serialPanel = new SerialPanel();
-        addTab(tabbedPane, "串口调试", serialPanel);
 
         // 数据编码转换 Tab
         DataConvertPanel convertPanel = new DataConvertPanel();
@@ -132,9 +151,9 @@ public class MainFrame extends JFrame {
         RedisPanel redisPanel = new RedisPanel();
         addTab(tabbedPane, "Redis", redisPanel);
 
-        // 系统监控 Tab
-        SystemMonitorPanel sysMonitorPanel = new SystemMonitorPanel();
-        addTab(tabbedPane, "系统监控", sysMonitorPanel);
+        // SSH Tab
+        SshPanel sshPanel = new SshPanel();
+        addTab(tabbedPane, "SSH", sshPanel);
 
         // 监听 tab 切换：控制系统监控面板的启停
         tabbedPane.addChangeListener(e -> {
@@ -240,6 +259,7 @@ public class MainFrame extends JFrame {
         config.set("theme", currentThemeClassName);
         config.set("font.family", currentFontFamily);
         config.set("font.size", String.valueOf(currentFontSize));
+        config.set("font.color", String.valueOf(currentTextColor.getRGB()));
         // 通知各面板保存配置
         for (AbstractCommandPanel panel : panels.values()) {
             panel.saveConfig(config);
@@ -274,7 +294,7 @@ public class MainFrame extends JFrame {
 
             UIManager.setLookAndFeel(className);
             FlatLaf.updateUILater();
-            initGlobalFont();          // 重新注入字体
+            initGlobalFont();          // 重新注入字体 + 文字颜色
             SwingUtilities.updateComponentTreeUI(this);
             currentThemeClassName = className;
 
@@ -290,6 +310,7 @@ public class MainFrame extends JFrame {
 
     private String currentFontFamily;
     private int currentFontSize;
+    private Color currentTextColor;
 
     /** 构建菜单栏，含主题选择 */
     private JMenuBar createMenuBar() {
@@ -396,6 +417,13 @@ public class MainFrame extends JFrame {
         }
         fontMenu.add(sizeMenu);
 
+        fontMenu.addSeparator();
+
+        // 字体颜色
+        JMenuItem colorItem = new JMenuItem("字体颜色");
+        colorItem.addActionListener(e -> switchTextColor());
+        fontMenu.add(colorItem);
+
         bar.add(fontMenu);
 
         return bar;
@@ -415,6 +443,64 @@ public class MainFrame extends JFrame {
         config.set("font.size", String.valueOf(size));
     }
 
+    /** 打开颜色选择器切换全局文字颜色 */
+    private void switchTextColor() {
+        Color chosen = JColorChooser.showDialog(this, "选择全局文字颜色", currentTextColor);
+        if (chosen != null) {
+            currentTextColor = chosen;
+            NetUtil.TEXT_COLOR = chosen;
+            config.set("font.color", String.valueOf(chosen.getRGB()));
+            applyTextColor();
+        }
+    }
+
+    /** 将当前文字颜色应用到全局 */
+    private void applyTextColor() {
+        NetUtil.TEXT_COLOR = currentTextColor;
+
+        // UIManager 全局前景色覆盖
+        UIManager.put("Label.foreground", currentTextColor);
+        UIManager.put("Button.foreground", currentTextColor);
+        UIManager.put("TextField.foreground", currentTextColor);
+        UIManager.put("TextArea.foreground", currentTextColor);
+        UIManager.put("ComboBox.foreground", currentTextColor);
+        UIManager.put("TitledBorder.titleColor", currentTextColor);
+        UIManager.put("TabbedPane.foreground", currentTextColor);
+        UIManager.put("Table.foreground", currentTextColor);
+        UIManager.put("TableHeader.foreground", currentTextColor);
+        UIManager.put("ToolTip.foreground", currentTextColor);
+        UIManager.put("Tree.foreground", currentTextColor);
+        UIManager.put("List.foreground", currentTextColor);
+
+        SwingUtilities.updateComponentTreeUI(this);
+        updateAllTextColors(getContentPane(), currentTextColor);
+
+        SwingUtilities.invokeLater(() -> {
+            getRootPane().revalidate();
+            getRootPane().repaint();
+        });
+    }
+
+    /** 递归遍历组件树，强制更新所有文字颜色 */
+    private void updateAllTextColors(Container root, Color color) {
+        for (Component c : root.getComponents()) {
+            if (c instanceof javax.swing.JLabel
+                    || c instanceof javax.swing.JTextComponent
+                    || c instanceof javax.swing.JButton
+                    || c instanceof javax.swing.JComboBox
+                    || c instanceof javax.swing.JTable
+                    || c instanceof javax.swing.JTree
+                    || c instanceof javax.swing.JList) {
+                c.setForeground(color);
+            } else if (c instanceof Container) {
+                c.setForeground(color);
+            }
+            if (c instanceof Container) {
+                updateAllTextColors((Container) c, color);
+            }
+        }
+    }
+
     /** 应用当前字体到全局 */
     private void applyFont() {
         Font font = new Font(currentFontFamily, Font.PLAIN, currentFontSize);
@@ -427,7 +513,7 @@ public class MainFrame extends JFrame {
         UIManager.put("TabbedPane.font", new Font(currentFontFamily, Font.BOLD, currentFontSize));
 
         // 更新 NetUtil 中的全局字体引用
-        com.szh.ui.panel.NetUtil.updateFont(currentFontFamily, currentFontSize);
+        NetUtil.updateFont(currentFontFamily, currentFontSize);
 
         // 递归刷新所有组件字体
         SwingUtilities.updateComponentTreeUI(this);

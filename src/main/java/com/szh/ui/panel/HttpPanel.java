@@ -32,7 +32,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import static com.szh.ui.panel.NetUtil.*;
+import static com.szh.utils.NetUtil.*;
 
 /**
  * HTTP 调试面板：GET/POST/PUT/DELETE 请求，支持自定义 Header、请求体、参数
