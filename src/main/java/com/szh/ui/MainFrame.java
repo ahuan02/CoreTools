@@ -8,6 +8,7 @@ import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -85,6 +86,10 @@ public class MainFrame extends JFrame {
         JTabbedPane tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
         enableSmoothTabScrolling(tabbedPane);
+
+        // AI 对话 Tab
+        AiChatPanel aiChatPanel = new AiChatPanel();
+        addTab(tabbedPane, "AI 对话", aiChatPanel);
 
         // 系统监控 Tab
         SystemMonitorPanel sysMonitorPanel = new SystemMonitorPanel();
@@ -484,13 +489,13 @@ public class MainFrame extends JFrame {
     /** 递归遍历组件树，强制更新所有文字颜色 */
     private void updateAllTextColors(Container root, Color color) {
         for (Component c : root.getComponents()) {
-            if (c instanceof javax.swing.JLabel
-                    || c instanceof javax.swing.JTextComponent
-                    || c instanceof javax.swing.JButton
-                    || c instanceof javax.swing.JComboBox
-                    || c instanceof javax.swing.JTable
-                    || c instanceof javax.swing.JTree
-                    || c instanceof javax.swing.JList) {
+            if (c instanceof JLabel
+                    || c instanceof JTextComponent
+                    || c instanceof JButton
+                    || c instanceof JComboBox
+                    || c instanceof JTable
+                    || c instanceof JTree
+                    || c instanceof JList) {
                 c.setForeground(color);
             } else if (c instanceof Container) {
                 c.setForeground(color);
