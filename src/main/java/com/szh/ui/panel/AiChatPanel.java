@@ -1,13 +1,21 @@
 package com.szh.ui.panel;
 
+import com.formdev.flatlaf.extras.FlatSVGIcon;
 import com.szh.entity.ModelConfig;
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
+import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
+import org.pushingpixels.radiance.animation.api.Timeline;
+import org.pushingpixels.radiance.animation.api.Timeline.TimelineState;
+import org.pushingpixels.radiance.animation.api.callback.TimelineCallback;
 
 import javax.swing.*;
 import javax.swing.plaf.basic.BasicComboBoxEditor;
 import java.awt.*;
 import java.awt.event.*;
+import java.net.URL;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -18,12 +26,24 @@ import java.util.List;
 public class AiChatPanel extends AbstractCommandPanel {
 
     // ==================== 聊天组件 ====================
-    private JEditorPane chatPane;
+    private JPanel chatMessagePanel;     // 气泡消息列表容器
+    private JLabel placeholderLabel;     // 空状态占位文字
+    private AnimatedLabel typingLabel;    // "AI 思考中..." 打字指示器（已废弃，思考动画移入气泡内）
+    private Timeline typingTimeline;     // 打字指示器呼吸动画（已废弃）
+    private ChatBubble streamingBubble;   // 当前流式输出中的气泡（用于增量更新）
+    private JPanel streamingWrapper;      // 流式气泡的父级包装容器
     private JTextArea inputArea;
     private JButton sendBtn;
     private JButton clearBtn;
     private JButton addModelBtn;
+    private JLabel editModelBtn;
     private JScrollPane chatScrollPane;
+    private JLayeredPane chatLayeredPane;     // 层级面板，放浮动按钮
+    private JButton scrollToBottomBtn;         // 浮动「滚动到底部」按钮
+    private Timeline scrollBtnTimeline;        // 按钮显隐动画时间线
+
+    /** 流式响应进行中标记，防止过程中打开模态弹窗导致 UI 卡死 */
+    private volatile boolean streamingActive = false;
 
     // ==================== 颜色常量 ====================
     private static final Color C_INPUT_BG   = new Color(0x252525);
@@ -82,8 +102,6 @@ public class AiChatPanel extends AbstractCommandPanel {
     private static final DateTimeFormatter TF = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     // ==================== 布局常量 ====================
-    private static final String CHAT_STYLE =
-        "font-family:Microsoft YaHei;font-size:13px;color:#D4D4D4;padding:12px;";
 
     // ==================== 构造 ====================
     public AiChatPanel() {
@@ -116,7 +134,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         add(southWrapper, BorderLayout.SOUTH);
 
         // 初始占位
-        resetChatHtml();
+        showPlaceholder();
     }
 
     private JTextField createField(int cols) {
@@ -147,7 +165,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         @Override
         protected void paintComponent(Graphics g) {
             super.paintComponent(g);
-            if (prompt != null && getText().isEmpty() && !isFocusOwner()) {
+            if (prompt != null && getText().isEmpty()) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
                 g2.setColor(C_TIME);
@@ -160,26 +178,146 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
-    // ==================== 聊天区域 ====================
-    private JScrollPane createChatArea() {
-        chatPane = new JEditorPane();
-        chatPane.setContentType("text/html");
-        chatPane.setEditable(false);
-        chatPane.setBackground(NetUtil.C_BG);
-        chatPane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, true);
+    /** 带 placeholder 的 JTextArea */
+    private static class PromptTextArea extends JTextArea {
+        private final String prompt;
 
-        chatScrollPane = new JScrollPane(chatPane);
-        chatScrollPane.setBorder(null);
-        chatScrollPane.getViewport().setBackground(NetUtil.C_BG);
-        return chatScrollPane;
+        PromptTextArea(int rows, int cols, String prompt) {
+            super(rows, cols);
+            this.prompt = prompt;
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            if (getText().isEmpty()) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g2.setColor(C_TIME);
+                FontMetrics fm = g2.getFontMetrics();
+                Insets ins = getInsets();
+                int y = fm.getAscent() + ins.top;
+                g2.drawString(prompt, ins.left, y);
+                g2.dispose();
+            }
+        }
     }
 
-    private void resetChatHtml() {
-        chatPane.setText(
-            "<html><body style='" + CHAT_STYLE + "background-color:"
-            + toHex(NetUtil.C_BG) + ";'><div style='text-align:center;padding-top:80px;color:"
-            + toHex(C_TIME) + ";'>AI 对话助手<br/><br/>"
-            + "点击「＋ 添加模型」配置后即可使用</div></body></html>");
+    // ==================== 聊天区域 ====================
+    private JComponent createChatArea() {
+        // 消息气泡列表（垂直排列）
+        chatMessagePanel = new JPanel();
+        chatMessagePanel.setLayout(new BoxLayout(chatMessagePanel, BoxLayout.Y_AXIS));
+        chatMessagePanel.setBackground(NetUtil.C_BG);
+
+        chatScrollPane = new JScrollPane(chatMessagePanel);
+        chatScrollPane.setBorder(null);
+        chatScrollPane.getViewport().setBackground(NetUtil.C_BG);
+        chatScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        chatScrollPane.getVerticalScrollBar().setUnitIncrement(16);
+
+        // 监听滚动：流式期间用户滚上去时显示浮动按钮
+        chatScrollPane.getVerticalScrollBar().addAdjustmentListener(e -> {
+            if (streamingActive) updateScrollToBottomButton();
+        });
+
+        // 层级面板：DEFAULT 层放滚动面板，PALETTE 层放浮动按钮
+        chatLayeredPane = new JLayeredPane();
+
+        chatLayeredPane.add(chatScrollPane, JLayeredPane.DEFAULT_LAYER);
+
+        scrollToBottomBtn = createScrollToBottomFloatingButton();
+        chatLayeredPane.add(scrollToBottomBtn, JLayeredPane.PALETTE_LAYER);
+
+        // 窗口缩放时重设 scrollPane 尺寸并定位按钮
+        chatLayeredPane.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentResized(ComponentEvent e) {
+                chatScrollPane.setBounds(0, 0, chatLayeredPane.getWidth(), chatLayeredPane.getHeight());
+                positionScrollToBottomButton();
+            }
+        });
+
+        return chatLayeredPane;
+    }
+
+    /** 创建浮动「滚动到底部」圆形按钮（绘制圆底+下箭头） */
+    private JButton createScrollToBottomFloatingButton() {
+        JButton btn = new JButton() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                // 半透明圆形背景
+                g2.setColor(new Color(58, 58, 58, 200));
+                g2.fillOval(2, 2, w - 4, h - 4);
+                // 描边
+                g2.setStroke(new BasicStroke(1.5f));
+                g2.setColor(new Color(0x666666));
+                g2.drawOval(2, 2, w - 4, h - 4);
+                // 向下箭头
+                g2.setColor(new Color(0xCCCCCC));
+                g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 18));
+                FontMetrics fm = g2.getFontMetrics();
+                String arrow = "\u2304";
+                int ax = (w - fm.stringWidth(arrow)) / 2;
+                int ay = (h + fm.getAscent() - fm.getDescent()) / 2;
+                g2.drawString(arrow, ax, ay);
+                g2.dispose();
+            }
+        };
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(false);
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        btn.setVisible(false);
+        int btnSize = 42;
+        btn.setSize(btnSize, btnSize);
+        btn.setPreferredSize(new Dimension(btnSize, btnSize));
+        btn.addActionListener(e -> {
+            hideScrollToBottomButton();
+            scrollToBottom();
+        });
+        return btn;
+    }
+
+    private void showPlaceholder() {
+        streamingBubble = null;
+        streamingWrapper = null;
+        chatMessagePanel.removeAll();
+
+        boolean hasModels = modelConfigs != null && !modelConfigs.isEmpty();
+
+        if (hasModels) {
+            // 已配置模型：显示品牌大字
+            placeholderLabel = new JLabel("CoreTools AI", SwingConstants.CENTER);
+            placeholderLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 42));
+            placeholderLabel.setForeground(new Color(0x3A3A3A)); // 浅白色大字
+            placeholderLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+            chatMessagePanel.add(Box.createVerticalGlue());
+            chatMessagePanel.add(placeholderLabel);
+            chatMessagePanel.add(Box.createVerticalGlue());
+        } else {
+            // 未配置模型：显示引导提示
+            placeholderLabel = new JLabel("AI 对话助手", SwingConstants.CENTER);
+            placeholderLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 14));
+            placeholderLabel.setForeground(C_TIME);
+            placeholderLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            JLabel subLabel = new JLabel("点击「＋ 添加模型」配置后即可使用", SwingConstants.CENTER);
+            subLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+            subLabel.setForeground(C_TIME);
+            subLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            chatMessagePanel.add(Box.createVerticalGlue());
+            chatMessagePanel.add(placeholderLabel);
+            chatMessagePanel.add(Box.createVerticalStrut(8));
+            chatMessagePanel.add(subLabel);
+            chatMessagePanel.add(Box.createVerticalGlue());
+        }
+        chatMessagePanel.revalidate();
+        chatMessagePanel.repaint();
     }
 
     // ==================== 输入栏 ====================
@@ -188,18 +326,25 @@ public class AiChatPanel extends AbstractCommandPanel {
         bar.setBackground(C_INPUT_BG);
         bar.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
 
-        // 左侧：模型下拉选择器 + 添加模型按钮
+        // 左侧：模型下拉选择器 + 编辑按钮 + 添加模型按钮
         JPanel leftBtnPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         leftBtnPanel.setOpaque(false);
         leftBtnPanel.add(modelSelector);
+        // 编辑当前选中模型的图标标签
+        editModelBtn = new JLabel(loadEditIcon(24));
+        editModelBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        editModelBtn.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent e) { editSelectedModel(); }
+        });
+        leftBtnPanel.add(editModelBtn);
         addModelBtn = createFilledButton("＋ 添加模型", e -> showAddModelDialog());
         leftBtnPanel.add(addModelBtn);
         bar.add(leftBtnPanel, BorderLayout.WEST);
 
-        // 中间：输入框（小巧单行）
+        // 中间：输入框（带 placeholder）
         JPanel centerPanel = new JPanel(new BorderLayout());
         centerPanel.setOpaque(false);
-        inputArea = new JTextArea(1, 0);
+        inputArea = new PromptTextArea(1, 0, "输入消息，Enter 发送");
         inputArea.setFont(NetUtil.FONT_TEXT);
         inputArea.setForeground(NetUtil.TEXT_COLOR);
         inputArea.setBackground(C_FIELD_BG);
@@ -235,9 +380,9 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         bar.add(btnPanel, BorderLayout.EAST);
 
-        // 限制输入栏最大宽度，配合 wrapper 的 FlowLayout.CENTER 实现居中
-        bar.setPreferredSize(new Dimension(640, 40));
-        bar.setMaximumSize(new Dimension(640, 40));
+        // 输入栏宽度
+        bar.setPreferredSize(new Dimension(900, 40));
+        bar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
         return bar;
     }
 
@@ -316,42 +461,400 @@ public class AiChatPanel extends AbstractCommandPanel {
         String text = inputArea.getText().trim();
         if (text.isEmpty()) return;
 
-        // 显示用户消息
-        appendMessage("你", text, NetUtil.C_SEND);
+        // 获取当前选中的模型
+        ModelConfig selectedModel = getSelectedModel();
+        if (selectedModel == null || selectedModel.getModelName().isEmpty()) {
+            JOptionPane.showMessageDialog(this, "请先添加并选择一个模型", "提示", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        // 清除占位文字，显示用户消息（右侧绿色气泡）
+        clearPlaceholderIfNeeded();
+        String userTime = LocalTime.now().format(TF);
+        addMessageBubble("你", text, userTime, true);
         inputArea.setText("");
 
-        // 异步调用 AI（占位，后续接入 langchain4j）
-        SwingUtilities.invokeLater(() -> {
-            appendMessage("AI", "（langchain4j 接口待接入，这是占位回复。）",
-                          NetUtil.C_RECV);
+        // 先创建空的 AI 气泡，准备流式填充（thinking=true 表示等待首 token）
+        String aiTime = LocalTime.now().format(TF);
+        ChatBubble aiBubble = new ChatBubble("AI", "", aiTime, false, true);
+        aiBubble.setAlpha(0.0f);
+
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.setOpaque(false);
+        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+        JPanel alignPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        alignPanel.setOpaque(false);
+        alignPanel.add(aiBubble);
+        wrapper.add(alignPanel, BorderLayout.CENTER);
+
+        chatMessagePanel.add(wrapper);
+        chatMessagePanel.revalidate();
+
+        // 记录流式气泡引用，供 handler 增量更新
+        this.streamingBubble = aiBubble;
+        this.streamingWrapper = wrapper;
+
+        // 淡入动画
+        Timeline.builder(aiBubble)
+            .setDuration(300)
+            .addCallback(new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    aiBubble.repaint();
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    aiBubble.setAlpha(timelinePosition);
+                    aiBubble.repaint();
+                }
+            })
+            .build()
+            .play();
+
+        scrollToBottom();
+
+        // 标记流式开始，禁用编辑按钮防止模态弹窗卡死 UI
+        streamingActive = true;
+        setModelButtonsEnabled(false);
+        // 思考中状态已在 AI 气泡内部显示（● AI 思考中...），不再单独添加指示器
+
+        // 异步流式调用 AI API（虚拟线程）
+        Thread.ofVirtual().start(() -> {
+            try {
+                String apiKey = selectedModel.getApiKey();
+                String apiUrl = selectedModel.getApiUrl();
+                String modelName = selectedModel.getModelName();
+
+                // 去除 baseUrl 末尾的 /chat/completions，LangChain4j 会自动追加
+                String baseUrl = apiUrl;
+                if (baseUrl != null && baseUrl.endsWith("/chat/completions")) {
+                    baseUrl = baseUrl.substring(0, baseUrl.length() - "/chat/completions".length());
+                }
+
+                System.out.println("[AI Chat] Calling API: " + baseUrl + " | Model: " + modelName);
+
+                OpenAiStreamingChatModel model = OpenAiStreamingChatModel.builder()
+                    .apiKey(apiKey.isEmpty() ? "sk-placeholder" : apiKey)
+                    .baseUrl(baseUrl)
+                    .modelName(modelName)
+                    .logRequests(true)
+                    .logResponses(true)
+                    .build();
+
+                StringBuilder fullResponse = new StringBuilder();
+                model.chat(text, new StreamingChatResponseHandler() {
+                    @Override
+                    public void onPartialResponse(String partialResponse) {
+                        fullResponse.append(partialResponse);
+                        SwingUtilities.invokeLater(() -> {
+                            if (streamingBubble != null) {
+                                streamingBubble.appendContent(partialResponse);
+                                // 不再强制滚动到底部，让用户自由浏览
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onCompleteResponse(ChatResponse completeResponse) {
+                        SwingUtilities.invokeLater(() -> {
+                            streamingBubble = null;
+                            streamingWrapper = null;
+                            streamingActive = false;
+                            hideScrollToBottomButton();
+                            setModelButtonsEnabled(true);
+                        });
+                    }
+
+                    @Override
+                    public void onError(Throwable error) {
+                        error.printStackTrace();
+                        SwingUtilities.invokeLater(() -> {
+                            // 移除流式气泡
+                            if (streamingWrapper != null) {
+                                chatMessagePanel.remove(streamingWrapper);
+                                streamingWrapper = null;
+                                streamingBubble = null;
+                                chatMessagePanel.revalidate();
+                                chatMessagePanel.repaint();
+                            }
+                            streamingActive = false;
+                            hideScrollToBottomButton();
+                            setModelButtonsEnabled(true);
+                            String errTime = LocalTime.now().format(TF);
+                            String errDetail = error.getMessage() != null ? error.getMessage() : "";
+                            Throwable cause = error.getCause();
+                            if (cause != null && cause.getMessage() != null) {
+                                errDetail = cause.getMessage();
+                            }
+                            addErrorMessage("API call failed: " + errDetail, errTime);
+                        });
+                    }
+                });
+            } catch (Exception ex) {
+                ex.printStackTrace();
+                SwingUtilities.invokeLater(() -> {
+                    if (streamingWrapper != null) {
+                        chatMessagePanel.remove(streamingWrapper);
+                        streamingWrapper = null;
+                        streamingBubble = null;
+                        chatMessagePanel.revalidate();
+                        chatMessagePanel.repaint();
+                    }
+                    streamingActive = false;
+                    hideScrollToBottomButton();
+                    setModelButtonsEnabled(true);
+                    String errTime = LocalTime.now().format(TF);
+                    String errDetail = ex.getMessage();
+                    Throwable cause = ex.getCause();
+                    if (cause != null && cause.getMessage() != null) {
+                        errDetail = cause.getMessage();
+                    }
+                    addErrorMessage("API call failed: " + errDetail, errTime);
+                });
+            }
         });
     }
 
-    private void appendMessage(String sender, String body, Color senderColor) {
-        String time = LocalTime.now().format(TF);
-        String html = chatPane.getText();
-        html = html.replace("</body></html>", "");
-        html += String.format(
-            "<div style='margin:6px 0;line-height:1.6;'>"
-            + "<span style='color:%s;'>[%s]</span> "
-            + "<b style='color:%s;'>%s:</b>"
-            + "<span style='color:%s;'> %s</span>"
-            + "</div>",
-            toHex(C_TIME), time,
-            toHex(senderColor), sender,
-            toHex(C_TEXT), escapeHtml(body));
-        html += "</body></html>";
-        chatPane.setText(html);
+    /** 获取当前选中的模型配置 */
+    private ModelConfig getSelectedModel() {
+        if (modelSelector == null || modelSelector.getItemCount() == 0) return null;
+        Object item = modelSelector.getSelectedItem();
+        if (item instanceof ModelConfig mc) {
+            // 过滤占位项
+            if ("请先添加模型".equals(mc.getAlias())) return null;
+            return mc;
+        }
+        return null;
+    }
 
-        // 自动滚到底部
+    /** 清除占位内容 */
+    private void clearPlaceholderIfNeeded() {
+        if (placeholderLabel != null && placeholderLabel.getParent() != null) {
+            placeholderLabel = null;
+            chatMessagePanel.removeAll();
+            chatMessagePanel.revalidate();
+            chatMessagePanel.repaint();
+        }
+    }
+
+    /** 添加消息气泡到聊天面板（带动画） */
+    private void addMessageBubble(String sender, String content, String time, boolean isUser) {
+        ChatBubble bubble = new ChatBubble(sender, content, time, isUser);
+        bubble.setAlpha(0.0f);
+
+        // 外层包装：控制左/右对齐和最大宽度
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.setOpaque(false);
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, bubble.getPreferredSize().height + 10));
+        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+
+        JPanel alignPanel = new JPanel(new FlowLayout(
+            isUser ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0));
+        alignPanel.setOpaque(false);
+        alignPanel.add(bubble);
+        wrapper.add(alignPanel, BorderLayout.CENTER);
+
+        chatMessagePanel.add(wrapper);
+        chatMessagePanel.revalidate();
+
+        // 淡入动画
+        Timeline timeline = Timeline.builder(bubble)
+            .setDuration(450)
+            .addCallback(new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    bubble.repaint();
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    bubble.setAlpha(timelinePosition);
+                    bubble.repaint();
+                }
+            })
+            .build();
+        timeline.play();
+
+        // 自动滚到底部（带平滑动画）
+        scrollToBottom();
+    }
+
+    /** 添加错误消息气泡 */
+    private void addErrorMessage(String content, String time) {
+        ChatBubble bubble = new ChatBubble("系统", content, time, false);
+        bubble.setBubbleBg(new Color(0x4A2020)); // 红色调背景
+        bubble.setBorderColor(new Color(0xC62828));
+        bubble.setAlpha(0.0f);
+
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.setOpaque(false);
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, bubble.getPreferredSize().height + 10));
+        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+
+        JPanel alignPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        alignPanel.setOpaque(false);
+        alignPanel.add(bubble);
+        wrapper.add(alignPanel, BorderLayout.CENTER);
+
+        chatMessagePanel.add(wrapper);
+        chatMessagePanel.revalidate();
+
+        Timeline.builder(bubble)
+            .setDuration(350)
+            .addCallback(new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    bubble.repaint();
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    bubble.setAlpha(timelinePosition);
+                    bubble.repaint();
+                }
+            })
+            .build()
+            .play();
+
+        scrollToBottom();
+    }
+
+    // ==================== 打字指示器 ====================
+    private void showTypingIndicator() {
+        if (typingLabel != null && typingLabel.getParent() != null) return; // 已显示
+
+        clearPlaceholderIfNeeded();
+
+        typingLabel = new AnimatedLabel("● AI 思考中", SwingConstants.LEFT);
+        typingLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        typingLabel.setForeground(C_PRIMARY);
+        typingLabel.setBorder(BorderFactory.createEmptyBorder(6, 20, 6, 20));
+
+        JPanel wrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        wrapper.setOpaque(false);
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        wrapper.add(typingLabel);
+
+        chatMessagePanel.add(wrapper);
+        chatMessagePanel.revalidate();
+        scrollToBottom();
+
+        // 呼吸动画：循环改变透明度
+        typingTimeline = Timeline.builder(typingLabel)
+            .setDuration(800)
+            .addCallback(new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    if (newState == TimelineState.DONE && typingLabel != null) {
+                        // 反转方向继续呼吸
+                        typingLabel.forward = !typingLabel.forward;
+                        Timeline reverse = Timeline.builder(typingLabel)
+                            .setDuration(800)
+                            .addCallback(this)
+                            .build();
+                        typingTimeline = reverse;
+                        reverse.play();
+                    }
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    float alpha = typingLabel.forward
+                        ? 0.35f + timelinePosition * 0.65f   // 0.35 → 1.0
+                        : 1.0f - timelinePosition * 0.65f;   // 1.0 → 0.35
+                    typingLabel.setAlpha(alpha);
+                    typingLabel.repaint();
+                }
+            })
+            .build();
+        typingTimeline.play();
+    }
+
+    private void hideTypingIndicator() {
+        if (typingTimeline != null) {
+            typingTimeline.abort();
+            typingTimeline = null;
+        }
+        if (typingLabel != null && typingLabel.getParent() != null) {
+            typingLabel.getParent().remove(typingLabel.getParent());
+            typingLabel = null;
+            chatMessagePanel.revalidate();
+            chatMessagePanel.repaint();
+        }
+    }
+
+    // ==================== 滚动 ====================
+    private void scrollToBottom() {
         SwingUtilities.invokeLater(() -> {
             JScrollBar vBar = chatScrollPane.getVerticalScrollBar();
-            vBar.setValue(vBar.getMaximum());
+            int from = vBar.getValue();
+            int to = vBar.getMaximum();
+            if (to <= from + vBar.getVisibleAmount()) return; // 已经在底部
+
+            Timeline scrollTimeline = Timeline.builder(new Object())
+                .setDuration(300)
+                .addCallback(new TimelineCallback() {
+                    @Override
+                    public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                       float durationFraction, float timelinePosition) {
+                        // no-op
+                    }
+                    @Override
+                    public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                        int val = from + (int)((to - from) * timelinePosition);
+                        vBar.setValue(val);
+                    }
+                })
+                .build();
+            scrollTimeline.play();
         });
+    }
+
+    /** 是否已滚动到底部附近（容差 20px） */
+    private boolean isScrolledToBottom() {
+        JScrollBar vBar = chatScrollPane.getVerticalScrollBar();
+        int val = vBar.getValue();
+        int max = vBar.getMaximum();
+        int extent = vBar.getVisibleAmount();
+        return val + extent >= max - 20;
+    }
+
+    /** 定位浮动按钮：水平居中，距视口底部 16px */
+    private void positionScrollToBottomButton() {
+        if (scrollToBottomBtn == null || chatLayeredPane == null) return;
+        int w = chatLayeredPane.getWidth();
+        int h = chatLayeredPane.getHeight();
+        int bw = scrollToBottomBtn.getWidth();
+        int bh = scrollToBottomBtn.getHeight();
+        scrollToBottomBtn.setBounds((w - bw) / 2, h - bh - 16, bw, bh);
+    }
+
+    /** 根据滚动位置和流式状态决定浮动按钮显隐 */
+    private void updateScrollToBottomButton() {
+        if (scrollToBottomBtn == null) return;
+        if (streamingActive && !isScrolledToBottom()) {
+            showScrollToBottomButton();
+        } else {
+            hideScrollToBottomButton();
+        }
+    }
+
+    private void showScrollToBottomButton() {
+        if (scrollToBottomBtn == null || scrollToBottomBtn.isVisible()) return;
+        scrollToBottomBtn.setVisible(true);
+        positionScrollToBottomButton();
+        scrollToBottomBtn.repaint();
+    }
+
+    private void hideScrollToBottomButton() {
+        if (scrollToBottomBtn == null || !scrollToBottomBtn.isVisible()) return;
+        scrollToBottomBtn.setVisible(false);
+        scrollToBottomBtn.repaint();
     }
 
     private void clearChat() {
-        resetChatHtml();
+        showPlaceholder();
         inputArea.setText("");
     }
 
@@ -427,6 +930,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             e -> dialog.dispose(), esc, JComponent.WHEN_IN_FOCUSED_WINDOW);
 
         dialog.setVisible(true);
+        refreshModelSelector();
+        showPlaceholder();
     }
 
     private void refreshList(DefaultListModel<String> listModel) {
@@ -464,8 +969,62 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         });
 
+        // 选中模型只切换，不弹窗
+
         refreshModelSelector();
         return combo;
+    }
+
+    /** 弹出模型实体详情 */
+    private void showModelDetail(ModelConfig mc) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        JDialog detail = new JDialog(owner, "当前模型: " + mc.comboLabel(), Dialog.ModalityType.APPLICATION_MODAL);
+        detail.setResizable(false);
+
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBackground(C_INPUT_BG);
+        panel.setBorder(BorderFactory.createEmptyBorder(16, 20, 16, 20));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(4, 0, 4, 10);
+        gbc.anchor = GridBagConstraints.WEST;
+
+        addDetailRow(panel, gbc, 0, "别　名：", mc.getAlias());
+        addDetailRow(panel, gbc, 1, "Key　：", mc.getApiKey());
+        addDetailRow(panel, gbc, 2, "接　口：", mc.getApiUrl());
+        addDetailRow(panel, gbc, 3, "全　称：", mc.getModelName());
+
+        JButton btnClose = createOutlinedButton("关闭", C_TIME, e -> detail.dispose());
+        JPanel btnBar = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 10));
+        btnBar.setOpaque(false);
+        btnBar.add(btnClose);
+
+        JPanel content = new JPanel(new BorderLayout());
+        content.setBackground(C_INPUT_BG);
+        content.add(panel, BorderLayout.CENTER);
+        content.add(btnBar, BorderLayout.SOUTH);
+
+        detail.add(content);
+        detail.pack();
+        detail.setLocationRelativeTo(owner);
+        detail.setVisible(true);
+    }
+
+    private void addDetailRow(JPanel p, GridBagConstraints gbc, int row, String label, String value) {
+        gbc.gridy = row;
+
+        gbc.gridx = 0;
+        gbc.weightx = 0;
+        JLabel lbl = new JLabel(label);
+        lbl.setFont(NetUtil.FONT_TEXT);
+        lbl.setForeground(C_TIME);
+        p.add(lbl, gbc);
+
+        gbc.gridx = 1;
+        gbc.weightx = 1;
+        JLabel val = new JLabel(value.isEmpty() ? "（未设置）" : value);
+        val.setFont(NetUtil.FONT_TEXT);
+        val.setForeground(value.isEmpty() ? C_TIME : NetUtil.TEXT_COLOR);
+        p.add(val, gbc);
     }
 
     /** 刷新模型下拉选择器内容 */
@@ -473,12 +1032,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         if (modelSelector == null) return;
         modelSelector.removeAllItems();
         if (modelConfigs.isEmpty()) {
-            // 没有模型时：显示提示文字并禁用下拉选择器
+            // 没有模型时：显示提示文字并禁用下拉选择器 + 编辑按钮
             ModelConfig placeholder = new ModelConfig("请先添加模型", "", "", "");
             modelSelector.addItem(placeholder);
             modelSelector.setEnabled(false);
+            if (editModelBtn != null) editModelBtn.setEnabled(false);
         } else {
             modelSelector.setEnabled(true);
+            if (editModelBtn != null) editModelBtn.setEnabled(true);
             for (ModelConfig mc : modelConfigs) {
                 modelSelector.addItem(mc);
             }
@@ -488,9 +1049,33 @@ public class AiChatPanel extends AbstractCommandPanel {
         modelSelector.repaint();
     }
 
+    private void editSelectedModel() {
+        if (streamingActive) return;
+        if (modelSelector == null) return;
+        Object sel = modelSelector.getSelectedItem();
+        if (!(sel instanceof ModelConfig mc)) return;
+        if (mc.getModelName() == null || mc.getModelName().isEmpty()) return;
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        new ModelConfigDialog(owner, mc).setVisible(true);
+        refreshModelSelector();
+        showPlaceholder();
+    }
+
     private void showAddModelDialog() {
+        if (streamingActive) return;
         Window owner = SwingUtilities.getWindowAncestor(this);
         new ModelConfigDialog(owner, null).setVisible(true);
+        refreshModelSelector();
+        showPlaceholder();
+    }
+
+    /** 流式进行中禁用/启用模型编辑相关按钮 */
+    private void setModelButtonsEnabled(boolean enabled) {
+        if (addModelBtn != null) addModelBtn.setEnabled(enabled);
+        // 编辑按钮恢复时还要检查是否确实有模型可编辑
+        if (editModelBtn != null) {
+            editModelBtn.setEnabled(enabled && !modelConfigs.isEmpty());
+        }
     }
 
     /** 模型配置编辑弹窗（新增 / 编辑） */
@@ -676,16 +1261,353 @@ public class AiChatPanel extends AbstractCommandPanel {
     }
 
     // ==================== 工具方法 ====================
+
+    /** 编辑图标 — 从 resources/icons/edit.svg 加载 */
+    private static Icon loadEditIcon(int sz) {
+        URL url = AiChatPanel.class.getResource("/icons/edit.svg");
+        if (url != null) {
+            return new FlatSVGIcon(url).derive(sz, sz);
+        }
+        return new ColorIcon(14);
+    }
+
+    /** AI 头像 — 圆形裁剪 + 从 resources/icons/ai.svg 加载 */
+    private static Icon loadAiAvatar(int sz) {
+        URL url = AiChatPanel.class.getResource("/icons/ai.svg");
+        if (url != null) {
+            Icon svgIcon = new FlatSVGIcon(url).derive(sz - 4, sz - 4);
+            return new Icon() {
+                @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                    // 圆形背景
+                    g2.setColor(new Color(0x444444));
+                    g2.fillOval(x, y, sz, sz);
+                    // 圆形裁剪
+                    g2.setClip(new java.awt.geom.Ellipse2D.Float(x + 2, y + 2, sz - 4, sz - 4));
+                    svgIcon.paintIcon(c, g2, x + 2, y + 2);
+                    g2.setClip(null);
+                    // 外圈
+                    g2.setColor(new Color(0x666666));
+                    g2.setStroke(new BasicStroke(1.2f));
+                    g2.drawOval(x, y, sz, sz);
+                    g2.dispose();
+                }
+                @Override public int getIconWidth()  { return sz; }
+                @Override public int getIconHeight() { return sz; }
+            };
+        }
+        return new ColorIcon(sz);
+    }
+
+    /** 占位图标（资源缺失时显示） */
+    private static class ColorIcon implements Icon {
+        private final int size;
+        ColorIcon(int size) { this.size = size; }
+        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            g.setColor(Color.GRAY);
+            g.fillRect(x, y, size, size);
+        }
+        @Override public int getIconWidth() { return size; }
+        @Override public int getIconHeight() { return size; }
+    }
+
     private static String toHex(Color c) {
         return String.format("#%02x%02x%02x", c.getRed(), c.getGreen(), c.getBlue());
     }
 
-    private static String escapeHtml(String s) {
-        return s.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace("\n", "<br>")
-                .replace("\"", "&quot;");
+    // ==================== 聊天气泡组件 ====================
+
+    /** 聊天气泡面板（支持 radiance 透明度动画） */
+    private static class ChatBubble extends JPanel {
+        private String sender;
+        private String content;
+        private String time;
+        private boolean isUser;
+        private boolean isError;
+        private float alpha = 1.0f;
+        private Color bubbleBg;
+        private Color borderColor;
+        private JTextArea contentArea;      // 内容文本区域引用，支持流式增量更新
+        private boolean thinking;            // 是否正在等待 AI 首 token
+        private float thinkingAlpha = 1.0f;  // "思考中..." 文字呼吸动画 alpha
+        private boolean thinkingForward = true;
+        private Timeline thinkingTimeline;   // 思考中呼吸动画时间线
+
+        ChatBubble(String sender, String content, String time, boolean isUser) {
+            this(sender, content, time, isUser, false);
+        }
+
+        ChatBubble(String sender, String content, String time, boolean isUser, boolean thinking) {
+            this.sender = sender;
+            this.content = content;
+            this.time = time;
+            this.isUser = isUser;
+            this.isError = "系统".equals(sender);
+            this.thinking = thinking;
+            this.bubbleBg = isUser ? new Color(0x1B5E20)
+                    : isError ? new Color(0x4A2020)
+                    : new Color(0x21212E);      // AI 消息：深蓝灰底色
+            this.borderColor = isUser ? new Color(0x2E7D32)
+                    : isError ? new Color(0xC62828)
+                    : new Color(0x2F2F40);       // AI 消息：柔和边框
+            setOpaque(false);
+            buildLayout();
+            if (thinking) {
+                startThinkingAnimation();
+            }
+        }
+
+        void setBubbleBg(Color bg) {
+            this.bubbleBg = bg;
+            for (Component c : getComponents()) {
+                if (c instanceof JPanel inner) {
+                    inner.setBackground(bg);
+                }
+            }
+        }
+
+        void setBorderColor(Color bc) { this.borderColor = bc; }
+
+        // ---- alpha property for radiance Timeline ----
+        public float getAlpha() { return alpha; }
+        public void setAlpha(float alpha) {
+            this.alpha = Math.max(0.0f, Math.min(1.0f, alpha));
+        }
+
+        /** 流式追加文本内容（在 EDT 上调用） */
+        void appendContent(String text) {
+            if (contentArea == null) return;
+            if (thinking) {
+                // 首 token 到达，退出思考模式，清空"思考中"占位文字
+                thinking = false;
+                stopThinkingAnimation();
+                contentArea.setText("");
+                contentArea.setForeground(isUser ? new Color(0xE8E8E8)
+                        : isError ? new Color(0xFFCDD2)
+                        : new Color(0xEAEAEA));
+            }
+            this.content += text;
+            contentArea.append(text);
+            // 强制 JTextArea 按当前宽度重新计算所需高度
+            int curW = contentArea.getWidth();
+            if (curW <= 0) {
+                Container p = getParent();
+                curW = (p != null && p.getWidth() > 0) ? p.getWidth() - 56 : 500 - 56;
+            }
+            if (curW > 0) {
+                contentArea.setSize(curW, Short.MAX_VALUE);
+            }
+            revalidateAndRepaint();
+        }
+
+        /** 启动"思考中..."呼吸动画 */
+        void startThinkingAnimation() {
+            if (thinkingTimeline != null) return;
+            TimelineCallback cb = new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    if (newState == TimelineState.DONE && thinking) {
+                        thinkingForward = !thinkingForward;
+                        Timeline reverse = Timeline.builder(ChatBubble.this)
+                            .setDuration(800)
+                            .addCallback(this)
+                            .build();
+                        thinkingTimeline = reverse;
+                        reverse.play();
+                    }
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    thinkingAlpha = thinkingForward
+                        ? 0.35f + timelinePosition * 0.65f   // 0.35 → 1.0
+                        : 1.0f - timelinePosition * 0.65f;   // 1.0 → 0.35
+                    if (contentArea != null) contentArea.repaint();
+                }
+            };
+            thinkingTimeline = Timeline.builder(this)
+                .setDuration(800)
+                .addCallback(cb)
+                .build();
+            thinkingTimeline.play();
+        }
+
+        /** 停止"思考中..."呼吸动画 */
+        void stopThinkingAnimation() {
+            if (thinkingTimeline != null) {
+                thinkingTimeline.abort();
+                thinkingTimeline = null;
+            }
+            thinkingAlpha = 1.0f;
+        }
+
+        /** 重新计算布局（内容尺寸变化后调用） */
+        void revalidateAndRepaint() {
+            revalidate();
+            repaint();
+            Container p = getParent();
+            while (p != null) {
+                if (p instanceof JComponent jc) {
+                    jc.revalidate();
+                    jc.repaint();
+                }
+                p = p.getParent();
+            }
+        }
+
+        private void buildLayout() {
+            setLayout(new BorderLayout());
+
+            // 头部：头像/发送者 + 时间
+            JPanel header = new JPanel(new BorderLayout());
+            header.setOpaque(false);
+
+            if (!isUser && !isError) {
+                // AI 消息：显示圆形头像图标
+                JLabel avatarLabel = new JLabel(loadAiAvatar(24));
+                avatarLabel.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 8));
+                JPanel avatarPanel = new JPanel(new BorderLayout());
+                avatarPanel.setOpaque(false);
+                avatarPanel.add(avatarLabel, BorderLayout.CENTER);
+                header.add(avatarPanel, BorderLayout.WEST);
+            } else {
+                // 用户/系统消息：显示发送者文字
+                JLabel senderLabel = new JLabel(sender);
+                senderLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 11));
+                senderLabel.setForeground(isUser ? new Color(0xA5D6A7) : new Color(0xEF9A9A));
+                header.add(senderLabel, BorderLayout.WEST);
+            }
+
+            JLabel timeLabel = new JLabel(time);
+            timeLabel.setFont(new Font("Consolas", Font.PLAIN, 10));
+            timeLabel.setForeground(new Color(0x777777));
+
+            header.add(timeLabel, BorderLayout.EAST);
+            header.setBorder(BorderFactory.createEmptyBorder(0, 0, 6, 0));
+
+            // 内容：使用 JTextArea 自动换行
+            String initialText = thinking ? "● AI 思考中..." : content;
+            this.contentArea = new JTextArea(initialText, 0, 45) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    if (thinking && thinkingAlpha < 1.0f) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        try {
+                            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, thinkingAlpha));
+                            super.paintComponent(g2);
+                        } finally {
+                            g2.dispose();
+                        }
+                    } else {
+                        super.paintComponent(g);
+                    }
+                }
+            };
+            this.contentArea.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+            this.contentArea.setForeground(isUser ? new Color(0xE8E8E8)
+                    : isError ? new Color(0xFFCDD2)
+                    : thinking ? C_PRIMARY
+                    : new Color(0xEAEAEA));     // AI 消息文字更亮
+            this.contentArea.setOpaque(false);
+            this.contentArea.setEditable(false);
+            this.contentArea.setLineWrap(true);
+            this.contentArea.setWrapStyleWord(true);
+            this.contentArea.setCursor(null);
+            this.contentArea.setFocusable(false);
+
+            // 内容内边距面板
+            JPanel contentPane = new JPanel(new BorderLayout());
+            contentPane.setOpaque(false);
+            contentPane.add(this.contentArea, BorderLayout.CENTER);
+
+            JPanel innerPanel = new JPanel(new BorderLayout());
+            innerPanel.setBackground(bubbleBg);
+            innerPanel.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
+            innerPanel.add(header, BorderLayout.NORTH);
+            innerPanel.add(contentPane, BorderLayout.CENTER);
+
+            add(innerPanel, BorderLayout.CENTER);
+            setBorder(BorderFactory.createEmptyBorder(2, 0, 2, 0));
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            Container parent = getParent();
+            int parentW = (parent != null) ? parent.getWidth() : 0;
+            int maxW = (parentW > 0) ? Math.min(500, parentW) : 500;
+
+            // 让 JTextArea 按其宽度重新计算换行后的真实高度
+            if (contentArea != null) {
+                int textWidth = maxW - 32; // 减去内外面板边距
+                if (textWidth > 0) {
+                    contentArea.setSize(textWidth, Short.MAX_VALUE);
+                }
+            }
+            return new Dimension(maxW, super.getPreferredSize().height + 4);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+            // 使用 alpha 做整体透明度
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+
+            int w = getWidth() - 1;
+            int h = getHeight() - 1;
+
+            // 绘制圆角矩形背景
+            g2.setColor(bubbleBg);
+            g2.fillRoundRect(0, 0, w, h, 14, 14);
+
+            // 绘制边框
+            g2.setStroke(new BasicStroke(1.0f));
+            g2.setColor(new Color(
+                borderColor.getRed(), borderColor.getGreen(), borderColor.getBlue(),
+                (int)(borderColor.getAlpha() * alpha)));
+            g2.drawRoundRect(0, 0, w, h, 14, 14);
+
+            g2.dispose();
+            super.paintComponent(g);
+        }
+    }
+
+    /** 支持透明度动画的 JLabel（用于打字指示器和滚动等） */
+    private static class AnimatedLabel extends JLabel {
+        private float alpha = 1.0f;
+        boolean forward = true;
+
+        AnimatedLabel(String text, int horizontalAlignment) {
+            super(text, horizontalAlignment);
+        }
+
+        public float getAlpha() { return alpha; }
+        public void setAlpha(float alpha) {
+            this.alpha = Math.max(0.0f, Math.min(1.0f, alpha));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+            g2.setColor(getBackground());
+            g2.fillRect(0, 0, getWidth(), getHeight());
+            g2.setColor(getForeground());
+            g2.setFont(getFont());
+            FontMetrics fm = g2.getFontMetrics();
+            int y = (getHeight() + fm.getAscent() - fm.getDescent()) / 2;
+            int x;
+            switch (getHorizontalAlignment()) {
+                case SwingConstants.CENTER -> x = (getWidth() - fm.stringWidth(getText())) / 2;
+                case SwingConstants.RIGHT  -> x = getWidth() - fm.stringWidth(getText()) - getInsets().right;
+                default                    -> x = getInsets().left;
+            }
+            g2.drawString(getText(), x, y);
+            g2.dispose();
+        }
     }
 
     // ==================== 配置持久化 ====================
@@ -706,6 +1628,11 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
         // 加载完配置后刷新下拉选择器
         refreshModelSelector();
+
+        // 如果主界面还是占位状态（无聊天记录），刷新占位文字
+        if (placeholderLabel != null && placeholderLabel.getParent() != null) {
+            showPlaceholder();
+        }
     }
 
     @Override

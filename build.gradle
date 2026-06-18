@@ -37,6 +37,7 @@ def javacvVer = '1.5.10'
 def langchain4jVer = '1.16.2'
 dependencies {
     implementation 'com.formdev:flatlaf:3.5.4'
+    implementation 'com.formdev:flatlaf-extras:3.5.4'
     implementation 'com.formdev:flatlaf-intellij-themes:3.5.4'
     // ---- javaCV 瘦身：只引入 opencv + ffmpeg + 仅 Windows x64 原生库 ----
     // javacv-platform 会拖入 全平台原生库（~1.5GB）+ 20+ 无用模块
