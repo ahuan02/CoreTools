@@ -717,6 +717,33 @@ public class MainFrame extends JFrame {
         windowMenu.add(topItem);
         bar.add(windowMenu);
 
+        // ---- 捐助菜单 ----
+        JMenu donateMenu = new JMenu("捐助");
+        // 用 ax.svg 替换文字爱心图标
+        try {
+            java.io.InputStream svgStream = getClass().getResourceAsStream("/icons/ax.svg");
+            if (svgStream != null) {
+                com.formdev.flatlaf.extras.FlatSVGIcon donateIcon = new com.formdev.flatlaf.extras.FlatSVGIcon(svgStream);
+                int iconSize = donateMenu.getFont().getSize() + 2;  // 比文字稍大一点点
+                donateMenu.setIcon(donateIcon.derive(iconSize, iconSize));
+                svgStream.close();
+            }
+        } catch (Exception ex) {
+            // SVG 加载失败就退回到纯文字
+            ex.printStackTrace();
+        }
+        JMenuItem donateItem = new JMenuItem("支持开发者");
+        donateItem.addActionListener(e -> showDonateDialog());
+        donateMenu.add(donateItem);
+        bar.add(donateMenu);
+
+        // ---- 关于菜单 ----
+        JMenu aboutMenu = new JMenu("关于");
+        JMenuItem aboutItem = new JMenuItem("关于 CoreTools");
+        aboutItem.addActionListener(e -> showAboutDialog());
+        aboutMenu.add(aboutItem);
+        bar.add(aboutMenu);
+
         return bar;
     }
 
@@ -1000,6 +1027,157 @@ public class MainFrame extends JFrame {
             }
         }
         return null;
+    }
+
+    /**
+     * 弹出捐助对话框，展示微信收款码
+     */
+    private void showDonateDialog() {
+        JDialog dialog = new JDialog(this, "支持 CoreTools", true);
+        dialog.setResizable(false);
+
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBorder(new EmptyBorder(20, 25, 20, 25));
+
+        // 顶部文案
+        JLabel titleLabel = new JLabel("<html><div style='text-align:center;'>"
+                + "<h2 style='margin:0;'>感谢使用 CoreTools</h2>"
+                + "<p style='font-size:13px;color:#999;'>软件持续免费，制作不易</p>"
+                + "<p style='font-size:13px;'>如果您觉得好用，欢迎扫码支持一杯咖啡 ☕</p>"
+                + "<p style='font-size:12px;color:#aaa;'><i>完全自愿，心意到了就好 ❤</i></p>"
+                + "</div></html>");
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        panel.add(titleLabel, BorderLayout.NORTH);
+
+        // 收款码图片
+        try {
+            java.io.InputStream is = getClass().getResourceAsStream("/wx.png");
+            if (is != null) {
+                BufferedImage qrImage = ImageIO.read(is);
+                is.close();
+                if (qrImage != null) {
+                    // 控制显示大小，不超过 300x300
+                    int maxSize = 300;
+                    int w = qrImage.getWidth();
+                    int h = qrImage.getHeight();
+                    double scale = Math.min((double) maxSize / w, (double) maxSize / h);
+                    if (scale < 1.0) {
+                        w = (int) (w * scale);
+                        h = (int) (h * scale);
+                    }
+                    // 高质量缩放：Graphics2D + 双三次插值，比 SCALE_SMOOTH 清晰很多
+                    BufferedImage scaledImg = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+                    Graphics2D g2d = scaledImg.createGraphics();
+                    g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                    g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                    g2d.drawImage(qrImage, 0, 0, w, h, null);
+                    g2d.dispose();
+                    JLabel imageLabel = new JLabel(new ImageIcon(scaledImg));
+                    imageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+                    imageLabel.setBorder(BorderFactory.createLineBorder(
+                            UIManager.getColor("Component.borderColor"), 1));
+                    panel.add(imageLabel, BorderLayout.CENTER);
+                }
+            } else {
+                JLabel fallback = new JLabel("收款码图片未找到", SwingConstants.CENTER);
+                fallback.setForeground(Color.GRAY);
+                panel.add(fallback, BorderLayout.CENTER);
+            }
+        } catch (IOException e) {
+            JLabel fallback = new JLabel("加载图片失败: " + e.getMessage(), SwingConstants.CENTER);
+            fallback.setForeground(Color.GRAY);
+            panel.add(fallback, BorderLayout.CENTER);
+        }
+
+        // 底部按钮
+        JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 5));
+        JButton closeBtn = new JButton("关闭");
+        closeBtn.addActionListener(e -> dialog.dispose());
+        btnPanel.add(closeBtn);
+        panel.add(btnPanel, BorderLayout.SOUTH);
+
+        dialog.setContentPane(panel);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    /**
+     * 弹出"关于"对话框，含版本信息和第三方开源库许可声明
+     */
+    private void showAboutDialog() {
+        JDialog dialog = new JDialog(this, "关于 CoreTools", true);
+        dialog.setResizable(false);
+
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBorder(new EmptyBorder(20, 25, 15, 25));
+
+        // ---- 顶部：软件信息 ----
+        JPanel infoPanel = new JPanel();
+        infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
+        infoPanel.setOpaque(false);
+
+        JLabel titleLabel = new JLabel("CoreTools v1.0.0", SwingConstants.CENTER);
+        titleLabel.setFont(titleLabel.getFont().deriveFont(Font.BOLD, 16f));
+        titleLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel authorLabel = new JLabel("作者: sunzhenhuan", SwingConstants.CENTER);
+        authorLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel licenseLabel = new JLabel("开源协议: MIT License", SwingConstants.CENTER);
+        licenseLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        infoPanel.add(titleLabel);
+        infoPanel.add(Box.createVerticalStrut(8));
+        infoPanel.add(authorLabel);
+        infoPanel.add(Box.createVerticalStrut(4));
+        infoPanel.add(licenseLabel);
+        panel.add(infoPanel, BorderLayout.NORTH);
+
+        // ---- 中间：第三方许可（滚动） ----
+        String thirdPartyText = "<html><div style='text-align:center;'>"
+                + "<h3 style='margin:5px 0;'>第三方开源库声明</h3>"
+                + "<table style='font-size:12px;border-collapse:collapse;margin:0 auto;'>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>FlatLaf</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>JavaCV / FFmpeg / OpenCV</td><td style='padding:2px 8px;color:#666;'>LGPL / BSD</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>jSerialComm</td><td style='padding:2px 8px;color:#666;'>LGPL 3.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>RSyntaxTextArea</td><td style='padding:2px 8px;color:#666;'>BSD 3-Clause</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>XChart</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>MySQL Connector/J</td><td style='padding:2px 8px;color:#666;'>GPL 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>PostgreSQL JDBC</td><td style='padding:2px 8px;color:#666;'>BSD 2-Clause</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>SQLite JDBC</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>Jedis (Redis)</td><td style='padding:2px 8px;color:#666;'>MIT</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>Radiance (Substance)</td><td style='padding:2px 8px;color:#666;'>BSD 3-Clause</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>OSHI</td><td style='padding:2px 8px;color:#666;'>MIT</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>JSch</td><td style='padding:2px 8px;color:#666;'>BSD</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>LangChain4j</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>Eclipse Paho MQTT</td><td style='padding:2px 8px;color:#666;'>EPL 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>gRPC / Protobuf</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>ZXing</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "</table>"
+                + "<p style='margin-top:10px;font-size:12px;color:#999;'>"
+                + "感谢以上开源项目的贡献</p>"
+                + "</div></html>";
+
+        JLabel tplLabel = new JLabel(thirdPartyText);
+        tplLabel.setHorizontalAlignment(SwingConstants.CENTER);
+
+        JScrollPane scrollPane = new JScrollPane(tplLabel);
+        scrollPane.setPreferredSize(new Dimension(400, 300));
+        scrollPane.setBorder(BorderFactory.createEmptyBorder());
+        panel.add(scrollPane, BorderLayout.CENTER);
+
+        // ---- 底部按钮 ----
+        JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 5));
+        JButton closeBtn = new JButton("关闭");
+        closeBtn.addActionListener(e -> dialog.dispose());
+        btnPanel.add(closeBtn);
+        panel.add(btnPanel, BorderLayout.SOUTH);
+
+        dialog.setContentPane(panel);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
     }
 
     /**

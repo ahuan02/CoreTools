@@ -1,7 +1,7 @@
 plugins {
     id 'java'
     id 'application'
-    id 'org.beryx.runtime' version '1.13.1'
+    id 'org.beryx.runtime' version '2.0.1'
     id 'com.google.protobuf' version '0.9.5'
 }
 
@@ -10,7 +10,7 @@ version = '1.0.0'
 
 application {
     mainClass = 'com.szh.Start'
-    applicationName = 'corTools'
+    applicationName = 'CoreTools'
     applicationDefaultJvmArgs = [
             '--enable-native-access=ALL-UNNAMED',
             '--add-opens=java.base/java.lang=ALL-UNNAMED',
@@ -21,7 +21,7 @@ application {
 
 // Jar 瘦身：固定名称 + 剔除签名冗余文件
 jar {
-    archiveBaseName.set('corTools')
+    archiveBaseName.set('CoreTools')
     archiveVersion.set('1.0.0')
     manifest {
         attributes 'Main-Class': application.mainClass,
@@ -152,24 +152,29 @@ runtime {
     modules = [
             'java.base',
             'java.desktop',
-            'jdk.localedata',
-            'jdk.unsupported'
+            'java.sql',
+            'java.naming',
+            'java.management',
+            'java.net.http',
+            'java.security.jgss',
+            'java.xml',
+            'jdk.unsupported',
+            'jdk.localedata'
     ]
 
     jpackage {
-        imageName = 'CorTools'
-        installerName = 'CorTools'
+        imageName = 'CoreTools'
+        installerName = 'CoreTools'
         appVersion = '1.0.0'
         imageOptions = [
                 '--icon', 'D:\\ideaProject\\CoreTools\\src\\main\\resources\\favicon.ico',
                 '--vendor', 'sunzhenhuan'
         ]
-        installerType = 'msi'
         installerOptions = [
                 '--win-dir-chooser',
                 '--win-menu',
                 '--win-shortcut',
-                '--description', 'CorTools'
+                '--description', 'CoreTools'
         ]
     }
 }
