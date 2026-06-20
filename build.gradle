@@ -19,7 +19,7 @@ application {
     ]
 }
 
-// Jar 瘦身：固定名称 + 剔除签名冗余文件
+// 瘦 JAR：仅打包自己的 class（~2MB），不能独立运行
 jar {
     archiveBaseName.set('CoreTools')
     archiveVersion.set('1.0.0')
@@ -31,6 +31,33 @@ jar {
     exclude 'META-INF/*.DSA'
     exclude 'META-INF/*.RSA'
     exclude 'META-INF/*.LIST'
+}
+
+// Fat JAR：所有依赖打包进一个 JAR（~160MB），java -jar 直接运行
+tasks.register('fatJar', Jar) {
+    archiveBaseName = 'CoreTools'
+    archiveVersion = '1.0.0'
+    archiveClassifier = 'all'
+    manifest {
+        attributes 'Main-Class': application.mainClass,
+                   'Author': 'sunzhenhuan'
+    }
+    // 你自己的 class
+    from sourceSets.main.output
+    // 所有运行时依赖解包合并
+    from {
+        configurations.runtimeClasspath.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+    // 排除签名和模块文件（否则冲突）
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    exclude 'META-INF/*.LIST'
+    exclude 'module-info.class'
+    // 重复文件取第一个
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 repositories {
