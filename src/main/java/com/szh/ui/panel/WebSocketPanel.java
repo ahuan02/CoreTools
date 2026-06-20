@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -288,6 +289,7 @@ public class WebSocketPanel extends AbstractCommandPanel {
         area.setForeground(new Color(0xD4D4D4));
         area.setCaretColor(new Color(0xD4D4D4));
         area.setLineWrap(true);
+        NetUtil.fixPaste(area);
         return area;
     }
 

@@ -6,12 +6,17 @@ import com.szh.manager.ConfigManager;
 import com.szh.ui.panel.*;
 import com.szh.utils.NetUtil;
 
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -21,24 +26,40 @@ public class MainFrame extends JFrame {
     private VideoStreamPanel videoStreamPanel;
     private final ConfigManager config = new ConfigManager("app_config.properties");
     private String currentThemeClassName;
+    private JTabbedPane tabbedPane;
 
     public MainFrame() {
         initTheme();
         initGlobalFont();
         initUI();
         setJMenuBar(createMenuBar());
-        loadConfig();
 
         setTitle("CoreTools");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(1280, 780);
+        Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
+        int initW = (int) (screenSize.width * 0.5);
+        int initH = (int) (screenSize.height * 0.5);
+        setSize(initW, initH);
         setLocationRelativeTo(null);
-        setMinimumSize(new Dimension(1000, 650));
+        setPreferredSize(new Dimension(initW, initH));
+        setMinimumSize(new Dimension(600, 400));
+        // loadConfig 放在 setSize 之后，以便用保存的窗口尺寸覆盖默认值
+        loadConfig();
 
-        // 关闭时保存配置
+        // 窗口 resize 时即时重新布局
+        addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                getRootPane().revalidate();
+                getRootPane().repaint();
+            }
+        });
+
+        // 关闭时保存配置（含窗口尺寸和位置）
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
+                saveWindowBounds();
                 saveConfig();
             }
         });
@@ -47,7 +68,11 @@ public class MainFrame extends JFrame {
     private void initGlobalFont() {
         currentFontFamily = config.get("font.family", "Microsoft YaHei");
         String sizeStr = config.get("font.size", "13");
-        try { currentFontSize = Integer.parseInt(sizeStr); } catch (NumberFormatException e) { currentFontSize = 13; }
+        try {
+            currentFontSize = Integer.parseInt(sizeStr);
+        } catch (NumberFormatException e) {
+            currentFontSize = 13;
+        }
 
         Font font = new Font(currentFontFamily, Font.PLAIN, currentFontSize);
         UIManager.put("defaultFont", font);
@@ -79,12 +104,22 @@ public class MainFrame extends JFrame {
     }
 
     private void initUI() {
-        JPanel root = new JPanel(new BorderLayout(8, 8));
-        root.setBorder(new EmptyBorder(10, 10, 10, 10));
+        JPanel root = new JPanel(new BorderLayout(0, 0));
+        root.setBorder(new EmptyBorder(0, 0, 0, 0));
 
         // Tab 页
-        JTabbedPane tabbedPane = new JTabbedPane(JTabbedPane.TOP);
-        tabbedPane.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
+        tabbedPane = new JTabbedPane(JTabbedPane.TOP);
+        tabbedPane.setTabLayoutPolicy(JTabbedPane.WRAP_TAB_LAYOUT);
+        // FlatLaf: 均分 Tab 宽度填满整行
+        UIManager.put("TabbedPane.tabWidthMode", "equal");
+        // 窗口 resize 时即时重绘 tabbedPane，消除延迟感
+        tabbedPane.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                tabbedPane.revalidate();
+                tabbedPane.repaint();
+            }
+        });
         enableSmoothTabScrolling(tabbedPane);
 
         // AI 对话 Tab
@@ -159,6 +194,18 @@ public class MainFrame extends JFrame {
         // SSH Tab
         SshPanel sshPanel = new SshPanel();
         addTab(tabbedPane, "SSH", sshPanel);
+
+        // MQTT Tab
+        MqttPanel mqttPanel = new MqttPanel();
+        addTab(tabbedPane, "MQTT", mqttPanel);
+
+        // gRPC Tab
+        GrpcPanel grpcPanel = new GrpcPanel();
+        addTab(tabbedPane, "gRPC", grpcPanel);
+
+        // 二维码 Tab
+        QrCodePanel qrCodePanel = new QrCodePanel();
+        addTab(tabbedPane, "二维码", qrCodePanel);
 
         // 监听 tab 切换：控制系统监控面板的启停
         tabbedPane.addChangeListener(e -> {
@@ -254,10 +301,91 @@ public class MainFrame extends JFrame {
     // ==================== 配置持久化 ====================
 
     private void loadConfig() {
+        // 加载背景透明度
+        String alphaStr = config.get("background.alpha", "0.45");
+        try {
+            backgroundAlpha = Float.parseFloat(alphaStr);
+        } catch (NumberFormatException e) {
+            backgroundAlpha = 0.45f;
+        }
+        // 加载背景图片
+        String bgPath = config.get("background.image", "");
+        if (bgPath != null && !bgPath.isEmpty()) {
+            File bgFile = new File(bgPath);
+            if (bgFile.exists()) {
+                try {
+                    backgroundImage = ImageIO.read(bgFile);
+                    backgroundImagePath = bgPath;
+                    applyBackgroundImage();
+                } catch (IOException ignored) { /* 图片失效则忽略 */ }
+            }
+        }
+        // 加载窗口尺寸和位置（在 setSize/setLocation 之后调用以覆盖默认值）
+        loadWindowBounds();
         // 通知各面板加载配置
         for (AbstractCommandPanel panel : panels.values()) {
             panel.loadConfig(config);
         }
+    }
+
+    /**
+     * 加载上次关闭时保存的窗口尺寸和位置
+     */
+    private void loadWindowBounds() {
+        String xStr = config.get("window.x", "");
+        String yStr = config.get("window.y", "");
+        String wStr = config.get("window.width", "");
+        String hStr = config.get("window.height", "");
+        String maxStr = config.get("window.maximized", "false");
+
+        if (!wStr.isEmpty() && !hStr.isEmpty()) {
+            try {
+                int w = Integer.parseInt(wStr);
+                int h = Integer.parseInt(hStr);
+                // 尺寸合理性检查：不能小于最小尺寸，不能大于屏幕
+                Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+                w = Math.max(600, Math.min(w, screen.width));
+                h = Math.max(400, Math.min(h, screen.height));
+                setSize(w, h);
+                setPreferredSize(new Dimension(w, h));
+                setMinimumSize(new Dimension(600, 400));
+            } catch (NumberFormatException ignored) { /* 使用默认尺寸 */ }
+        }
+
+        if (!xStr.isEmpty() && !yStr.isEmpty()) {
+            try {
+                int x = Integer.parseInt(xStr);
+                int y = Integer.parseInt(yStr);
+                // 确保窗口至少部分可见（防止多显示器断开后窗口跑到屏幕外）
+                Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+                if (x + 100 > 0 && x < screen.width - 50 && y + 50 > 0 && y < screen.height - 50) {
+                    setLocation(x, y);
+                } else {
+                    setLocationRelativeTo(null); // 兜底居中
+                }
+            } catch (NumberFormatException ignored) { /* 使用默认位置 */ }
+        }
+
+        // 恢复最大化状态
+        if ("true".equals(maxStr)) {
+            setExtendedState(JFrame.MAXIMIZED_BOTH);
+        }
+    }
+
+    /**
+     * 保存当前窗口尺寸和位置到配置
+     */
+    private void saveWindowBounds() {
+        // 最大化时不保存尺寸（下次打开还是最大化）
+        if ((getExtendedState() & JFrame.MAXIMIZED_BOTH) != 0) {
+            config.set("window.maximized", "true");
+            return;
+        }
+        config.set("window.maximized", "false");
+        config.set("window.x", String.valueOf(getX()));
+        config.set("window.y", String.valueOf(getY()));
+        config.set("window.width", String.valueOf(getWidth()));
+        config.set("window.height", String.valueOf(getHeight()));
     }
 
     private void saveConfig() {
@@ -274,7 +402,9 @@ public class MainFrame extends JFrame {
 
     // ==================== 主题切换 ====================
 
-    /** 启动时初始化主题：优先从 config 读取，否则用默认 Material Dark */
+    /**
+     * 启动时初始化主题：优先从 config 读取，否则用默认 Material Dark
+     */
     private void initTheme() {
         String saved = config.get("theme", "");
         if (saved != null && !saved.isEmpty()) {
@@ -290,7 +420,9 @@ public class MainFrame extends JFrame {
         currentThemeClassName = FlatMaterialDesignDarkIJTheme.class.getName();
     }
 
-    /** 即时切换主题 */
+    /**
+     * 即时切换主题
+     */
     private void switchTheme(String className) {
         try {
             // 亮色主题不需要自绘标题栏，使用系统原生标题栏即可
@@ -317,7 +449,23 @@ public class MainFrame extends JFrame {
     private int currentFontSize;
     private Color currentTextColor;
 
-    /** 构建菜单栏，含主题选择 */
+    /**
+     * 背景图片路径（null 表示无背景）
+     */
+    private String backgroundImagePath;
+    /**
+     * 缓存的背景图片
+     */
+    private BufferedImage backgroundImage;
+    /**
+     * 背景图片透明度 0.0~1.0，默认 0.45
+     */
+    private float backgroundAlpha = 0.45f;
+
+
+    /**
+     * 构建菜单栏，含主题选择
+     */
     private JMenuBar createMenuBar() {
         JMenuBar bar = new JMenuBar();
 
@@ -328,38 +476,38 @@ public class MainFrame extends JFrame {
         // {显示名, 完整类名, "Dark"/"Light"}
         String[][] themes = {
                 // ---- 暗色 ----
-                {"Material Dark ★", "com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme",    "Dark"},
-                {"Xcode Dark",      "com.formdev.flatlaf.intellijthemes.FlatXcodeDarkIJTheme",              "Dark"},
-                {"One Dark",        "com.formdev.flatlaf.intellijthemes.FlatOneDarkIJTheme",               "Dark"},
-                {"Dracula",         "com.formdev.flatlaf.intellijthemes.FlatDraculaIJTheme",               "Dark"},
-                {"Nord",            "com.formdev.flatlaf.intellijthemes.FlatNordIJTheme",                  "Dark"},
-                {"Gruvbox Dark",    "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkMediumIJTheme",     "Dark"},
-                {"Monokai Pro",     "com.formdev.flatlaf.intellijthemes.FlatMonokaiProIJTheme",            "Dark"},
-                {"Arc Dark",        "com.formdev.flatlaf.intellijthemes.FlatArcDarkIJTheme",               "Dark"},
-                {"Carbon",          "com.formdev.flatlaf.intellijthemes.FlatCarbonIJTheme",                "Dark"},
-                {"Dark Flat",       "com.formdev.flatlaf.intellijthemes.FlatDarkFlatIJTheme",              "Dark"},
-                {"Dark Purple",     "com.formdev.flatlaf.intellijthemes.FlatDarkPurpleIJTheme",            "Dark"},
-                {"Hiberbee Dark",   "com.formdev.flatlaf.intellijthemes.FlatHiberbeeDarkIJTheme",          "Dark"},
-                {"Spacegray",       "com.formdev.flatlaf.intellijthemes.FlatSpacegrayIJTheme",             "Dark"},
-                {"Vuesion",         "com.formdev.flatlaf.intellijthemes.FlatVuesionIJTheme",               "Dark"},
-                {"Monocai",         "com.formdev.flatlaf.intellijthemes.FlatMonocaiIJTheme",               "Dark"},
-                {"Solarized Dark",  "com.formdev.flatlaf.intellijthemes.FlatSolarizedDarkIJTheme",         "Dark"},
-                {"High Contrast",   "com.formdev.flatlaf.intellijthemes.FlatHighContrastIJTheme",          "Dark"},
-                {"Gradianto Fuchsia","com.formdev.flatlaf.intellijthemes.FlatGradiantoDarkFuchsiaIJTheme", "Dark"},
-                {"Gradianto Ocean", "com.formdev.flatlaf.intellijthemes.FlatGradiantoDeepOceanIJTheme",    "Dark"},
-                {"Gradianto Blue",  "com.formdev.flatlaf.intellijthemes.FlatGradiantoMidnightBlueIJTheme", "Dark"},
-                {"Gradianto Green", "com.formdev.flatlaf.intellijthemes.FlatGradiantoNatureGreenIJTheme",  "Dark"},
-                {"Gruvbox Hard",    "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkHardIJTheme",       "Dark"},
-                {"Gruvbox Soft",    "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkSoftIJTheme",       "Dark"},
-                {"Flat Dark",       "com.formdev.flatlaf.FlatDarkLaf",                                     "Dark"},
+                {"Material Dark ★", "com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme", "Dark"},
+                {"Xcode Dark", "com.formdev.flatlaf.intellijthemes.FlatXcodeDarkIJTheme", "Dark"},
+                {"One Dark", "com.formdev.flatlaf.intellijthemes.FlatOneDarkIJTheme", "Dark"},
+                {"Dracula", "com.formdev.flatlaf.intellijthemes.FlatDraculaIJTheme", "Dark"},
+                {"Nord", "com.formdev.flatlaf.intellijthemes.FlatNordIJTheme", "Dark"},
+                {"Gruvbox Dark", "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkMediumIJTheme", "Dark"},
+                {"Monokai Pro", "com.formdev.flatlaf.intellijthemes.FlatMonokaiProIJTheme", "Dark"},
+                {"Arc Dark", "com.formdev.flatlaf.intellijthemes.FlatArcDarkIJTheme", "Dark"},
+                {"Carbon", "com.formdev.flatlaf.intellijthemes.FlatCarbonIJTheme", "Dark"},
+                {"Dark Flat", "com.formdev.flatlaf.intellijthemes.FlatDarkFlatIJTheme", "Dark"},
+                {"Dark Purple", "com.formdev.flatlaf.intellijthemes.FlatDarkPurpleIJTheme", "Dark"},
+                {"Hiberbee Dark", "com.formdev.flatlaf.intellijthemes.FlatHiberbeeDarkIJTheme", "Dark"},
+                {"Spacegray", "com.formdev.flatlaf.intellijthemes.FlatSpacegrayIJTheme", "Dark"},
+                {"Vuesion", "com.formdev.flatlaf.intellijthemes.FlatVuesionIJTheme", "Dark"},
+                {"Monocai", "com.formdev.flatlaf.intellijthemes.FlatMonocaiIJTheme", "Dark"},
+                {"Solarized Dark", "com.formdev.flatlaf.intellijthemes.FlatSolarizedDarkIJTheme", "Dark"},
+                {"High Contrast", "com.formdev.flatlaf.intellijthemes.FlatHighContrastIJTheme", "Dark"},
+                {"Gradianto Fuchsia", "com.formdev.flatlaf.intellijthemes.FlatGradiantoDarkFuchsiaIJTheme", "Dark"},
+                {"Gradianto Ocean", "com.formdev.flatlaf.intellijthemes.FlatGradiantoDeepOceanIJTheme", "Dark"},
+                {"Gradianto Blue", "com.formdev.flatlaf.intellijthemes.FlatGradiantoMidnightBlueIJTheme", "Dark"},
+                {"Gradianto Green", "com.formdev.flatlaf.intellijthemes.FlatGradiantoNatureGreenIJTheme", "Dark"},
+                {"Gruvbox Hard", "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkHardIJTheme", "Dark"},
+                {"Gruvbox Soft", "com.formdev.flatlaf.intellijthemes.FlatGruvboxDarkSoftIJTheme", "Dark"},
+                {"Flat Dark", "com.formdev.flatlaf.FlatDarkLaf", "Dark"},
                 // ---- 亮色 ----
-                {"Flat Light",      "com.formdev.flatlaf.FlatLightLaf",                                    "Light"},
-                {"Flat IntelliJ",   "com.formdev.flatlaf.FlatIntelliJLaf",                                 "Light"},
-                {"Arc",             "com.formdev.flatlaf.intellijthemes.FlatArcIJTheme",                   "Light"},
-                {"Cyan Light",      "com.formdev.flatlaf.intellijthemes.FlatCyanLightIJTheme",             "Light"},
-                {"Gray",            "com.formdev.flatlaf.intellijthemes.FlatGrayIJTheme",                  "Light"},
-                {"Light Flat",      "com.formdev.flatlaf.intellijthemes.FlatLightFlatIJTheme",             "Light"},
-                {"Solarized Light", "com.formdev.flatlaf.intellijthemes.FlatSolarizedLightIJTheme",        "Light"},
+                {"Flat Light", "com.formdev.flatlaf.FlatLightLaf", "Light"},
+                {"Flat IntelliJ", "com.formdev.flatlaf.FlatIntelliJLaf", "Light"},
+                {"Arc", "com.formdev.flatlaf.intellijthemes.FlatArcIJTheme", "Light"},
+                {"Cyan Light", "com.formdev.flatlaf.intellijthemes.FlatCyanLightIJTheme", "Light"},
+                {"Gray", "com.formdev.flatlaf.intellijthemes.FlatGrayIJTheme", "Light"},
+                {"Light Flat", "com.formdev.flatlaf.intellijthemes.FlatLightFlatIJTheme", "Light"},
+                {"Solarized Light", "com.formdev.flatlaf.intellijthemes.FlatSolarizedLightIJTheme", "Light"},
         };
 
         JMenu darkMenu = new JMenu("暗色主题");
@@ -412,7 +560,11 @@ public class MainFrame extends JFrame {
         int[] sizes = {10, 11, 12, 13, 14, 15, 16, 18, 20};
 
         String savedSize = config.get("font.size", "13");
-        try { currentFontSize = Integer.parseInt(savedSize); } catch (NumberFormatException e) { currentFontSize = 13; }
+        try {
+            currentFontSize = Integer.parseInt(savedSize);
+        } catch (NumberFormatException e) {
+            currentFontSize = 13;
+        }
         for (int s : sizes) {
             JRadioButtonMenuItem item = new JRadioButtonMenuItem(String.valueOf(s));
             item.addActionListener(e -> switchFontSize(s));
@@ -431,24 +583,164 @@ public class MainFrame extends JFrame {
 
         bar.add(fontMenu);
 
+        // ---- 背景菜单 ----
+        JMenu bgMenu = new JMenu("背景");
+        JMenuItem setBgItem = new JMenuItem("设置背景图片");
+        setBgItem.addActionListener(e -> chooseBackgroundImage());
+        bgMenu.add(setBgItem);
+
+        JMenuItem clearBgItem = new JMenuItem("清除背景图片");
+        clearBgItem.addActionListener(e -> clearBackgroundImage());
+        bgMenu.add(clearBgItem);
+
+        bgMenu.addSeparator();
+
+        // 透明度滑块
+        JMenu alphaMenu = new JMenu("背景透明度");
+        JSlider alphaSlider = new JSlider(0, 100, (int) (backgroundAlpha * 100));
+        alphaSlider.setMajorTickSpacing(25);
+        alphaSlider.setMinorTickSpacing(5);
+        alphaSlider.setPaintTicks(true);
+        alphaSlider.setPaintLabels(true);
+        alphaSlider.setSnapToTicks(true);
+        // 刻度标签
+        java.util.Hashtable<Integer, JLabel> labelTable = new java.util.Hashtable<>();
+        labelTable.put(0, new JLabel("0%"));
+        labelTable.put(25, new JLabel("25%"));
+        labelTable.put(50, new JLabel("50%"));
+        labelTable.put(75, new JLabel("75%"));
+        labelTable.put(100, new JLabel("100%"));
+        alphaSlider.setLabelTable(labelTable);
+        alphaSlider.setPreferredSize(new Dimension(200, 50));
+        alphaSlider.addChangeListener(e -> {
+            if (!alphaSlider.getValueIsAdjusting()) {
+                backgroundAlpha = alphaSlider.getValue() / 100f;
+                config.set("background.alpha", String.valueOf(backgroundAlpha));
+                // 刷新背景绘制
+                if (backgroundImage != null) {
+                    getContentPane().repaint();
+                }
+            }
+        });
+        alphaMenu.add(alphaSlider);
+        bgMenu.add(alphaMenu);
+
+        bar.add(bgMenu);
+
+        // ---- 视图菜单 ----
+        JMenu viewMenu = new JMenu("视图");
+
+        // 面板子菜单（默认不可见，隐藏表头后出现）
+        JMenu panelSubMenu = new JMenu("面板");
+        panelSubMenu.setVisible(false);
+        // 菜单打开时同步选中项到当前 Tab
+        panelSubMenu.addMenuListener(new javax.swing.event.MenuListener() {
+            @Override public void menuSelected(javax.swing.event.MenuEvent e) {
+                int sel = tabbedPane.getSelectedIndex();
+                for (int i = 0; i < panelSubMenu.getItemCount(); i++) {
+                    JMenuItem mi = panelSubMenu.getItem(i);
+                    if (mi instanceof JRadioButtonMenuItem rb) {
+                        rb.setSelected(i == sel);
+                    }
+                }
+            }
+            @Override public void menuDeselected(javax.swing.event.MenuEvent e) {}
+            @Override public void menuCanceled(javax.swing.event.MenuEvent e) {}
+        });
+        ButtonGroup panelGroup = new ButtonGroup();
+        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
+            String title = tabbedPane.getTitleAt(i);
+            JRadioButtonMenuItem panelItem = new JRadioButtonMenuItem(title);
+            if (i == tabbedPane.getSelectedIndex()) {
+                panelItem.setSelected(true);
+            }
+            final int idx = i;
+            panelItem.addActionListener(e -> tabbedPane.setSelectedIndex(idx));
+            panelGroup.add(panelItem);
+            panelSubMenu.add(panelItem);
+        }
+
+        JCheckBoxMenuItem hideTabItem = new JCheckBoxMenuItem("隐藏Tab表头");
+        hideTabItem.addActionListener(e -> {
+            boolean hide = hideTabItem.isSelected();
+            if (hide) {
+                // 使用自定义 UI：tab area 高度为 0 + 不绘制背景/边框
+                tabbedPane.setUI(new javax.swing.plaf.basic.BasicTabbedPaneUI() {
+                    @Override
+                    protected int calculateTabAreaHeight(int tabPlacement, int horizRunCount, int maxTabHeight) {
+                        return 0;
+                    }
+                    @Override
+                    protected void paintTabArea(Graphics g, int tabPlacement, int selectedIndex) {
+                        // 不绘制 tab 区域
+                    }
+                    @Override
+                    protected void paintContentBorder(Graphics g, int tabPlacement, int selectedIndex) {
+                        // 不绘制内容边框，避免覆盖背景图
+                    }
+                    @Override
+                    public void update(Graphics g, JComponent c) {
+                        // 跳过 opaque 检查和背景填充，直接 paint，让背景图透出
+                        paint(g, c);
+                    }
+                });
+            } else {
+                tabbedPane.updateUI();
+            }
+            // setUI/updateUI 的内部逻辑（installDefaults / FlatLaf 递归 updateUI）
+            // 会重置 tabbedPane 和子组件的 opaque / background，所以需要：
+            // 1) 立即设 tabbedPane 透明
+            // 2) 延迟到 UI 变更完全落定后再恢复 AI 面板子组件透明
+            if (backgroundImage != null) {
+                tabbedPane.setOpaque(false);
+                tabbedPane.setBackground(null);
+                SwingUtilities.invokeLater(() -> {
+                    makeAiPanelTransparent();
+                    tabbedPane.revalidate();
+                    tabbedPane.repaint();
+                    getContentPane().revalidate();
+                    getContentPane().repaint();
+                });
+            }
+            // 面板子菜单可见性随隐藏状态切换
+            panelSubMenu.setVisible(hide);
+        });
+        viewMenu.add(hideTabItem);
+        viewMenu.add(panelSubMenu);
+
+        bar.add(viewMenu);
+
+        // ---- 窗口菜单 ----
+        JMenu windowMenu = new JMenu("窗口");
+        JCheckBoxMenuItem topItem = new JCheckBoxMenuItem("窗口置顶");
+        topItem.addActionListener(e -> setAlwaysOnTop(topItem.isSelected()));
+        windowMenu.add(topItem);
+        bar.add(windowMenu);
+
         return bar;
     }
 
-    /** 切换字体族 */
+    /**
+     * 切换字体族
+     */
     private void switchFontFamily(String family) {
         currentFontFamily = family;
         applyFont();
         config.set("font.family", family);
     }
 
-    /** 切换字号 */
+    /**
+     * 切换字号
+     */
     private void switchFontSize(int size) {
         currentFontSize = size;
         applyFont();
         config.set("font.size", String.valueOf(size));
     }
 
-    /** 打开颜色选择器切换全局文字颜色 */
+    /**
+     * 打开颜色选择器切换全局文字颜色
+     */
     private void switchTextColor() {
         Color chosen = JColorChooser.showDialog(this, "选择全局文字颜色", currentTextColor);
         if (chosen != null) {
@@ -459,7 +751,9 @@ public class MainFrame extends JFrame {
         }
     }
 
-    /** 将当前文字颜色应用到全局 */
+    /**
+     * 将当前文字颜色应用到全局
+     */
     private void applyTextColor() {
         NetUtil.TEXT_COLOR = currentTextColor;
 
@@ -486,7 +780,9 @@ public class MainFrame extends JFrame {
         });
     }
 
-    /** 递归遍历组件树，强制更新所有文字颜色 */
+    /**
+     * 递归遍历组件树，强制更新所有文字颜色
+     */
     private void updateAllTextColors(Container root, Color color) {
         for (Component c : root.getComponents()) {
             if (c instanceof JLabel
@@ -506,7 +802,9 @@ public class MainFrame extends JFrame {
         }
     }
 
-    /** 应用当前字体到全局 */
+    /**
+     * 应用当前字体到全局
+     */
     private void applyFont() {
         Font font = new Font(currentFontFamily, Font.PLAIN, currentFontSize);
         UIManager.put("defaultFont", font);
@@ -530,7 +828,9 @@ public class MainFrame extends JFrame {
         });
     }
 
-    /** 递归遍历组件树，更新所有手动设置过字体的组件 */
+    /**
+     * 递归遍历组件树，更新所有手动设置过字体的组件
+     */
     private void updateAllFonts(Container root, Font font) {
         for (Component c : root.getComponents()) {
             if (c instanceof javax.swing.JTable) {
@@ -560,4 +860,172 @@ public class MainFrame extends JFrame {
             }
         }
     }
+
+    // ==================== 背景图片 ====================
+
+    /**
+     * 打开文件选择器选择背景图片
+     */
+    private void chooseBackgroundImage() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择背景图片");
+        chooser.setFileFilter(new FileNameExtensionFilter(
+                "图片文件 (*.jpg, *.jpeg, *.png, *.gif, *.bmp)",
+                "jpg", "jpeg", "png", "gif", "bmp"));
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            File file = chooser.getSelectedFile();
+            try {
+                backgroundImage = ImageIO.read(file);
+                backgroundImagePath = file.getAbsolutePath();
+                applyBackgroundImage();
+                config.set("background.image", backgroundImagePath);
+            } catch (IOException ex) {
+                JOptionPane.showMessageDialog(this,
+                        "无法加载图片: " + ex.getMessage(),
+                        "错误", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+
+    /**
+     * 清除背景图片
+     */
+    private void clearBackgroundImage() {
+        backgroundImage = null;
+        backgroundImagePath = null;
+        config.set("background.image", "");
+        applyBackgroundImage();
+    }
+
+    /**
+     * 将背景图片应用到整个界面
+     */
+    private void applyBackgroundImage() {
+        if (backgroundImage != null) {
+            // 创建带背景图片的 contentPane
+            JPanel bgPanel = new JPanel(new BorderLayout(0, 0)) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    int w = getWidth(), h = getHeight();
+                    if (w > 0 && h > 0) {
+                        // 按比例缩放铺满
+                        double imgRatio = (double) backgroundImage.getWidth() / backgroundImage.getHeight();
+                        double panelRatio = (double) w / h;
+                        int drawW, drawH, drawX, drawY;
+                        if (imgRatio > panelRatio) {
+                            drawH = h;
+                            drawW = (int) (h * imgRatio);
+                            drawX = (w - drawW) / 2;
+                            drawY = 0;
+                        } else {
+                            drawW = w;
+                            drawH = (int) (w / imgRatio);
+                            drawX = 0;
+                            drawY = (h - drawH) / 2;
+                        }
+                    // 先画背景图（透明度由用户控制）
+                    g2.setComposite(AlphaComposite.SrcOver.derive(backgroundAlpha));
+                    g2.drawImage(backgroundImage, drawX, drawY, drawW, drawH, this);
+                    // 再画一层半透明暗色遮罩，确保文字可读（遮罩强度与图片透明度互补）
+                    int maskAlpha = (int) (160 * (1 - backgroundAlpha * 0.7));
+                    g2.setComposite(AlphaComposite.SrcOver.derive(1f));
+                    g2.setColor(new Color(0, 0, 0, maskAlpha));
+                    g2.fillRect(0, 0, w, h);
+                    }
+                    g2.dispose();
+                }
+            };
+            bgPanel.setBorder(new EmptyBorder(0, 0, 0, 0));
+
+            // 把原有的子组件迁移过来
+            Container oldContent = getContentPane();
+            if (oldContent.getComponentCount() > 0) {
+                Component[] children = oldContent.getComponents();
+                oldContent.removeAll();
+                for (Component c : children) {
+                    bgPanel.add(c);
+                }
+            }
+            setContentPane(bgPanel);
+
+            // 让 tabbedPane 变透明才能透出背景图
+            tabbedPane.setOpaque(false);
+            // 只让 AI 对话面板变透明
+            makeAiPanelTransparent();
+        } else {
+            // 恢复 tabbedPane 不透明
+            tabbedPane.setOpaque(true);
+            // 恢复无背景状态
+            Container oldContent = getContentPane();
+            JPanel normalPanel = new JPanel(new BorderLayout(0, 0));
+            normalPanel.setBorder(new EmptyBorder(0, 0, 0, 0));
+            if (oldContent.getComponentCount() > 0) {
+                Component[] children = oldContent.getComponents();
+                oldContent.removeAll();
+                for (Component c : children) {
+                    normalPanel.add(c);
+                }
+            }
+            setContentPane(normalPanel);
+        }
+        SwingUtilities.invokeLater(() -> {
+            getRootPane().revalidate();
+            getRootPane().repaint();
+        });
+    }
+
+    /**
+     * 递归查找 AiChatPanel 并将其背景设为透明
+     */
+    private void makeAiPanelTransparent() {
+        Component aiPanel = findAiChatPanel(getContentPane());
+        if (aiPanel != null) {
+            setComponentTreeOpaque(aiPanel, false);
+        }
+    }
+
+    /**
+     * 在组件树中递归查找 AiChatPanel
+     */
+    private Component findAiChatPanel(Container root) {
+        for (Component c : root.getComponents()) {
+            if (c instanceof AiChatPanel) {
+                return c;
+            }
+            if (c instanceof Container) {
+                Component found = findAiChatPanel((Container) c);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 递归将组件树设为透明（opaque = false，清除背景色），以便背景透出
+     */
+    private void setComponentTreeOpaque(Component comp, boolean opaque) {
+        if (comp instanceof JComponent jc) {
+            jc.setOpaque(opaque);
+            if (!opaque) {
+                jc.setBackground(null);
+            }
+        }
+        // JScrollPane 的 viewport 也需要透明
+        if (comp instanceof JScrollPane sp) {
+            sp.setOpaque(opaque);
+            sp.getViewport().setOpaque(opaque);
+            if (!opaque) {
+                sp.setBackground(null);
+                sp.getViewport().setBackground(null);
+            }
+        }
+        if (comp instanceof Container container) {
+            for (Component child : container.getComponents()) {
+                setComponentTreeOpaque(child, opaque);
+            }
+        }
+    }
+
 }

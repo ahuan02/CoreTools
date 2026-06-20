@@ -791,6 +791,7 @@ public class RedisPanel extends AbstractCommandPanel {
         ctx.valueArea.setBackground(new Color(0x2B2B2B));
         ctx.valueArea.setForeground(new Color(0xA9B7C6));
         ctx.valueArea.setCaretColor(new Color(0xBBBBBB));
+        NetUtil.fixPaste(ctx.valueArea);
         JScrollPane valueScroll = new JScrollPane(ctx.valueArea);
         valueScroll.setBorder(null);
         valuePanel.add(valueScroll, BorderLayout.CENTER);
@@ -1095,6 +1096,7 @@ public class RedisPanel extends AbstractCommandPanel {
         valueArea.setFont(FONT);
         valueArea.setLineWrap(true);
         valueArea.setWrapStyleWord(true);
+        NetUtil.fixPaste(valueArea);
         JScrollPane valueScroll = new JScrollPane(valueArea);
         valueScroll.setPreferredSize(new Dimension(280, 120));
         panel.add(new JLabel("值:"), gbc(0, y));

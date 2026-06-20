@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package test;
+
+option java_package = "com.szh.grpc.test";
+option java_multiple_files = true;
+
+// 问候服务 — 用于测试 GrpcPanel
+service Greeter {
+  // 简单问候
+  rpc SayHello (HelloRequest) returns (HelloReply);
+  // 回声测试
+  rpc Echo (EchoRequest) returns (EchoReply);
+  // 服务端流式响应
+  rpc StreamGreet (HelloRequest) returns (stream HelloReply);
+}
+
+message HelloRequest {
+  string name = 1;
+  int32 age = 2;
+}
+
+message HelloReply {
+  string message = 1;
+  int64 timestamp = 2;
+}
+
+message EchoRequest {
+  string content = 1;
+  int32 repeat = 2;
+}
+
+message EchoReply {
+  string content = 1;
+  int32 index = 2;
+}

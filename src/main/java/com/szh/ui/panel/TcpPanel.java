@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -132,6 +133,7 @@ public class TcpPanel extends AbstractCommandPanel {
                     new Font("Microsoft YaHei", Font.BOLD, 11)));
             replyArea = new JTextArea(1, 20);
             replyArea.setFont(FONT_TEXT);
+            NetUtil.fixPaste(replyArea);
             replyPanel.add(new JScrollPane(replyArea), BorderLayout.CENTER);
 
             clientListModel = new DefaultListModel<>();
@@ -527,6 +529,7 @@ public class TcpPanel extends AbstractCommandPanel {
                     new Font("Microsoft YaHei", Font.BOLD, 11)));
             sendArea = new JTextArea(2, 20);
             sendArea.setFont(FONT_TEXT);
+            NetUtil.fixPaste(sendArea);
             sendPanel.add(new JScrollPane(sendArea), BorderLayout.CENTER);
 
             JPanel sendBtnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));

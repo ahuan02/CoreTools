@@ -4,11 +4,12 @@ import com.szh.manager.ConfigManager;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.Style;
-import javax.swing.text.StyleConstants;
-import javax.swing.text.StyledDocument;
+import javax.swing.text.*;
 import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.Transferable;
+import java.awt.event.ActionEvent;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -222,7 +223,40 @@ public class NetUtil {
         return combo;
     }
 
+    /**
+     * 修复从 IntelliJ IDEA 复制后粘贴时 ClassNotFoundException 报错。
+     * IntelliJ 会在剪贴板中放入自定义 DataFlavor（如 FoldingData），
+     * JTextComponent 默认 paste() 会枚举所有 Flavor 并尝试加载其类，
+     * 导致打印 ClassNotFoundException 到 stderr。
+     * 此方法替换默认粘贴动作为安全版本，仅请求 stringFlavor。
+     */
+    public static void fixPaste(JTextComponent comp) {
+        comp.getActionMap().put("paste-from-clipboard", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                try {
+                    Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
+                    Transferable contents = cb.getContents(null);
+                    if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                        String text = (String) contents.getTransferData(DataFlavor.stringFlavor);
+                        if (text != null) {
+                            comp.replaceSelection(text);
+                            return;
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // 安全粘贴失败时回退到默认 paste
+                }
+                // 回退：调用原始 paste（可能打印错误但至少功能正常）
+                comp.paste();
+            }
+        });
+    }
+
     // ==================== 日志方法 ====================
+
+    /** 单个日志面板最大保留行数，超出后从头部裁剪 */
+    private static final int MAX_LOG_LINES = 5000;
 
     public static void appendLog(JTextPane log, String prefix, String content, Color cPrefix, Color cContent) {
         if (log == null) return;
@@ -247,11 +281,35 @@ public class NetUtil {
                 }
 
                 doc.insertString(doc.getLength(), "\n", null);
+
+                // 超出最大行数时从头部裁剪
+                String text = doc.getText(0, doc.getLength());
+                int lines = countLines(text);
+                if (lines > MAX_LOG_LINES) {
+                    int excess = lines - MAX_LOG_LINES;
+                    int pos = 0;
+                    for (int i = 0; i < excess && pos >= 0; i++) {
+                        pos = text.indexOf('\n', pos);
+                        if (pos >= 0) pos++;
+                    }
+                    if (pos > 0) {
+                        doc.remove(0, pos);
+                    }
+                }
+
                 log.setCaretPosition(doc.getLength());
             } catch (BadLocationException e) {
                 e.printStackTrace();
             }
         });
+    }
+
+    private static int countLines(String text) {
+        int count = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') count++;
+        }
+        return count;
     }
 
     public static void logSys(JTextPane log, String msg)  { appendLog( log, ts(), msg, C_SYS, null); }

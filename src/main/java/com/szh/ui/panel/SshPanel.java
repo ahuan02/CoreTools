@@ -1,24 +1,29 @@
 package com.szh.ui.panel;
 
+import com.formdev.flatlaf.extras.FlatSVGIcon;
+import com.jcraft.jsch.*;
 import com.szh.manager.ConfigManager;
-import org.apache.sshd.client.SshClient;
-import org.apache.sshd.client.channel.ChannelShell;
-import org.apache.sshd.client.session.ClientSession;
+import com.szh.utils.NetUtil;
 
-import javax.swing.*;
 import javax.swing.Timer;
+import javax.swing.*;
 import javax.swing.border.TitledBorder;
 import javax.swing.text.*;
+import javax.swing.tree.DefaultMutableTreeNode;
+import javax.swing.tree.DefaultTreeCellRenderer;
+import javax.swing.tree.DefaultTreeModel;
+import javax.swing.tree.TreePath;
 import java.awt.*;
+import java.awt.datatransfer.DataFlavor;
 import java.awt.event.*;
 import java.io.*;
-import java.net.SocketAddress;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.PublicKey;
-import java.util.*;
+import java.text.AttributedCharacterIterator;
+import java.text.CharacterIterator;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
 
 import static com.szh.utils.NetUtil.*;
 
@@ -29,6 +34,19 @@ public class SshPanel extends AbstractCommandPanel {
 
     private static final Color WHITE = new Color(0xCCCCCC);
 
+    /** 进度条动画定时器间隔（毫秒），越小越流畅 */
+    private static final int PROGRESS_ANIMATION_INTERVAL_MS = 40;
+    /** 进度条视觉追赶速度：每次 tick 最多前进的百分点数，越小越慢 */
+    private static final int MAX_VISUAL_ADVANCE_PCT = 2;
+
+    /** 格式化文件大小（供整个类使用） */
+    private static String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024L * 1024) return String.format("%.1f KB", bytes / 1024.0);
+        if (bytes < 1024L * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+    }
+
     // ===== 连接信息 =====
     private static class SshConn implements Serializable {
         String name;
@@ -38,11 +56,10 @@ public class SshPanel extends AbstractCommandPanel {
         String password;
 
         transient boolean connected;
-        transient ClientSession session;
+        transient Session session;
         transient ChannelShell channel;
-        transient PipedOutputStream toChannel;
-        transient Thread readerThread;
-        transient SshClient client;
+        transient OutputStream toChannel;
+        transient JSch jsch;
 
         @Override
         public String toString() {
@@ -64,52 +81,59 @@ public class SshPanel extends AbstractCommandPanel {
     private Color ansiBg = null;
     private boolean ansiBold = false;
 
-    // 指令补全
-    private final StringBuilder currentInput = new StringBuilder();
-    private Timer suggestionTimer;
-    private JPopupMenu suggestionPopup;
-    private int selectedSuggestionIndex = -1;
-    private static final List<String> LINUX_COMMANDS = Collections.unmodifiableList(Arrays.asList(
-        "alias", "apt", "apt-get", "awk", "basename", "bash", "bg", "bzip2", "cal",
-        "cat", "cd", "chgrp", "chmod", "chown", "clear", "cmp", "comm", "cp",
-        "cron", "crontab", "curl", "cut", "date", "dd", "df", "diff", "dig",
-        "dirname", "dmesg", "dnf", "docker", "du", "echo", "env", "exit",
-        "export", "fg", "file", "find", "firewall-cmd", "free", "fsck", "ftp",
-        "gcc", "g++", "git", "grep", "groupadd", "groupdel", "groups", "gunzip",
-        "gzip", "head", "history", "hostname", "htop", "id", "ifconfig",
-        "ip", "iptables", "jobs", "journalctl", "kill", "killall", "kubectl",
-        "less", "ln", "locate", "logout", "ls", "lsblk", "lsof", "make",
-        "man", "md5sum", "mkdir", "mkfs", "more", "mount", "mv", "nano",
-        "nc", "netstat", "nice", "nmap", "nohup", "nslookup", "pacman",
-        "passwd", "patch", "ping", "pip", "pkill", "ps", "pwd", "readlink",
-        "reboot", "renice", "rm", "rmdir", "route", "rsync", "scp", "screen",
-        "sed", "seq", "service", "sftp", "sh", "sha256sum", "shutdown",
-        "sleep", "sort", "source", "ss", "ssh", "stat", "su", "sudo",
-        "systemctl", "tail", "tar", "tee", "time", "tmux", "top", "touch",
-        "tr", "traceroute", "tree", "ufw", "umask", "umount", "unalias",
-        "uniq", "unset", "unzip", "uptime", "useradd", "userdel", "usermod",
-        "vi", "vim", "wc", "wget", "whereis", "which", "who", "whoami",
-        "xargs", "yum", "zip"
-    ));
+    // 底部命令输入框
+    private JTextField commandInput;
+
+    // 会话命令历史（上下键翻历史）
+    private final List<String> commandHistory = new ArrayList<>();
+    private int historyIndex = -1;
+
+    // 终端原始模式（用于 vim/nano 等交互程序）
+    private boolean rawMode = false;
+    private JToggleButton rawModeBtn;
+    private KeyListener rawModeKeyListener;
+    /** 是否正在执行程序化输出（终端回显/ANSI），用于绕过 DocumentFilter */
+    private volatile boolean rawAppending = false;
+    /** 是否处于 IME 组合输入过程中 */
+    private volatile boolean imeComposing = false;
 
     // 与当前选中连接交互的锁
     private final Object connLock = new Object();
     private SshConn currentConn;
     private ConfigManager configManager;
 
+    // ===== 远程目录浏览器 =====
+    private JLabel dirPathLabel;
+    private JTree dirTree;
+    private DefaultTreeModel dirTreeModel;
+    private DefaultMutableTreeNode dirRootNode;
+    private javax.swing.Timer dirRefreshTimer;
+    private static final int DIR_REFRESH_DELAY_MS = 600; // 命令执行后延迟刷新（等 shell 回显完成）
+    private String cachedRemotePwd; // 本地推算的远程当前目录，避免每次刷新都发 pwd 命令到终端
+
     // 已知主机密钥
     private final Map<String, String> knownHosts = new LinkedHashMap<>();
     private static final String HOST_KEY_COUNT = "ssh.hostkey.count";
 
-    /** 计算公钥 SHA256 指纹 */
-    private static String computeFingerprint(PublicKey key) {
+    /** 计算公钥 SHA256 指纹（从原始字节） */
+    private static String computeFingerprint(byte[] key) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(key.getEncoded());
+            byte[] digest = md.digest(key);
             return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(digest);
         } catch (Exception e) {
             return "SHA256:???";
         }
+    }
+
+    /** 从 SSH 公钥原始字节中提取密钥类型字符串 */
+    private static String getKeyType(byte[] key) {
+        if (key == null || key.length < 4) return "SSH";
+        int len = ((key[0] & 0xFF) << 24) | ((key[1] & 0xFF) << 16) | ((key[2] & 0xFF) << 8) | (key[3] & 0xFF);
+        if (len > 0 && 4 + len <= key.length) {
+            return new String(key, 4, len, StandardCharsets.US_ASCII);
+        }
+        return "SSH";
     }
 
     public SshPanel() {
@@ -225,36 +249,35 @@ public class SshPanel extends AbstractCommandPanel {
     private JPanel createConsolePanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 0));
 
-        // 终端区域（JTextPane 支持多彩色 StyledDocument）
+        // 终端显示区域（纯只读输出）
         terminalArea = new JTextPane();
-        terminalArea.setEditable(false);  // 禁止 Swing 自动插入文本
-        terminalArea.setFocusable(true);
-        terminalArea.setFocusTraversalKeysEnabled(false); // 禁用焦点切换：Tab 直达 SSH
+        terminalArea.setEditable(false);
         terminalArea.setBackground(C_BG);
         terminalArea.setForeground(WHITE);
         terminalArea.setCaretColor(WHITE);
-        terminalArea.setFont(new Font("Consolas", Font.PLAIN, 13));
+        terminalArea.setFont(new Font("NSimSun", Font.PLAIN, 13));
         terminalArea.getCaret().setVisible(true);
         terminalArea.getCaret().setBlinkRate(500);
 
-        // 键盘监听：keyTyped 发普通字符，keyPressed 发特殊键
-        TerminalKeyListener keyListener = new TerminalKeyListener();
-        terminalArea.addKeyListener(keyListener);
-
-        // 防抖定时器：停止输入 300ms 后触发补全提示
-        suggestionTimer = new Timer(300, e -> showSuggestions());
-        suggestionTimer.setRepeats(false);
-
-        // 补全弹窗
-        suggestionPopup = new JPopupMenu();
-        suggestionPopup.setFocusable(false);
-
-        // 右键清空
-        JPopupMenu popup = new JPopupMenu();
+        // 右键菜单：复制 + 清空
+        JPopupMenu terminalPopup = new JPopupMenu();
+        JMenuItem copyItem = new JMenuItem("复制 (Ctrl+C)");
+        copyItem.addActionListener(e -> {
+            String selected = terminalArea.getSelectedText();
+            if (selected != null && !selected.isEmpty()) {
+                Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(selected), null);
+            } else {
+                Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(terminalArea.getText()), null);
+            }
+        });
         JMenuItem clearItem = new JMenuItem("清空终端");
         clearItem.addActionListener(e -> terminalArea.setText(""));
-        popup.add(clearItem);
-        terminalArea.setComponentPopupMenu(popup);
+        terminalPopup.add(copyItem);
+        terminalPopup.add(clearItem);
+        // 给 terminalArea 本身和它的 scroll 都加上右键菜单
+        terminalArea.setComponentPopupMenu(terminalPopup);
 
         JScrollPane scroll = new JScrollPane(terminalArea);
         scroll.setBorder(BorderFactory.createTitledBorder(
@@ -264,9 +287,598 @@ public class SshPanel extends AbstractCommandPanel {
         scroll.setPreferredSize(new Dimension(400, 220));
         scroll.setMinimumSize(new Dimension(200, 120));
         scroll.getVerticalScrollBar().setUnitIncrement(16);
-        panel.add(scroll, BorderLayout.CENTER);
+        // scroll 上也加右键菜单（防止 terminalArea 失焦时右键不触发）
+        scroll.setComponentPopupMenu(terminalPopup);
+
+        // 垂直分割：上方目录浏览器 + 下方终端
+        JSplitPane verticalSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        verticalSplit.setResizeWeight(0.35);
+        verticalSplit.setDividerSize(4);
+        verticalSplit.setBorder(null);
+        verticalSplit.setTopComponent(createDirBrowserPanel());
+        verticalSplit.setBottomComponent(scroll);
+        panel.add(verticalSplit, BorderLayout.CENTER);
+
+        // 底部命令输入框（样式模仿终端，以假乱真）
+        commandInput = new JTextField();
+        commandInput.setBackground(C_BG);
+        commandInput.setForeground(WHITE);
+        commandInput.setCaretColor(WHITE);
+        commandInput.setFont(FONT_TEXT);
+        NetUtil.fixPaste(commandInput);
+        commandInput.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(56, 56, 56)),
+                BorderFactory.createEmptyBorder(5, 10, 5, 10)));
+        commandInput.putClientProperty("JTextField.placeholderText", "输入命令，按 Tab 发送到远程...");
+        // 禁用 Tab/ShiftTab 焦点遍历，防止按 Tab 时焦点逃跑
+        commandInput.setFocusTraversalKeys(KeyboardFocusManager.FORWARD_TRAVERSAL_KEYS, Collections.emptySet());
+        commandInput.setFocusTraversalKeys(KeyboardFocusManager.BACKWARD_TRAVERSAL_KEYS, Collections.emptySet());
+
+        // 键盘：Tab/Ctrl+C/Enter 发送，上下键翻历史
+        commandInput.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                // Ctrl+C: 发送 \x03 中断远程命令 + 清空输入框
+                if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_C) {
+                    e.consume();
+                    sendToChannel(new byte[]{0x03});
+                    commandInput.setText("");
+                    return;
+                }
+
+                switch (e.getKeyCode()) {
+                    case KeyEvent.VK_TAB:
+                        e.consume();
+                        // Tab: 把输入框内容 + \t 发给远程做补全
+                        String tabText = commandInput.getText();
+                        if (!tabText.isEmpty()) {
+                            sendToChannel((tabText + "\t").getBytes(StandardCharsets.UTF_8));
+                            commandInput.setText("");
+                            // 等 200ms 后从终端显示区提取补全结果回填输入框
+                            scheduleTabCompletion(tabText);
+                        }
+                        break;
+
+                    case KeyEvent.VK_ENTER:
+                        e.consume();
+                        String text = commandInput.getText();
+                        // 回车：发当前内容 + \r 执行命令
+                        sendToChannel((text + "\r").getBytes(StandardCharsets.UTF_8));
+                        if (!text.isEmpty()) {
+                            // 记录历史（去重相邻重复）
+                            if (commandHistory.isEmpty() || !commandHistory.get(commandHistory.size() - 1).equals(text)) {
+                                commandHistory.add(text);
+                            }
+                            historyIndex = commandHistory.size();
+                        }
+                        commandInput.setText("");
+                        // 每次命令执行后都通过 SFTP 拉取真实目录，目录变化则自动同步树上
+                        if (!text.isEmpty()) schedulePwdVerify(500);
+                        break;
+
+                    case KeyEvent.VK_UP:
+                        e.consume();
+                        // 发送 ↑ 给远程，让终端显示区也回显历史命令
+                        sendToChannel(new byte[]{'\u001B', '[', 'A'});
+                        if (!commandHistory.isEmpty() && historyIndex > 0) {
+                            historyIndex--;
+                            commandInput.setText(commandHistory.get(historyIndex));
+                        }
+                        break;
+
+                    case KeyEvent.VK_DOWN:
+                        e.consume();
+                        // 发送 ↓ 给远程
+                        sendToChannel(new byte[]{'\u001B', '[', 'B'});
+                        if (historyIndex < commandHistory.size() - 1) {
+                            historyIndex++;
+                            commandInput.setText(commandHistory.get(historyIndex));
+                        } else {
+                            historyIndex = commandHistory.size();
+                            commandInput.setText("");
+                        }
+                        break;
+                }
+            }
+        });
+
+        JPanel bottomBar = new JPanel(new BorderLayout(5, 0));
+        bottomBar.setBackground(C_BG);
+        bottomBar.add(commandInput, BorderLayout.CENTER);
+
+        // 上传 / 下载 / 原始模式按钮
+        JPanel fileBtnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+        fileBtnPanel.setBackground(C_BG);
+
+        rawModeBtn = new JToggleButton("RAW");
+        rawModeBtn.setFont(new Font("Consolas", Font.BOLD, 11));
+        rawModeBtn.setToolTipText("切换终端原始模式（用于 vim/nano 等交互程序，所有按键直通远程）");
+        rawModeBtn.setMargin(new Insets(1, 6, 1, 6));
+        rawModeBtn.addActionListener(e -> toggleRawMode());
+        fileBtnPanel.add(rawModeBtn);
+
+        JButton uploadBtn = makeBtn("上传", new Color(0x2E7D32));
+        uploadBtn.setToolTipText("上传文件到远程当前目录");
+        uploadBtn.addActionListener(e -> uploadFile());
+        JButton downloadBtn = makeBtn("下载", new Color(0x1565C0));
+        downloadBtn.setToolTipText("从远程下载文件");
+        downloadBtn.addActionListener(e -> downloadFile());
+        fileBtnPanel.add(uploadBtn);
+        fileBtnPanel.add(downloadBtn);
+        bottomBar.add(fileBtnPanel, BorderLayout.EAST);
+        panel.add(bottomBar, BorderLayout.SOUTH);
+
 
         return panel;
+    }
+
+    // ==================== 远程目录浏览器 ====================
+
+    /** SFTP 目录条目 */
+    private static class RemoteFileNode {
+        final String name;
+        final String path;
+        final boolean isDir;
+        final boolean isLink;
+        final long size;
+        final String perms;
+
+        RemoteFileNode(String name, String path, boolean isDir, boolean isLink, long size, String perms) {
+            this.name = name;
+            this.path = path;
+            this.isDir = isDir;
+            this.isLink = isLink;
+            this.size = size;
+            this.perms = perms;
+        }
+
+        @Override
+        public String toString() { return name; }
+    }
+
+    /** 目录树单元格渲染器 */
+    private static class DirTreeCellRenderer extends DefaultTreeCellRenderer {
+        private static final Color C_DIR = new Color(0x64B5F6);
+        private static final Color C_EXE = new Color(0x81C784);
+        private static final Color C_LINK = new Color(0xCE93D8);
+        private static Icon folderIcon;
+        private static Icon fileIcon;
+        static {
+            URL folderUrl = DirTreeCellRenderer.class.getResource("/icons/fileholder.svg");
+            if (folderUrl != null) folderIcon = new FlatSVGIcon(folderUrl).derive(16, 16);
+            URL fileUrl = DirTreeCellRenderer.class.getResource("/icons/file.svg");
+            if (fileUrl != null) fileIcon = new FlatSVGIcon(fileUrl).derive(16, 16);
+        }
+
+        @Override
+        public Component getTreeCellRendererComponent(JTree tree, Object value,
+                boolean sel, boolean expanded, boolean leaf, int row, boolean hasFocus) {
+            super.getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus);
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) value;
+            Object obj = node.getUserObject();
+            if (obj instanceof RemoteFileNode fn) {
+                String display = fn.name;
+                if (!fn.isDir) {
+                    display += "  (" + formatSize(fn.size) + ")";
+                }
+                setText(display);
+                if (fn.isDir) {
+                    setIcon(folderIcon);
+                } else {
+                    setIcon(fileIcon);
+                }
+                if (!sel) {
+                    if (fn.isLink) setForeground(C_LINK);
+                    else if (fn.isDir) setForeground(C_DIR);
+                    else if (fn.perms != null && fn.perms.length() >= 4 && fn.perms.charAt(3) == 'x')
+                        setForeground(C_EXE);
+                    else setForeground(WHITE);
+                }
+            } else {
+                setText(String.valueOf(obj));
+                setIcon(folderIcon);
+                if (!sel) setForeground(C_DIR);
+            }
+            setBackgroundNonSelectionColor(C_BG);
+            setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+            return this;
+        }
+    }
+
+    /** 创建目录浏览器面板 */
+    private JPanel createDirBrowserPanel() {
+        JPanel panel = new JPanel(new BorderLayout(0, 2));
+        panel.setBorder(BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(new Color(80, 80, 80), 1, true),
+                "远程目录", TitledBorder.LEADING, TitledBorder.TOP,
+                new Font("Microsoft YaHei", Font.BOLD, 12), new Color(0x64B5F6)));
+
+        // ---- 顶部路径栏 ----
+        JPanel pathBar = new JPanel(new BorderLayout(4, 0));
+        pathBar.setBackground(C_BG);
+        pathBar.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
+
+        dirPathLabel = new JLabel("未连接");
+        dirPathLabel.setFont(FONT_TEXT.deriveFont(12f));
+        dirPathLabel.setForeground(C_TIME);
+        pathBar.add(dirPathLabel, BorderLayout.CENTER);
+
+        JPanel navBtnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+        navBtnPanel.setBackground(C_BG);
+
+        JButton parentBtn = new JButton("⬆");
+        parentBtn.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
+        parentBtn.setToolTipText("上级目录");
+        parentBtn.setMargin(new Insets(1, 6, 1, 6));
+        parentBtn.addActionListener(e -> navigateToParent());
+        navBtnPanel.add(parentBtn);
+
+        JButton refreshBtn = new JButton("🔄");
+        refreshBtn.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
+        refreshBtn.setToolTipText("刷新目录");
+        refreshBtn.setMargin(new Insets(1, 6, 1, 6));
+        refreshBtn.addActionListener(e -> refreshDirectoryBrowser(true));
+        navBtnPanel.add(refreshBtn);
+
+        pathBar.add(navBtnPanel, BorderLayout.EAST);
+        panel.add(pathBar, BorderLayout.NORTH);
+
+        // ---- 目录树 ----
+        dirRootNode = new DefaultMutableTreeNode("未连接");
+        dirTreeModel = new DefaultTreeModel(dirRootNode);
+        dirTree = new JTree(dirTreeModel);
+        dirTree.setRootVisible(true);
+        dirTree.setShowsRootHandles(true);
+        dirTree.setBackground(C_BG);
+        dirTree.setCellRenderer(new DirTreeCellRenderer());
+        dirTree.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+
+        JScrollPane treeScroll = new JScrollPane(dirTree);
+        treeScroll.setBorder(null);
+        treeScroll.setPreferredSize(new Dimension(400, 140));
+        treeScroll.setMinimumSize(new Dimension(200, 80));
+        panel.add(treeScroll, BorderLayout.CENTER);
+
+        // 双击进入目录
+        dirTree.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    TreePath tp = dirTree.getPathForLocation(e.getX(), e.getY());
+                    if (tp != null) {
+                        DefaultMutableTreeNode node = (DefaultMutableTreeNode) tp.getLastPathComponent();
+                        Object obj = node.getUserObject();
+                        if (obj instanceof RemoteFileNode fn && fn.isDir) {
+                            cdIntoRemote(fn.path);
+                        }
+                    }
+                }
+                // 改为右击下载（待扩展）
+                if (SwingUtilities.isRightMouseButton(e)) {
+                    TreePath tp = dirTree.getPathForLocation(e.getX(), e.getY());
+                    if (tp != null) {
+                        dirTree.setSelectionPath(tp);
+                        DefaultMutableTreeNode node = (DefaultMutableTreeNode) tp.getLastPathComponent();
+                        Object obj = node.getUserObject();
+                        if (obj instanceof RemoteFileNode fn && !fn.isDir) {
+                            // 预留：右键下载文件
+                            JPopupMenu popup = new JPopupMenu();
+                            JMenuItem downloadItem = new JMenuItem("下载 " + fn.name);
+                            downloadItem.addActionListener(ev -> downloadSingleRemoteFile(fn.path, fn.name));
+                            popup.add(downloadItem);
+                            JMenuItem deleteItem = new JMenuItem("删除");
+                            deleteItem.addActionListener(ev -> deleteRemoteFile(fn.path, fn.name));
+                            popup.add(deleteItem);
+                            popup.show(dirTree, e.getX(), e.getY());
+                        }
+                        if (obj instanceof RemoteFileNode fn && fn.isDir) {
+                            JPopupMenu popup = new JPopupMenu();
+                            JMenuItem enterItem = new JMenuItem("进入 " + fn.name);
+                            enterItem.addActionListener(ev -> cdIntoRemote(fn.path));
+                            popup.add(enterItem);
+                            popup.show(dirTree, e.getX(), e.getY());
+                        }
+                    }
+                }
+            }
+        });
+
+        // 延迟刷新定时器（等 shell 回显完成后再查目录）
+        dirRefreshTimer = new javax.swing.Timer(DIR_REFRESH_DELAY_MS, ev -> {
+            SshConn c;
+            synchronized (connLock) { c = currentConn; }
+            if (c != null && c.connected) refreshDirectoryBrowser(false);
+        });
+        dirRefreshTimer.setRepeats(false);
+
+        // 支持拖拽本地文件到目录树面板 → 上传到远程当前目录
+        dirTree.setTransferHandler(new TransferHandler() {
+            @Override
+            public boolean canImport(TransferSupport support) {
+                return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+            }
+            @Override
+            @SuppressWarnings("unchecked")
+            public boolean importData(TransferSupport support) {
+                if (!canImport(support)) return false;
+                try {
+                    List<File> files = (List<File>) support.getTransferable()
+                            .getTransferData(DataFlavor.javaFileListFlavor);
+                    if (!files.isEmpty()) uploadDraggedFiles(files);
+                    return true;
+                } catch (Exception e) {
+                    appendTerminal("[拖拽上传失败: " + e.getMessage() + "]\n", C_ERR);
+                    return false;
+                }
+            }
+        });
+        dirTree.setDragEnabled(false);
+
+        return panel;
+    }
+
+    /** 刷新目录浏览器。forceQuery=true 时向 shell 发 pwd 获取真实目录，否则用本地缓存。 */
+    private void refreshDirectoryBrowser(boolean forceQuery) {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) return;
+
+        Thread.startVirtualThread(() -> {
+            String cwd = cachedRemotePwd;
+            if (cwd == null || forceQuery) {
+                cwd = getRemotePwd(conn);
+                if (cwd != null) cachedRemotePwd = cwd;
+            }
+            if (cwd == null) {
+                SwingUtilities.invokeLater(() -> dirPathLabel.setText("获取目录失败"));
+                return;
+            }
+
+            List<RemoteFileNode> children = new ArrayList<>();
+            ChannelSftp sftp = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(3000);
+
+                @SuppressWarnings("unchecked")
+                Vector<ChannelSftp.LsEntry> entries = sftp.ls(cwd);
+                for (ChannelSftp.LsEntry entry : entries) {
+                    String name = entry.getFilename();
+                    if (".".equals(name) || "..".equals(name)) continue;
+                    SftpATTRS attrs = entry.getAttrs();
+                    children.add(new RemoteFileNode(
+                            name,
+                            cwd + "/" + name,
+                            attrs.isDir(),
+                            attrs.isLink(),
+                            attrs.getSize(),
+                            attrs.getPermissionsString()
+                    ));
+                }
+            } catch (Exception e) {
+                final String errPath = cwd;
+                SwingUtilities.invokeLater(() ->
+                    dirPathLabel.setText(errPath + "  (无权限)"));
+                return;
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+
+            // 排序：目录优先，然后按名称
+            children.sort((a, b) -> {
+                if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
+                return a.name.compareToIgnoreCase(b.name);
+            });
+
+            final String displayPath = cwd;
+            SwingUtilities.invokeLater(() -> {
+                dirPathLabel.setText(displayPath);
+                dirRootNode.setUserObject(displayPath);
+                dirRootNode.removeAllChildren();
+                for (RemoteFileNode child : children) {
+                    dirRootNode.add(new DefaultMutableTreeNode(child));
+                }
+                dirTreeModel.reload();
+                dirTree.expandRow(0);
+            });
+        });
+    }
+
+    /** cd 到远程目录 */
+    private void cdIntoRemote(String path) {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.toChannel == null) return;
+        try {
+            conn.toChannel.write(("cd \"" + path + "\"\r").getBytes(StandardCharsets.UTF_8));
+            conn.toChannel.flush();
+            cachedRemotePwd = path; // 本地缓存，不向 shell 发 pwd
+            if (dirRefreshTimer != null) dirRefreshTimer.restart();
+        } catch (Exception ignored) {}
+    }
+
+    /** 返回上级目录 */
+    private void navigateToParent() {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.toChannel == null) return;
+        String cwd = cachedRemotePwd;
+        if (cwd != null && !cwd.equals("/")) {
+            int idx = cwd.lastIndexOf('/');
+            String parent = idx <= 0 ? "/" : cwd.substring(0, idx);
+            cachedRemotePwd = parent;
+            try {
+                conn.toChannel.write(("cd \"" + parent + "\"\r").getBytes(StandardCharsets.UTF_8));
+                conn.toChannel.flush();
+                if (dirRefreshTimer != null) dirRefreshTimer.restart();
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** 拖拽本地文件到目录树 → 上传到远程当前目录 */
+    private void uploadDraggedFiles(List<File> files) {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) {
+            appendTerminal("[未连接到服务器，无法上传]\n", C_WARN);
+            return;
+        }
+        Thread.startVirtualThread(() -> {
+            String cwd = getRemotePwd(conn);
+            if (cwd == null) {
+                appendTerminal("[无法获取远程当前目录]\n", C_ERR);
+                return;
+            }
+            ChannelSftp sftp = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(5000);
+                for (File file : files) {
+                    if (!file.isFile()) continue;
+                    String remotePath = cwd + "/" + file.getName();
+                    appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
+                    TransferProgressDialog dlg = new TransferProgressDialog(
+                            SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
+                    try {
+                        sftp.put(file.getAbsolutePath(), remotePath,
+                            new SftpProgressMonitor() {
+                                private long total;
+                                @Override public void init(int op, String src, String dest, long max) {
+                                    total = max;
+                                    SwingUtilities.invokeLater(() -> dlg.setVisible(true));
+                                }
+                                @Override public boolean count(long count) {
+                                    dlg.setTarget(count, total);
+                                    return !dlg.cancelled;
+                                }
+                                @Override public void end() {
+                                    SwingUtilities.invokeLater(() -> {
+                                        dlg.setTarget(total, total);
+                                        dlg.markFinished();
+                                    });
+                                }
+                            }, ChannelSftp.OVERWRITE);
+                        if (dlg.cancelled) {
+                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
+                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
+                        } else {
+                            appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
+                        }
+                    } catch (Exception e) {
+                        if (dlg.cancelled) {
+                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
+                            dlg.markFinished();
+                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
+                        } else {
+                            dlg.markFinished();
+                            appendTerminal("[上传失败: " + e.getMessage() + "]\n", C_ERR);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+            refreshDirectoryBrowser(false);
+        });
+    }
+
+    /** 下载右键选择的单个文件 */
+    private void downloadSingleRemoteFile(String remotePath, String fileName) {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) return;
+
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("保存 " + fileName);
+        chooser.setSelectedFile(new File(fileName));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        File localFile = chooser.getSelectedFile();
+        if (localFile == null) return;
+        if (localFile.exists()) {
+            int ret = JOptionPane.showConfirmDialog(this,
+                    "文件已存在，是否覆盖？", "确认", JOptionPane.YES_NO_OPTION);
+            if (ret != JOptionPane.YES_OPTION) return;
+        }
+
+        Thread.startVirtualThread(() -> {
+            ChannelSftp sftp = null;
+            TransferProgressDialog dlg = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(5000);
+
+                dlg = new TransferProgressDialog(
+                        SwingUtilities.getWindowAncestor(this), "下载 " + fileName);
+                try {
+                    TransferProgressDialog finalDlg = dlg;
+                    sftp.get(remotePath, localFile.getAbsolutePath(),
+                        new SftpProgressMonitor() {
+                            private long total;
+                            @Override public void init(int op, String src, String dest, long max) {
+                                total = max;
+                                SwingUtilities.invokeLater(() -> finalDlg.setVisible(true));
+                            }
+                            @Override public boolean count(long count) {
+                                finalDlg.setTarget(count, total);
+                                return !finalDlg.cancelled;
+                            }
+                            @Override public void end() {
+                                SwingUtilities.invokeLater(() -> {
+                                    finalDlg.setTarget(total, total);
+                                    finalDlg.markFinished();
+                                });
+                            }
+                        });
+                    if (dlg.cancelled) {
+                        try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        appendTerminal("[已取消下载: " + fileName + "]\n", C_WARN);
+                    } else {
+                        appendTerminal("[下载完成: " + fileName + "]\n", C_RECV);
+                    }
+                } catch (Exception e) {
+                    if (dlg.cancelled) {
+                        try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        dlg.markFinished();
+                        appendTerminal("[已取消下载: " + fileName + "]\n", C_WARN);
+                    } else {
+                        dlg.markFinished();
+                        appendTerminal("[下载失败: " + e.getMessage() + "]\n", C_ERR);
+                    }
+                }
+            } catch (Exception e) {
+                appendTerminal("[下载失败: " + e.getMessage() + "]\n", C_ERR);
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    /** 删除远程文件 */
+    private void deleteRemoteFile(String remotePath, String fileName) {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) return;
+        int ret = JOptionPane.showConfirmDialog(this,
+                "确定删除远程文件 \"" + fileName + "\" 吗？", "确认删除",
+                JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (ret != JOptionPane.YES_OPTION) return;
+
+        Thread.startVirtualThread(() -> {
+            ChannelSftp sftp = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(3000);
+                sftp.rm(remotePath);
+                appendTerminal("[已删除: " + fileName + "]\n", C_SYS);
+                refreshDirectoryBrowser(false);
+            } catch (Exception e) {
+                appendTerminal("[删除失败: " + e.getMessage() + "]\n", C_ERR);
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+        });
     }
 
     // ==================== 连接管理操作 ====================
@@ -351,27 +963,623 @@ public class SshPanel extends AbstractCommandPanel {
         }
     }
 
+    /** Tab 补全后从终端回显提取完成文本，延迟回填输入框 */
+    private void scheduleTabCompletion(String prefix) {
+        new javax.swing.Timer(180, ev -> {
+            ((javax.swing.Timer) ev.getSource()).stop();
+            try {
+                StyledDocument doc = terminalArea.getStyledDocument();
+                if (doc.getLength() == 0) return;
+                String full = doc.getText(0, doc.getLength());
+                // 取最后一个 "prompt 行" — 即最后一个以 prefix 开头或包含 prefix 的行
+                int lastNL = full.lastIndexOf('\n');
+                String lastLine = (lastNL >= 0) ? full.substring(lastNL + 1).trim() : full.trim();
+                // 如果最后一行不是补全结果，往前找
+                if (lastLine.isEmpty() || !lastLine.contains(prefix)) {
+                    // 往前扫描最近 8 行
+                    int scanEnd = lastNL >= 0 ? lastNL : full.length();
+                    String before = full.substring(0, scanEnd);
+                    String[] lines = before.split("\n");
+                    for (int i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
+                        String l = lines[i].trim();
+                        if (l.startsWith(prefix) && l.length() > prefix.length()) {
+                            lastLine = l;
+                            break;
+                        }
+                    }
+                }
+                // 提取以 prefix 开头的完整词
+                if (lastLine.startsWith(prefix) && lastLine.length() > prefix.length()) {
+                    // 取 prefix 之后没有空格的那段作为补全结果
+                    int end = prefix.length();
+                    while (end < lastLine.length() && !Character.isWhitespace(lastLine.charAt(end))) {
+                        end++;
+                    }
+                    String completed = lastLine.substring(0, end);
+                    commandInput.setText(completed);
+                }
+            } catch (BadLocationException ignored) {}
+        }).start();
+    }
+
+    /** 命令执行后延迟用 SFTP 拉取真实目录，变化则自动同步树上 */
+    private void schedulePwdVerify(int delayMs) {
+        new javax.swing.Timer(delayMs, ev -> {
+            ((javax.swing.Timer) ev.getSource()).stop();
+            SshConn conn;
+            synchronized (connLock) { conn = currentConn; }
+            if (conn != null && conn.connected && conn.session != null) {
+                Thread.startVirtualThread(() -> {
+                    String real = getSftpPwd(conn);
+                    if (real != null && !real.equals(cachedRemotePwd)) {
+                        cachedRemotePwd = real;
+                        refreshDirectoryBrowser(false);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 切换终端原始模式（vim/nano 等交互程序用） */
+    private void toggleRawMode() {
+        rawMode = rawModeBtn.isSelected();
+        if (rawMode) {
+            enterRawMode();
+        } else {
+            exitRawMode();
+        }
+    }
+
+    private void enterRawMode() {
+        commandInput.setEnabled(false);
+        commandInput.setForeground(Color.GRAY);
+        commandInput.putClientProperty("JTextField.placeholderText", "RAW 模式 — 按键直通远程终端");
+        // 临时设为可编辑以支持 IME 中文输入法
+        terminalArea.setEditable(true);
+        terminalArea.setFocusable(true);
+        // 禁用 Tab/ShiftTab 焦点遍历，防止按 Tab 焦点逃跑
+        terminalArea.setFocusTraversalKeys(KeyboardFocusManager.FORWARD_TRAVERSAL_KEYS, Collections.emptySet());
+        terminalArea.setFocusTraversalKeys(KeyboardFocusManager.BACKWARD_TRAVERSAL_KEYS, Collections.emptySet());
+        terminalArea.requestFocusInWindow();
+
+        // 文档过滤器：拦截用户输入发送到远程终端，阻止其写入 JTextPane
+        // 程序化输出（appendTerminal/appendAnsi）通过 rawAppending 标志绕过
+        DocumentFilter rawDocFilter = new DocumentFilter() {
+            @Override
+            public void insertString(FilterBypass fb, int offset, String string, AttributeSet attr) throws BadLocationException {
+                if (rawAppending) {
+                    super.insertString(fb, offset, string, attr);
+                } else if (imeComposing) {
+                    // IME 组合输入期间允许临时显示
+                    super.insertString(fb, offset, string, attr);
+                } else {
+                    // 用户按键 → 发远程，不写入文档
+                    sendToChannel(string.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            @Override
+            public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attrs) throws BadLocationException {
+                if (rawAppending) {
+                    super.replace(fb, offset, length, text, attrs);
+                } else if (imeComposing) {
+                    super.replace(fb, offset, length, text, attrs);
+                } else {
+                    if (text != null && !text.isEmpty()) {
+                        sendToChannel(text.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+            }
+            @Override
+            public void remove(FilterBypass fb, int offset, int length) throws BadLocationException {
+                if (!rawAppending) return; // 阻止用户删除终端内容
+                super.remove(fb, offset, length);
+            }
+        };
+        ((AbstractDocument) terminalArea.getDocument()).setDocumentFilter(rawDocFilter);
+
+        // 输入法监听：IME 组合期间允许文档变更显示；提交后统一发送到远程
+        terminalArea.addInputMethodListener(new InputMethodListener() {
+            @Override
+            public void inputMethodTextChanged(InputMethodEvent event) {
+                int committedCount = event.getCommittedCharacterCount();
+                AttributedCharacterIterator text = event.getText();
+                if (committedCount > 0 && text != null) {
+                    // IME 已提交文字 → 提取并发送到远程
+                    char[] chars = new char[committedCount];
+                    int idx = 0;
+                    for (char c = text.first(); c != CharacterIterator.DONE && idx < committedCount; c = text.next()) {
+                        chars[idx++] = c;
+                    }
+                    sendToChannel(new String(chars).getBytes(StandardCharsets.UTF_8));
+                }
+                // 判断是否仍在组合输入中
+                imeComposing = (text != null && (text.getEndIndex() - text.getBeginIndex() > committedCount));
+            }
+            @Override
+            public void caretPositionChanged(InputMethodEvent event) {}
+        });
+
+        rawModeKeyListener = new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                byte[] data = keyEventToRemoteBytes(e);
+                if (data != null) {
+                    e.consume();
+                    sendToChannel(data);
+                }
+                // 普通可打印键不在此处理，交由 DocumentFilter 统一拦截（含 IME 中文）
+            }
+        };
+        terminalArea.addKeyListener(rawModeKeyListener);
+    }
+
+    private void exitRawMode() {
+        if (rawModeKeyListener != null) {
+            terminalArea.removeKeyListener(rawModeKeyListener);
+            rawModeKeyListener = null;
+        }
+        // 移除文档过滤器
+        Document d = terminalArea.getDocument();
+        if (d instanceof AbstractDocument) {
+            ((AbstractDocument) d).setDocumentFilter(null);
+        }
+        // 移除输入法监听器
+        for (InputMethodListener l : terminalArea.getInputMethodListeners()) {
+            terminalArea.removeInputMethodListener(l);
+        }
+        terminalArea.setEditable(false);
+        terminalArea.setFocusable(false);
+        // 恢复焦点遍历键为默认值
+        terminalArea.setFocusTraversalKeys(KeyboardFocusManager.FORWARD_TRAVERSAL_KEYS, null);
+        terminalArea.setFocusTraversalKeys(KeyboardFocusManager.BACKWARD_TRAVERSAL_KEYS, null);
+        commandInput.setEnabled(true);
+        commandInput.setForeground(WHITE);
+        commandInput.putClientProperty("JTextField.placeholderText", "输入命令，按 Tab 发送到远程...");
+        commandInput.requestFocusInWindow();
+    }
+
+    /** 将按键事件转换为发送到远程终端的字节序列 */
+    private static byte[] keyEventToRemoteBytes(KeyEvent e) {
+        int code = e.getKeyCode();
+        boolean ctrl = e.isControlDown();
+
+        if (ctrl) {
+            // Ctrl+A..Z → 0x01..0x1A,  Ctrl+[ → 0x1B (ESC)
+            if (code >= KeyEvent.VK_A && code <= KeyEvent.VK_Z) {
+                return new byte[]{(byte) (code - KeyEvent.VK_A + 1)};
+            }
+            switch (code) {
+                case KeyEvent.VK_OPEN_BRACKET: return new byte[]{0x1B}; // Ctrl+[ = ESC
+                case KeyEvent.VK_SPACE:       return new byte[]{0x00};
+                case KeyEvent.VK_BACK_SLASH:  return new byte[]{0x1C};
+                case KeyEvent.VK_CLOSE_BRACKET: return new byte[]{0x1D};
+                case KeyEvent.VK_SLASH:       return new byte[]{0x1F}; // Ctrl+/
+                default: return null;
+            }
+        }
+
+        // Alt+key: send ESC prefix (Meta)
+        boolean alt = e.isAltDown();
+        byte[] inner = null;
+
+        switch (code) {
+            case KeyEvent.VK_ENTER:      inner = new byte[]{'\r'}; break;
+            case KeyEvent.VK_TAB:        inner = new byte[]{'\t'}; break;
+            case KeyEvent.VK_BACK_SPACE: inner = new byte[]{0x7F}; break;
+            case KeyEvent.VK_ESCAPE:     inner = new byte[]{0x1B}; break;
+            case KeyEvent.VK_DELETE:     inner = "\u001B[3~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_UP:         inner = "\u001B[A".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_DOWN:       inner = "\u001B[B".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_RIGHT:      inner = "\u001B[C".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_LEFT:       inner = "\u001B[D".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_HOME:       inner = "\u001B[H".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_END:        inner = "\u001B[F".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_PAGE_UP:    inner = "\u001B[5~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_PAGE_DOWN:  inner = "\u001B[6~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_INSERT:     inner = "\u001B[2~".getBytes(StandardCharsets.UTF_8); break;
+            // F1-F12
+            case KeyEvent.VK_F1:  inner = "\u001BOP".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F2:  inner = "\u001BOQ".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F3:  inner = "\u001BOR".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F4:  inner = "\u001BOS".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F5:  inner = "\u001B[15~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F6:  inner = "\u001B[17~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F7:  inner = "\u001B[18~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F8:  inner = "\u001B[19~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F9:  inner = "\u001B[20~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F10: inner = "\u001B[21~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F11: inner = "\u001B[23~".getBytes(StandardCharsets.UTF_8); break;
+            case KeyEvent.VK_F12: inner = "\u001B[24~".getBytes(StandardCharsets.UTF_8); break;
+            default: return null;
+        }
+
+        if (inner == null) return null;
+
+        // Alt 修饰：在序列前加 ESC
+        if (alt) {
+            byte[] prefixed = new byte[inner.length + 1];
+            prefixed[0] = 0x1B;
+            System.arraycopy(inner, 0, prefixed, 1, inner.length);
+            return prefixed;
+        }
+        return inner;
+    }
+
+    // ==================== 文件上传 / 下载 ====================
+
+    /**
+     * 获取远程 Shell 当前所在目录。
+     * 原理：通过 Shell 通道写 $PWD 到临时文件，再用 SFTP 下载回来读取，零歧义。
+     */
+    /** 通过 Shell 通道获取远程当前目录。
+     *  原理：写到 /dev/shm（内存文件系统），SFTP 读回后删除，命令极短仅在终端一闪而过。 */
+    private String getSftpPwd(SshConn conn) {
+        if (conn.toChannel == null || conn.session == null) return null;
+        String tmpName = "/dev/shm/.szh_cwd_" + UUID.randomUUID().toString().substring(0, 6);
+        ChannelSftp sftp = null;
+        try {
+            // 1. 通过 Shell 通道写 $PWD 到内存文件（命令极短）
+            conn.toChannel.write(("echo $PWD>" + tmpName + "\n").getBytes(StandardCharsets.UTF_8));
+            conn.toChannel.flush();
+
+            // 2. SFTP 读回
+            sftp = (ChannelSftp) conn.session.openChannel("sftp");
+            sftp.connect(3000);
+            long deadline = System.currentTimeMillis() + 2000;
+            boolean ready = false;
+            while (System.currentTimeMillis() < deadline) {
+                try { sftp.stat(tmpName); ready = true; break; }
+                catch (Exception ignored) { Thread.sleep(80); }
+            }
+            if (!ready) return null;
+
+            java.nio.file.Path localTmp = java.nio.file.Files.createTempFile("szh_cwd_", ".txt");
+            sftp.get(tmpName, localTmp.toString());
+            String cwd = new String(java.nio.file.Files.readAllBytes(localTmp), StandardCharsets.UTF_8).trim();
+            try { java.nio.file.Files.deleteIfExists(localTmp); } catch (Exception ignored) {}
+            if (!cwd.isEmpty() && cwd.startsWith("/")) return cwd;
+        } catch (Exception ignored) {
+        } finally {
+            if (sftp != null) {
+                try { sftp.rm(tmpName); } catch (Exception ignored) {}
+                try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+        }
+        return null;
+    }
+
+    /** 旧方法保留兼容 */
+    private String getRemotePwd(SshConn conn) {
+        return getSftpPwd(conn);
+    }
+
+    /** 上传文件到远程当前目录 */
+    private void uploadFile() {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) {
+            appendTerminal("[未连接到任何主机]\n", C_WARN);
+            return;
+        }
+
+        JFileChooser chooser = new JFileChooser();
+        chooser.setMultiSelectionEnabled(true);
+        chooser.setDialogTitle("选择要上传的文件");
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+
+        File[] files = chooser.getSelectedFiles();
+        if (files == null || files.length == 0) return;
+
+        Thread.startVirtualThread(() -> {
+            // 在后台线程获取远程当前目录，不阻塞 EDT
+            String remoteDir = getRemotePwd(conn);
+            if (remoteDir == null) {
+                appendTerminal("[无法获取远程目录，默认使用 /root]\n", C_WARN);
+                remoteDir = "/root";
+            }
+            ChannelSftp sftp = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(5000);
+
+                for (File file : files) {
+                    String remotePath = remoteDir + "/" + file.getName();
+                    appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
+
+                    TransferProgressDialog dlg = new TransferProgressDialog(
+                        SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
+
+                    try {
+                        sftp.put(file.getAbsolutePath(), remotePath,
+                            new SftpProgressMonitor() {
+                                private long total;
+                                @Override public void init(int op, String src, String dest, long max) {
+                                    total = max;
+                                    SwingUtilities.invokeLater(() -> dlg.setVisible(true));
+                                }
+                                @Override public boolean count(long count) {
+                                    dlg.setTarget(count, total);
+                                    return !dlg.cancelled;
+                                }
+                                @Override public void end() {
+                                    SwingUtilities.invokeLater(() -> {
+                                        dlg.setTarget(total, total);
+                                        dlg.markFinished();
+                                    });
+                                }
+                            }, ChannelSftp.OVERWRITE);
+
+                        if (dlg.cancelled) {
+                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
+                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
+                        } else {
+                            appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
+                        }
+                    } catch (Exception e) {
+                        // count() 返回 false 会触发 JSch 异常，end() 不会被调用
+                        if (dlg.cancelled) {
+                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
+                            dlg.markFinished();
+                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
+                        } else {
+                            dlg.markFinished();
+                            appendTerminal("[上传失败: " + e.getMessage() + "]\n", C_ERR);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    /** 下载远程文件 */
+    private void downloadFile() {
+        SshConn conn;
+        synchronized (connLock) { conn = currentConn; }
+        if (conn == null || !conn.connected || conn.session == null) {
+            appendTerminal("[未连接到任何主机]\n", C_WARN);
+            return;
+        }
+
+        // 输入远程文件路径（不阻塞 EDT 查 pwd，后面在后台线程补全）
+        String remotePath = (String) JOptionPane.showInputDialog(this,
+            "输入远程文件路径（绝对路径 或 相对于当前目录的路径）:",
+            "下载文件", JOptionPane.PLAIN_MESSAGE, null, null, "");
+        if (remotePath == null || remotePath.trim().isEmpty()) return;
+        remotePath = remotePath.trim();
+
+        // 选择本地保存位置
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择保存位置");
+        chooser.setSelectedFile(new File(new File(remotePath).getName()));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+
+        File localFile = chooser.getSelectedFile();
+        if (localFile == null) return;
+
+        // 确认覆盖
+        if (localFile.exists()) {
+            int ret = JOptionPane.showConfirmDialog(this,
+                "文件已存在，是否覆盖？\n" + localFile.getAbsolutePath(),
+                "确认覆盖", JOptionPane.YES_NO_OPTION);
+            if (ret != JOptionPane.YES_OPTION) return;
+        }
+
+        final String finalRemotePath = remotePath;
+        Thread.startVirtualThread(() -> {
+            // 在后台线程获取远程当前目录，不阻塞 EDT
+            String remoteDir = getRemotePwd(conn);
+            String resolvedPath = finalRemotePath;
+            if (!finalRemotePath.startsWith("/") && remoteDir != null) {
+                resolvedPath = remoteDir + "/" + finalRemotePath;
+            }
+            ChannelSftp sftp = null;
+            try {
+                sftp = (ChannelSftp) conn.session.openChannel("sftp");
+                sftp.connect(5000);
+
+                appendTerminal("[下载: " + resolvedPath + " → " + localFile.getAbsolutePath() + "]\n", C_SYS);
+
+                TransferProgressDialog dlg = new TransferProgressDialog(
+                    SwingUtilities.getWindowAncestor(this), "下载 " + new File(finalRemotePath).getName());
+
+                try {
+                    sftp.get(resolvedPath, localFile.getAbsolutePath(),
+                        new SftpProgressMonitor() {
+                            private long total;
+                            @Override public void init(int op, String src, String dest, long max) {
+                                total = max;
+                                SwingUtilities.invokeLater(() -> dlg.setVisible(true));
+                            }
+                            @Override public boolean count(long count) {
+                                dlg.setTarget(count, total);
+                                return !dlg.cancelled;
+                            }
+                            @Override public void end() {
+                                SwingUtilities.invokeLater(() -> {
+                                    dlg.setTarget(total, total);
+                                    dlg.markFinished();
+                                });
+                            }
+                        });
+
+                    if (dlg.cancelled) {
+                        try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        appendTerminal("[已取消下载]\n", C_WARN);
+                    } else {
+                        appendTerminal("[下载完成: " + localFile.getName() + "]\n", C_RECV);
+                    }
+                } catch (Exception e) {
+                    // count() 返回 false 触发 JSch 异常，end() 不会被调用
+                    if (dlg.cancelled) {
+                        try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        dlg.markFinished();
+                        appendTerminal("[已取消下载]\n", C_WARN);
+                    } else {
+                        dlg.markFinished();
+                        appendTerminal("[下载失败: " + e.getMessage() + "]\n", C_ERR);
+                    }
+                }
+            } catch (Exception e) {
+                appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
+            } finally {
+                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    /** 传输进度对话框 — 带平滑追赶动画 */
+    private static class TransferProgressDialog extends JDialog {
+        final JProgressBar progressBar;
+        final JLabel speedLabel;
+        final JButton cancelBtn;
+        volatile boolean cancelled;
+
+        // 真实传输进度（由 JSch 回调线程写入，不经过 EDT）
+        volatile long targetTransferred;
+        volatile long targetTotal;
+        volatile boolean transferFinished;
+
+        // 视觉显示进度（仅 EDT 读写）
+        private long displayTransferred;
+        private final long startTime = System.currentTimeMillis();
+        private long lastTargetCount;
+        private long lastSpeedTime = startTime;
+        private final Timer animateTimer;
+
+        TransferProgressDialog(Window owner, String title) {
+            super(owner, title, ModalityType.MODELESS);
+            setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
+            setResizable(false);
+
+            JPanel panel = new JPanel(new BorderLayout(8, 8));
+            panel.setBorder(BorderFactory.createEmptyBorder(12, 16, 12, 16));
+
+            JLabel titleLabel = new JLabel(title);
+            titleLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+            panel.add(titleLabel, BorderLayout.NORTH);
+
+            progressBar = new JProgressBar(0, 100);
+            progressBar.setStringPainted(true);
+            progressBar.setString("准备中...");
+            progressBar.setPreferredSize(new Dimension(400, 26));
+            panel.add(progressBar, BorderLayout.CENTER);
+
+            speedLabel = new JLabel("等待传输...");
+            speedLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+
+            cancelBtn = new JButton("取消");
+            cancelBtn.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+            cancelBtn.addActionListener(e -> {
+                cancelled = true;
+                cancelBtn.setEnabled(false);
+                cancelBtn.setText("取消中...");
+            });
+
+            JPanel bottom = new JPanel(new BorderLayout());
+            bottom.add(speedLabel, BorderLayout.WEST);
+            bottom.add(cancelBtn, BorderLayout.EAST);
+            panel.add(bottom, BorderLayout.SOUTH);
+
+            add(panel);
+            pack();
+            setLocationRelativeTo(owner);
+
+            // 动画定时器：每 40ms 让视觉进度条追赶真实进度
+            animateTimer = new Timer(PROGRESS_ANIMATION_INTERVAL_MS, ev -> animateTick());
+            animateTimer.start();
+        }
+
+        /** JSch 回调线程调用：仅更新目标值，极轻量 */
+        void setTarget(long transferred, long total) {
+            this.targetTransferred = transferred;
+            this.targetTotal = total;
+        }
+
+        /** JSch end() 回调：标记传输完成，让动画最终走到 100% */
+        void markFinished() {
+            this.transferFinished = true;
+        }
+
+        /** 动画 tick（EDT 线程） */
+        private void animateTick() {
+            if (targetTotal <= 0) return;
+
+            // 计算视觉显示值应该追赶到的目标
+            long visualTarget = transferFinished ? targetTotal : targetTransferred;
+
+            int targetPct = (int) (visualTarget * 100 / targetTotal);
+            int displayPct = (int) (displayTransferred * 100 / targetTotal);
+
+            // 逐步追赶，每次最多前进 MAX_VISUAL_ADVANCE_PCT 百分点
+            if (targetPct > displayPct) {
+                int advance = Math.min(targetPct - displayPct, MAX_VISUAL_ADVANCE_PCT);
+                displayPct = Math.min(displayPct + advance, 100);
+                displayTransferred = displayPct * targetTotal / 100;
+            }
+
+            // 渲染进度条
+            if (targetTotal > 0) {
+                progressBar.setValue(displayPct);
+                progressBar.setString(formatSize(displayTransferred) + " / " + formatSize(targetTotal)
+                    + "  (" + displayPct + "%)");
+                progressBar.setIndeterminate(false);
+            } else {
+                progressBar.setIndeterminate(true);
+                progressBar.setString("等待中...");
+            }
+
+            // 速度统计（基于真实传输值）
+            long now = System.currentTimeMillis();
+            long dt = now - lastSpeedTime;
+            if (dt >= 1000) {
+                long dc = targetTransferred - lastTargetCount;
+                double speedBps = dc * 1000.0 / dt;
+                speedLabel.setText("速度: " + formatSize((long) speedBps) + "/s  |  已用时: "
+                    + formatDuration(now - startTime));
+                lastTargetCount = targetTransferred;
+                lastSpeedTime = now;
+            }
+
+            // 传输已完成且视觉进度已追到 100%，关闭对话框
+            if (transferFinished && displayPct >= 100) {
+                animateTimer.stop();
+                dispose();
+            }
+        }
+
+        private static String formatDuration(long ms) {
+            if (ms < 1000) return ms + "ms";
+            long sec = ms / 1000;
+            if (sec < 60) return sec + "s";
+            return (sec / 60) + "m" + (sec % 60) + "s";
+        }
+    }
+
     // ==================== 终端输出 & ANSI ====================
 
-    /** ANSI 标准色映射（暗色背景） */
+    /** ANSI 标准色映射（暗色背景优化） */
     private static final Color[] ANSI_COLORS = {
-        new Color(0x000000), // 0 Black
-        new Color(0xCD0000), // 1 Red
-        new Color(0x00CD00), // 2 Green
-        new Color(0xCDCD00), // 3 Yellow
-        new Color(0x3465A4), // 4 Blue
-        new Color(0xCD00CD), // 5 Magenta
-        new Color(0x00CDCD), // 6 Cyan
-        new Color(0xCCCCCC), // 7 White
+        new Color(0x2E3436), // 0 Black
+        new Color(0xEF5555), // 1 Red
+        new Color(0x55DD55), // 2 Green
+        new Color(0xDDDD55), // 3 Yellow
+        new Color(0x5599EE), // 4 Blue
+        new Color(0xE066E0), // 5 Magenta
+        new Color(0x55D0D0), // 6 Cyan
+        new Color(0xD3D7CF), // 7 White
     };
     private static final Color[] ANSI_BRIGHT = {
-        new Color(0x555555), // 0 Bright Black
-        new Color(0xFF5555), // 1 Bright Red
-        new Color(0x55FF55), // 2 Bright Green
-        new Color(0xFFFF55), // 3 Bright Yellow
-        new Color(0x729FCF), // 4 Bright Blue
-        new Color(0xFF55FF), // 5 Bright Magenta
-        new Color(0x55FFFF), // 6 Bright Cyan
+        new Color(0x555753), // 0 Bright Black
+        new Color(0xFF6E6E), // 1 Bright Red
+        new Color(0x8AFF8A), // 2 Bright Green
+        new Color(0xFFFF70), // 3 Bright Yellow
+        new Color(0x77AAFF), // 4 Bright Blue
+        new Color(0xFF88FF), // 5 Bright Magenta
+        new Color(0x88FFFF), // 6 Bright Cyan
         new Color(0xFFFFFF), // 7 Bright White
     };
 
@@ -379,42 +1587,77 @@ public class SshPanel extends AbstractCommandPanel {
     private void appendTerminal(String text, Color color) {
         if (terminalArea == null || text == null || text.isEmpty()) return;
         SwingUtilities.invokeLater(() -> {
+            rawAppending = true;
             try {
                 StyledDocument doc = terminalArea.getStyledDocument();
                 Style style = doc.addStyle("s" + System.nanoTime(), null);
                 StyleConstants.setForeground(style, color != null ? color : WHITE);
-                StyleConstants.setFontFamily(style, "Consolas");
+                StyleConstants.setFontFamily(style, "NSimSun");
                 StyleConstants.setFontSize(style, 13);
                 doc.insertString(doc.getLength(), text, style);
                 terminalArea.setCaretPosition(doc.getLength());
-            } catch (BadLocationException ignored) {}
+            } catch (BadLocationException ignored) {
+            } finally {
+                rawAppending = false;
+            }
         });
     }
 
-    /** 追加 ANSI 转义文本，解析着色 + 终端控制码 */
+    /** 追加 ANSI 转义文本，解析着色 + 终端控制码，过滤 OSC 序列 */
     private void appendAnsi(String text) {
         if (terminalArea == null || text == null || text.isEmpty()) return;
         SwingUtilities.invokeLater(() -> {
+            rawAppending = true;
             try {
                 StyledDocument doc = terminalArea.getStyledDocument();
                 int len = text.length();
                 int segStart = 0;
                 for (int i = 0; i < len; i++) {
-                    if (text.charAt(i) == '\033' && i + 1 < len && text.charAt(i + 1) == '[') {
-                        // 先把前面的纯文本段输出
-                        if (i > segStart) {
-                            insertStyled(doc, text.substring(segStart, i));
-                        }
-                        // 找 CSI 结束
-                        int end = i + 2;
-                        while (end < len && !isCsiTerminator(text.charAt(end))) end++;
-                        if (end < len) {
-                            String params = text.substring(i + 2, end);
-                            applyCsiSequence(doc, params, text.charAt(end));
-                            i = end;
-                            segStart = end + 1;
+                    if (text.charAt(i) == '\033' && i + 1 < len) {
+                        char next = text.charAt(i + 1);
+                        if (next == '[') {
+                            // CSI 序列 \033[...X
+                            if (i > segStart) {
+                                insertStyled(doc, text.substring(segStart, i));
+                            }
+                            int end = i + 2;
+                            while (end < len && !isCsiTerminator(text.charAt(end))) end++;
+                            if (end < len) {
+                                String params = text.substring(i + 2, end);
+                                applyCsiSequence(doc, params, text.charAt(end));
+                                i = end;
+                                segStart = end + 1;
+                            } else {
+                                i = len;
+                            }
+                        } else if (next == ']') {
+                            // OSC 序列 \033]...\007 或 \033]...\033\\
+                            // 常见：\033]0;title\007 — 设终端标题，直接丢弃
+                            if (i > segStart) {
+                                insertStyled(doc, text.substring(segStart, i));
+                            }
+                            int end = i + 2;
+                            while (end < len) {
+                                char ec = text.charAt(end);
+                                if (ec == '\007' || (ec == '\033' && end + 1 < len && text.charAt(end + 1) == '\\')) {
+                                    break;
+                                }
+                                end++;
+                            }
+                            if (end < len) {
+                                if (text.charAt(end) == '\033') end++; // 跳过 \033\\ 中的 \
+                                i = end;
+                                segStart = end + 1;
+                            } else {
+                                i = len;
+                            }
                         } else {
-                            i = len;
+                            // 其他双字符 ESC 序列：\033= \033> \033( \033) 等，直接跳过
+                            if (i > segStart) {
+                                insertStyled(doc, text.substring(segStart, i));
+                            }
+                            i++; // 跳过 ESC 后的那个字符
+                            segStart = i + 1;
                         }
                     }
                 }
@@ -422,7 +1665,10 @@ public class SshPanel extends AbstractCommandPanel {
                     insertStyled(doc, text.substring(segStart));
                 }
                 terminalArea.setCaretPosition(doc.getLength());
-            } catch (BadLocationException ignored) {}
+            } catch (BadLocationException ignored) {
+            } finally {
+                rawAppending = false;
+            }
         });
     }
 
@@ -549,11 +1795,26 @@ public class SshPanel extends AbstractCommandPanel {
                     doc.remove(doc.getLength() - 1, 1);
                 }
             } else if (c == '\r') {
-                // \r 回到行首（简化：仅当后跟 \n 时由 \n 统一处理，单独的 \r 做换行）
                 if (i + 1 < seg.length() && seg.charAt(i + 1) == '\n') {
-                    clean.append(c); // \r\n 一并追加
-                } else {
+                    // \r\n → 正常换行
                     clean.append('\n');
+                    i++;
+                } else {
+                    // 单独的 \r：回到行首，清掉当前行已输出的内容
+                    // 先把已积累的 clean 文本写入文档
+                    if (clean.length() > 0) {
+                        Style s = makeCurrentStyle(doc);
+                        doc.insertString(doc.getLength(), clean.toString(), s);
+                        clean.setLength(0);
+                    }
+                    // 找到最后一个 \n，删除它之后的所有内容（回到行首）
+                    int docLen = doc.getLength();
+                    String full = doc.getText(0, docLen);
+                    int lastNL = full.lastIndexOf('\n');
+                    int from = lastNL >= 0 ? lastNL + 1 : 0;
+                    if (docLen > from) {
+                        doc.remove(from, docLen - from);
+                    }
                 }
             } else if (c >= ' ' || c == '\n' || c == '\t') {
                 // 只保留可打印字符 + 换行 + 制表符
@@ -562,241 +1823,19 @@ public class SshPanel extends AbstractCommandPanel {
             // 其他控制字符（0x00-0x1F、0x7F）直接丢弃
         }
         if (clean.length() == 0) return;
-        Style style = doc.addStyle("a" + System.nanoTime(), null);
-        StyleConstants.setForeground(style, ansiFg);
-        StyleConstants.setFontFamily(style, "Consolas");
-        StyleConstants.setFontSize(style, 13);
-        StyleConstants.setBold(style, ansiBold);
-        if (ansiBg != null) StyleConstants.setBackground(style, ansiBg);
+        Style style = makeCurrentStyle(doc);
         doc.insertString(doc.getLength(), clean.toString(), style);
     }
 
-    // ==================== 终端键盘监听器 ====================
-
-    /** 终端键盘监听器：keyTyped 发普通字符，keyPressed 发特殊键 */
-    private class TerminalKeyListener extends KeyAdapter {
-        private SshConn activeConn() {
-            synchronized (connLock) { return currentConn; }
-        }
-
-        @Override
-        public void keyTyped(KeyEvent e) {
-            SshConn conn = activeConn();
-            if (conn == null || !conn.connected || conn.toChannel == null) {
-                e.consume();
-                return;
-            }
-            char c = e.getKeyChar();
-            // 过滤控制字符（Enter/Backspace/Tab/Esc 等由 keyPressed 处理）
-            if (c == '\n' || c == '\t' || c == '\b' || c == '\r' || c == 0x7F || c == 0x1B || c == KeyEvent.CHAR_UNDEFINED)
-                return;
-            // 避免重复处理 Ctrl 组合键产生的控制字符
-            if (Character.isISOControl(c)) return;
-            e.consume();
-            sendToChannel(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
-            // 跟踪输入并触发防抖补全
-            currentInput.append(c);
-            suggestionTimer.restart();
-        }
-
-        @Override
-        public void keyPressed(KeyEvent e) {
-            SshConn conn = activeConn();
-            if (conn == null || !conn.connected || conn.toChannel == null) {
-                e.consume();
-                return;
-            }
-            int code = e.getKeyCode();
-            int mod = e.getModifiersEx();
-            boolean ctrl = (mod & KeyEvent.CTRL_DOWN_MASK) != 0;
-
-            switch (code) {
-                case KeyEvent.VK_ENTER:
-                    e.consume();
-                    if (suggestionPopup.isVisible() && selectedSuggestionIndex >= 0) {
-                        executeSelectedSuggestion();
-                    } else {
-                        sendToChannel(new byte[]{'\r'});
-                        currentInput.setLength(0);
-                        dismissSuggestion();
-                    }
-                    break;
-                case KeyEvent.VK_TAB:
-                    e.consume();
-                    sendToChannel(new byte[]{'\t'});
-                    // Tab 后远程会补全，不重启计时器避免弹出过期提示
-                    break;
-                case KeyEvent.VK_BACK_SPACE:
-                    e.consume();
-                    sendToChannel(new byte[]{0x7F});
-                    if (currentInput.length() > 0) currentInput.setLength(currentInput.length() - 1);
-                    suggestionTimer.restart();
-                    break;
-                case KeyEvent.VK_DELETE:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', '3', '~'});
-                    break;
-                case KeyEvent.VK_UP:
-                case KeyEvent.VK_DOWN:
-                    e.consume();
-                    if (suggestionPopup.isVisible()) {
-                        navigateSuggestion(code == KeyEvent.VK_UP ? -1 : 1);
-                    } else {
-                        sendToChannel(new byte[]{'\u001B', '[', (byte) ('A' + (code == KeyEvent.VK_DOWN ? 1 : 0))});
-                    }
-                    break;
-                case KeyEvent.VK_RIGHT:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', 'C'});
-                    break;
-                case KeyEvent.VK_LEFT:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', 'D'});
-                    break;
-                case KeyEvent.VK_HOME:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', 'H'});
-                    break;
-                case KeyEvent.VK_END:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', 'F'});
-                    break;
-                case KeyEvent.VK_PAGE_UP:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', '5', '~'});
-                    break;
-                case KeyEvent.VK_PAGE_DOWN:
-                    e.consume();
-                    sendToChannel(new byte[]{'\u001B', '[', '6', '~'});
-                    break;
-                case KeyEvent.VK_ESCAPE:
-                    if (suggestionPopup.isVisible()) {
-                        dismissSuggestion();
-                    } else {
-                        sendToChannel(new byte[]{'\u001B'});
-                    }
-                    e.consume();
-                    break;
-                case KeyEvent.VK_C:
-                    if (ctrl) {
-                        e.consume();
-                        sendToChannel(new byte[]{0x03});
-                        currentInput.setLength(0);
-                        dismissSuggestion();
-                    }
-                    break;
-                case KeyEvent.VK_D:
-                    if (ctrl) { e.consume(); sendToChannel(new byte[]{0x04}); }
-                    break;
-                case KeyEvent.VK_Z:
-                    if (ctrl) { e.consume(); sendToChannel(new byte[]{0x1A}); }
-                    break;
-                case KeyEvent.VK_L:
-                    if (ctrl) {
-                        e.consume();
-                        sendToChannel(new byte[]{0x0C});
-                        currentInput.setLength(0);
-                        dismissSuggestion();
-                    }
-                    break;
-            }
-        }
-    }
-
-    // ==================== 指令补全 ====================
-
-    private void dismissSuggestion() {
-        suggestionPopup.setVisible(false);
-        suggestionTimer.stop();
-        selectedSuggestionIndex = -1;
-    }
-
-    /** 上下导航补全列表 */
-    private void navigateSuggestion(int delta) {
-        int count = suggestionPopup.getComponentCount();
-        if (count == 0) return;
-        selectedSuggestionIndex = (selectedSuggestionIndex + delta + count) % count;
-        updateSuggestionHighlight();
-    }
-
-    /** 选中当前高亮项的指令并发送 */
-    private void executeSelectedSuggestion() {
-        if (selectedSuggestionIndex < 0 || selectedSuggestionIndex >= suggestionPopup.getComponentCount()) return;
-        Component comp = suggestionPopup.getComponent(selectedSuggestionIndex);
-        if (comp instanceof JMenuItem) {
-            ((JMenuItem) comp).doClick();
-        }
-    }
-
-    /** 刷新弹窗里所有项的高亮状态 */
-    private void updateSuggestionHighlight() {
-        int count = suggestionPopup.getComponentCount();
-        for (int i = 0; i < count; i++) {
-            Component comp = suggestionPopup.getComponent(i);
-            if (comp instanceof JMenuItem) {
-                JMenuItem item = (JMenuItem) comp;
-                if (i == selectedSuggestionIndex) {
-                    item.setBackground(new Color(0x3A6EA5));
-                    item.setOpaque(true);
-                } else {
-                    item.setBackground(null);
-                    item.setOpaque(false);
-                }
-            }
-        }
-    }
-
-    private void showSuggestions() {
-        if (terminalArea == null) return;
-        String input = currentInput.toString();
-        // 提取空格分隔后的最后一个词
-        String[] parts = input.split("\\s+");
-        String lastWord = parts.length > 0 ? parts[parts.length - 1] : "";
-        if (lastWord.isEmpty()) {
-            dismissSuggestion();
-            return;
-        }
-
-        String prefix = lastWord.toLowerCase();
-        java.util.List<String> matches = new java.util.ArrayList<>();
-        for (String cmd : LINUX_COMMANDS) {
-            if (cmd.startsWith(prefix) && matches.size() < 10) {
-                matches.add(cmd);
-            }
-        }
-        if (matches.isEmpty()) {
-            dismissSuggestion();
-            return;
-        }
-
-        suggestionPopup.removeAll();
-        for (String cmd : matches) {
-            JMenuItem item = new JMenuItem(cmd);
-            item.setFont(new Font("Consolas", Font.PLAIN, 12));
-            item.addActionListener(ae -> {
-                String remaining = cmd.substring(prefix.length());
-                sendToChannel(remaining.getBytes(StandardCharsets.UTF_8));
-                currentInput.append(remaining);
-                dismissSuggestion();
-                terminalArea.requestFocusInWindow();
-            });
-            suggestionPopup.add(item);
-        }
-
-        // 默认高亮第一项
-        selectedSuggestionIndex = 0;
-        updateSuggestionHighlight();
-
-        // 定位在终端底部、光标附近
-        try {
-            Point pos = terminalArea.getCaret().getMagicCaretPosition();
-            if (pos == null) {
-                pos = new Point(10, terminalArea.getHeight() - 60);
-            }
-            suggestionPopup.show(terminalArea, pos.x, pos.y + 18);
-        } catch (Exception ex) {
-            suggestionPopup.show(terminalArea, 10, terminalArea.getHeight() - 60);
-        }
+    /** 用当前 ANSI 状态创建一个 Style */
+    private Style makeCurrentStyle(StyledDocument doc) {
+        Style style = doc.addStyle("a" + System.nanoTime(), null);
+        StyleConstants.setForeground(style, ansiFg);
+        StyleConstants.setFontFamily(style, "NSimSun");
+        StyleConstants.setFontSize(style, 13);
+        StyleConstants.setBold(style, ansiBold);
+        if (ansiBg != null) StyleConstants.setBackground(style, ansiBg);
+        return style;
     }
 
     // ==================== SSH 连接核心 ====================
@@ -806,68 +1845,88 @@ public class SshPanel extends AbstractCommandPanel {
             try {
                 appendTerminal("[正在连接 " + conn.name + " (" + conn.host + ":" + conn.port + ")...]\n", C_SYS);
 
-                SshClient client = SshClient.setUpDefaultClient();
-                conn.client = client;
-                client.start();
+                JSch jsch = new JSch();
+                conn.jsch = jsch;
 
-                // 自定义主机密钥校验
-                client.setServerKeyVerifier((clientSession, remoteAddress, serverKey) -> {
-                    String addr = conn.host + ":" + conn.port;
-                    String fingerprint = computeFingerprint(serverKey);
+                // ---- 主机密钥仓库：存待校验密钥供 UserInfo 对话框使用 ----
+                final byte[][] pendingKey = new byte[1][];
+                final String[] pendingHost = new String[1];
 
-                    // 已保存且指纹一致 → 直接通过
-                    String saved = knownHosts.get(addr);
-                    if (saved != null && saved.equals(fingerprint)) {
-                        return true;
-                    }
-
-                    // 弹窗让用户确认
-                    boolean[] box = {false, false}; // [accepted, save]
-                    try {
-                        SwingUtilities.invokeAndWait(() -> {
-                            HostKeyVerifyDialog dlg = new HostKeyVerifyDialog(
-                                    SwingUtilities.getWindowAncestor(SshPanel.this),
-                                    conn.host, conn.port, fingerprint, serverKey.getAlgorithm());
-                            dlg.setVisible(true);
-                            box[0] = dlg.accepted;
-                            box[1] = dlg.savePermanently;
-                        });
-                    } catch (Exception ex) {
-                        return false;
-                    }
-
-                    if (box[0]) {
-                        if (box[1]) {
-                            knownHosts.put(addr, fingerprint);
-                            saveKnownHosts();
+                jsch.setHostKeyRepository(new HostKeyRepository() {
+                    @Override
+                    public int check(String host, byte[] key) {
+                        String fp = computeFingerprint(key);
+                        String saved = knownHosts.get(host);
+                        if (saved != null && saved.equals(fp)) {
+                            return HostKeyRepository.OK;
                         }
-                        return true;
+                        if (saved != null) {
+                            return HostKeyRepository.CHANGED;
+                        }
+                        pendingKey[0] = key;
+                        pendingHost[0] = host;
+                        return HostKeyRepository.NOT_INCLUDED;
                     }
-                    return false;
+
+                    @Override public void add(HostKey hk, UserInfo ui) {}
+                    @Override public HostKey[] getHostKey() { return new HostKey[0]; }
+                    @Override public HostKey[] getHostKey(String h, String t) { return new HostKey[0]; }
+                    @Override public void remove(String h, String t) {}
+                    @Override public void remove(String h, String t, byte[] k) {}
+                    @Override public String getKnownHostsRepositoryID() { return "CoreTools"; }
                 });
 
-                ClientSession session = client.connect(conn.username, conn.host, conn.port)
-                        .verify(8000, TimeUnit.MILLISECONDS).getSession();
-                session.addPasswordIdentity(conn.password);
-                session.auth().verify(8000, TimeUnit.MILLISECONDS);
+                // ---- 会话 ----
+                Session session = jsch.getSession(conn.username, conn.host, conn.port);
+                session.setPassword(conn.password);
+                session.setConfig("StrictHostKeyChecking", "ask");
 
-                ChannelShell channel = session.createShellChannel();
+                session.setUserInfo(new UserInfo() {
+                    @Override public String getPassphrase() { return null; }
+                    @Override public String getPassword() { return null; }
+                    @Override public boolean promptPassword(String msg) { return false; }
+                    @Override public boolean promptPassphrase(String msg) { return false; }
+                    @Override public void showMessage(String msg) {}
+
+                    @Override
+                    public boolean promptYesNo(String msg) {
+                        byte[] key = pendingKey[0];
+                        String host = pendingHost[0] != null ? pendingHost[0] : (conn.host + ":" + conn.port);
+                        String fp = key != null ? computeFingerprint(key) : "SHA256:???";
+                        String keyType = key != null ? getKeyType(key) : "SSH";
+                        boolean[] box = {false, false};
+                        try {
+                            SwingUtilities.invokeAndWait(() -> {
+                                HostKeyVerifyDialog dlg = new HostKeyVerifyDialog(
+                                    SwingUtilities.getWindowAncestor(SshPanel.this),
+                                    conn.host, conn.port, fp, keyType);
+                                dlg.setVisible(true);
+                                box[0] = dlg.accepted;
+                                box[1] = dlg.savePermanently;
+                            });
+                        } catch (Exception ex) {
+                            return false;
+                        }
+                        if (box[0] && box[1]) {
+                            knownHosts.put(host, fp);
+                            saveKnownHosts();
+                        }
+                        return box[0];
+                    }
+                });
+
+                session.connect(8000);
+
+                // ---- Shell Channel ----
+                ChannelShell channel = (ChannelShell) session.openChannel("shell");
                 channel.setPtyType("xterm-256color");
-                channel.setPtyColumns(160);
-                channel.setPtyLines(30);
-                channel.setEnv("LANG", "en_US.UTF-8");
+                channel.setPtySize(160, 30, 800, 600);
+                channel.setEnv("LANG", "zh_CN.UTF-8");
 
-                PipedInputStream toChannelPipe = new PipedInputStream(65536);
-                PipedOutputStream toChannelOs = new PipedOutputStream(toChannelPipe);
-                channel.setIn(toChannelPipe);
+                InputStream recvStream = channel.getInputStream();
+                OutputStream toChannelOs = channel.getOutputStream();
 
-                // stdout + stderr 合并到一个流
-                PipedInputStream recvStream = new PipedInputStream(65536);
-                PipedOutputStream recvOut = new PipedOutputStream(recvStream);
-                channel.setOut(recvOut);
-                channel.setErr(recvOut);
-
-                channel.open().verify(8000, TimeUnit.MILLISECONDS);
+                channel.connect(8000);
 
                 conn.session = session;
                 conn.channel = channel;
@@ -881,7 +1940,10 @@ public class SshPanel extends AbstractCommandPanel {
                 });
                 appendTerminal("[连接成功: " + conn.name + "]\n\n", C_RECV);
 
-                // 读线程 - ANSI 着色输出
+                // 首次加载远程目录
+                if (dirRefreshTimer != null) dirRefreshTimer.restart();
+
+                // 读线程 — ANSI 着色输出
                 byte[] buf = new byte[4096];
                 try {
                     while (conn.connected) {
@@ -920,20 +1982,14 @@ public class SshPanel extends AbstractCommandPanel {
         } catch (Exception ignored) {}
         try {
             if (conn.channel != null) {
-                conn.channel.close(false);
+                conn.channel.disconnect();
                 conn.channel = null;
             }
         } catch (Exception ignored) {}
         try {
             if (conn.session != null) {
-                conn.session.close();
+                conn.session.disconnect();
                 conn.session = null;
-            }
-        } catch (Exception ignored) {}
-        try {
-            if (conn.client != null) {
-                conn.client.stop();
-                conn.client = null;
             }
         } catch (Exception ignored) {}
 
@@ -953,13 +2009,21 @@ public class SshPanel extends AbstractCommandPanel {
         statusLabel.setForeground(C_RECV);
         connInfoLabel.setText(conn.name + "  " + conn.username + "@" + conn.host + ":" + conn.port);
         resetAnsiState();
-        terminalArea.requestFocusInWindow();
+        commandInput.setEnabled(true);
+        commandInput.requestFocusInWindow();
     }
 
     private void updateUiDisconnected() {
         statusLabel.setText("未连接");
         statusLabel.setForeground(C_WARN);
         connInfoLabel.setText("");
+        commandInput.setEnabled(false);
+        // 清空控制台
+        terminalArea.setText("");
+        // 清空远程目录树
+        dirPathLabel.setText("未连接");
+        dirRootNode.removeAllChildren();
+        dirTreeModel.reload();
     }
 
     private void resetAnsiState() {

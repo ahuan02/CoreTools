@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -75,6 +76,7 @@ public class TelnetPanel extends AbstractCommandPanel {
         telnetInputField.setFont(new Font("Consolas", Font.PLAIN, 14));
         telnetInputField.setToolTipText("输入命令后按回车或点击发送，输入 exit 可断开");
         telnetInputField.setEnabled(false);
+        NetUtil.fixPaste(telnetInputField);
         inputRow.add(telnetInputField, BorderLayout.CENTER);
 
         btnTelnetSend = makeBtn("发送", new Color(0x42A5F5));

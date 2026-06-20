@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
@@ -111,24 +112,28 @@ public class DataConvertPanel extends AbstractCommandPanel {
         radixDecField = new JTextField("255", 10);
         radixDecField.setFont(FONT_TEXT);
         radixDecField.addCaretListener(e -> onDecChanged());
+        NetUtil.fixPaste(radixDecField);
         row1.add(radixDecField);
 
         row1.add(new JLabel("十六进制:"));
         radixHexField = new JTextField("0xFF", 10);
         radixHexField.setFont(FONT_TEXT);
         radixHexField.addCaretListener(e -> onHexChanged());
+        NetUtil.fixPaste(radixHexField);
         row1.add(radixHexField);
 
         row1.add(new JLabel("八进制:"));
         radixOctField = new JTextField("377", 8);
         radixOctField.setFont(FONT_TEXT);
         radixOctField.addCaretListener(e -> onOctChanged());
+        NetUtil.fixPaste(radixOctField);
         row1.add(radixOctField);
 
         row1.add(new JLabel("二进制:"));
         radixBinField = new JTextField("11111111", 16);
         radixBinField.setFont(FONT_TEXT);
         radixBinField.addCaretListener(e -> onBinChanged());
+        NetUtil.fixPaste(radixBinField);
         row1.add(radixBinField);
 
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
@@ -320,6 +325,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         strInputField = new JTextField(30);
         strInputField.setFont(FONT_TEXT);
         strInputField.setToolTipText("输入要转换的字符串");
+        NetUtil.fixPaste(strInputField);
         ctrlRow.add(strInputField);
 
         strEncFromCombo = new JComboBox<>(new String[]{"UTF-8", "GBK", "GB2312", "ASCII", "ISO-8859-1", "UTF-16", "UTF-16BE", "UTF-16LE"});
@@ -453,6 +459,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         ctrlRow.add(new JLabel("文本:"));
         b64TextField = new JTextField(30);
         b64TextField.setFont(FONT_TEXT);
+        NetUtil.fixPaste(b64TextField);
         ctrlRow.add(b64TextField);
 
         btnB64Encode = makeBtn("编码", new Color(0x4CAF50));
@@ -509,6 +516,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         ctrlRow.add(new JLabel("文本:"));
         urlTextField = new JTextField(30);
         urlTextField.setFont(FONT_TEXT);
+        NetUtil.fixPaste(urlTextField);
         ctrlRow.add(urlTextField);
 
         btnUrlEncode = makeBtn("编码", new Color(0x4CAF50));
@@ -574,6 +582,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         row1.add(new JLabel("时间戳:"));
         tsField = new JTextField(15);
         tsField.setFont(FONT_TEXT);
+        NetUtil.fixPaste(tsField);
         row1.add(tsField);
 
         tsUnitCombo = new JComboBox<>(new String[]{"秒", "毫秒"});
@@ -612,6 +621,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         tsBatchField = new JTextField(30);
         tsBatchField.setFont(FONT_TEXT);
         tsBatchField.setToolTipText("多个时间戳用逗号或空格分隔");
+        NetUtil.fixPaste(tsBatchField);
         row3.add(tsBatchField);
 
         btnTsBatch = makeBtn("批量转换", new Color(0xFFB74D));
@@ -762,6 +772,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         crcInputField = new JTextField(28);
         crcInputField.setFont(FONT_TEXT);
         crcInputField.setToolTipText("输入文本或十六进制（如 AABBCC 或 0xAA 0xBB 0xCC）");
+        NetUtil.fixPaste(crcInputField);
         row1.add(crcInputField);
 
         crcAlgoCombo = new JComboBox<>(new String[]{
@@ -930,6 +941,7 @@ public class DataConvertPanel extends AbstractCommandPanel {
         cryptoInputField = new JTextField(28);
         cryptoInputField.setFont(FONT_TEXT);
         cryptoInputField.setToolTipText("输入明文或密文");
+        NetUtil.fixPaste(cryptoInputField);
         row1.add(cryptoInputField);
 
         cryptoAlgoCombo = new JComboBox<>(new String[]{"AES", "DES", "MD5", "SHA-1", "SHA-256"});
@@ -953,12 +965,14 @@ public class DataConvertPanel extends AbstractCommandPanel {
         cryptoKeyField = new JTextField(20);
         cryptoKeyField.setFont(FONT_TEXT);
         cryptoKeyField.setToolTipText("AES 支持 16/24/32 字节密钥，DES 需要 8 字节密钥");
+        NetUtil.fixPaste(cryptoKeyField);
         row2.add(cryptoKeyField);
 
         row2.add(new JLabel("IV:"));
         cryptoIvField = new JTextField(16);
         cryptoIvField.setFont(FONT_TEXT);
         cryptoIvField.setToolTipText("CBC/CFB/OFB/CTR 模式需要 IV，长度与块大小一致");
+        NetUtil.fixPaste(cryptoIvField);
         row2.add(cryptoIvField);
 
         JPanel row3 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));

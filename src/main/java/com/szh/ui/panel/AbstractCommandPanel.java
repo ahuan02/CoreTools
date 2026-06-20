@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.ui.MainFrame;
+import com.szh.utils.NetUtil;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -62,6 +63,7 @@ public abstract class AbstractCommandPanel extends JPanel {
     protected JTextField createTextField(String defaultVal, int cols) {
         JTextField f = new JTextField(defaultVal, cols);
         f.setPreferredSize(new Dimension(cols * 9, 24));
+        NetUtil.fixPaste(f);
         return f;
     }
 

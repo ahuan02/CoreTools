@@ -3,7 +3,15 @@ package com.szh.ui.panel;
 import com.formdev.flatlaf.extras.FlatSVGIcon;
 import com.szh.entity.ModelConfig;
 import com.szh.manager.ConfigManager;
+import com.szh.utils.AiUtils;
 import com.szh.utils.NetUtil;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
@@ -12,13 +20,20 @@ import org.pushingpixels.radiance.animation.api.Timeline.TimelineState;
 import org.pushingpixels.radiance.animation.api.callback.TimelineCallback;
 
 import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.plaf.basic.BasicComboBoxEditor;
+import javax.swing.undo.UndoManager;
 import java.awt.*;
 import java.awt.event.*;
 import java.net.URL;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * AI 对话面板 - 基于 langchain4j
@@ -33,10 +48,10 @@ public class AiChatPanel extends AbstractCommandPanel {
     private ChatBubble streamingBubble;   // 当前流式输出中的气泡（用于增量更新）
     private JPanel streamingWrapper;      // 流式气泡的父级包装容器
     private JTextArea inputArea;
+    private UndoManager inputUndoManager;   // inputArea 的撤销管理器
     private JButton sendBtn;
-    private JButton clearBtn;
     private JButton addModelBtn;
-    private JLabel editModelBtn;
+    private JButton editModelBtn;
     private JScrollPane chatScrollPane;
     private JLayeredPane chatLayeredPane;     // 层级面板，放浮动按钮
     private JButton scrollToBottomBtn;         // 浮动「滚动到底部」按钮
@@ -44,6 +59,17 @@ public class AiChatPanel extends AbstractCommandPanel {
 
     /** 流式响应进行中标记，防止过程中打开模态弹窗导致 UI 卡死 */
     private volatile boolean streamingActive = false;
+
+    /** 停止流式输出标记，用户点击停止时设为 true，后台线程检测到后中断流式输出 */
+    private volatile boolean stopRequested = false;
+
+    /** 用户在流式输出期间手动滚上去了，不再自动滚动到底部 */
+    private volatile boolean userScrolledUp = false;
+
+    /** 对话记忆，保留最近 20 轮对话（用户+AI 各算一轮） */
+    private final ChatMemory chatMemory = MessageWindowChatMemory.builder()
+            .maxMessages(40)
+            .build();
 
     // ==================== 颜色常量 ====================
     private static final Color C_INPUT_BG   = new Color(0x252525);
@@ -114,6 +140,9 @@ public class AiChatPanel extends AbstractCommandPanel {
         setLayout(new BorderLayout());
         setBackground(NetUtil.C_BG);
 
+        // 注册预置动态工具（getCurrentTime 等），无需创建类即可扩展 AI 能力
+        AiUtils.registerPresetDynamicTools();
+
         // 在父类构造器中被子类覆盖调用，此时字段初始化器尚未执行，需手动初始化
         if (modelConfigs == null) {
             modelConfigs = new java.util.ArrayList<>();
@@ -124,17 +153,34 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         add(createChatArea(), BorderLayout.CENTER);
 
-        // 底部输入栏：水平居中
-        JPanel southWrapper = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        // 底部输入栏：自适应宽度，留少量左右边距
+        JPanel southWrapper = new JPanel(new BorderLayout());
         southWrapper.setBackground(C_INPUT_BG);
         southWrapper.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(1, 0, 0, 0, C_BORDER),
-            BorderFactory.createEmptyBorder(6, 0, 6, 0)));
-        southWrapper.add(createInputBar());
+            BorderFactory.createEmptyBorder(6, 12, 6, 12)));
+        southWrapper.add(createInputBar(), BorderLayout.CENTER);
         add(southWrapper, BorderLayout.SOUTH);
 
         // 初始占位
         showPlaceholder();
+
+        // 监听面板可见性变化：切换 Tab 时暂停呼吸动画，避免后台闪烁
+        addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) != 0) {
+                if (!isShowing()) {
+                    // 面板隐藏时，暂停当前流式气泡的思考动画
+                    if (streamingBubble != null && streamingBubble.thinking) {
+                        streamingBubble.pauseThinkingAnimation();
+                    }
+                } else {
+                    // 面板重新显示时，恢复思考动画
+                    if (streamingBubble != null && streamingBubble.thinking) {
+                        streamingBubble.resumeThinkingAnimation();
+                    }
+                }
+            }
+        });
     }
 
     private JTextField createField(int cols) {
@@ -214,11 +260,70 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatScrollPane.setBorder(null);
         chatScrollPane.getViewport().setBackground(NetUtil.C_BG);
         chatScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-        chatScrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        // 圆角滚动条（自定义 UI）
+        chatScrollPane.getVerticalScrollBar().setUI(new javax.swing.plaf.basic.BasicScrollBarUI() {
+            @Override
+            protected void configureScrollBarColors() {
+                thumbColor = new Color(0x666666);
+                trackColor = new Color(0x2A2A2A);
+            }
+            @Override
+            protected JButton createDecreaseButton(int orientation) {
+                return createZeroSizeButton();
+            }
+            @Override
+            protected JButton createIncreaseButton(int orientation) {
+                return createZeroSizeButton();
+            }
+            private JButton createZeroSizeButton() {
+                JButton b = new JButton();
+                Dimension zero = new Dimension(0, 0);
+                b.setPreferredSize(zero);
+                b.setMinimumSize(zero);
+                b.setMaximumSize(zero);
+                return b;
+            }
+            @Override
+            protected void paintThumb(Graphics g, JComponent c, Rectangle thumbBounds) {
+                if (thumbBounds.isEmpty() || !c.isEnabled()) return;
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = thumbBounds.width;
+                int h = thumbBounds.height;
+                // 圆角半径取宽度的一半，形成胶囊/药丸形状
+                int arc = Math.min(w, h) / 2;
+                int margin = 3;
+                int x = thumbBounds.x + margin;
+                int y = thumbBounds.y + margin;
+                int rw = w - margin * 2;
+                int rh = h - margin * 2;
+                if (rw <= 0) rw = w;
+                if (rh <= 0) rh = h;
+                // 圆角滑块填充
+                g2.setColor(thumbColor);
+                g2.fillRoundRect(x, y, rw, rh, arc, arc);
+                g2.dispose();
+            }
+            @Override
+            protected void paintTrack(Graphics g, JComponent c, Rectangle trackBounds) {
+                // 轨道完全透明，不绘制任何内容
+            }
+        });
+        // 确保滚动条宽度合适
+        chatScrollPane.getVerticalScrollBar().setPreferredSize(new Dimension(10, 0));
+        // 丝滑滚动优化：鼠标滚轮增量
+        chatScrollPane.getVerticalScrollBar().setUnitIncrement(32);
+        chatScrollPane.getVerticalScrollBar().setBlockIncrement(120);
 
-        // 监听滚动：流式期间用户滚上去时显示浮动按钮
+        // 监听滚动：用户滚上去时停止自动滚动 / 显示浮动按钮
         chatScrollPane.getVerticalScrollBar().addAdjustmentListener(e -> {
-            if (streamingActive) updateScrollToBottomButton();
+            if (e.getValueIsAdjusting()) return;
+            if (streamingActive) {
+                if (!isScrolledToBottom()) {
+                    userScrolledUp = true;
+                }
+            }
+            updateScrollToBottomButton();
         });
 
         // 层级面板：DEFAULT 层放滚动面板，PALETTE 层放浮动按钮
@@ -241,8 +346,12 @@ public class AiChatPanel extends AbstractCommandPanel {
         return chatLayeredPane;
     }
 
-    /** 创建浮动「滚动到底部」圆形按钮（绘制圆底+下箭头） */
+    /** 创建浮动「滚动到底部」圆形按钮（圆底 + caret-bottom.svg 图标） */
     private JButton createScrollToBottomFloatingButton() {
+        int btnSize = 42;
+        int iconSize = 20;
+        Icon caretIcon = loadSvgIcon("/icons/caret-bottom.svg", iconSize);
+
         JButton btn = new JButton() {
             @Override
             protected void paintComponent(Graphics g) {
@@ -256,15 +365,13 @@ public class AiChatPanel extends AbstractCommandPanel {
                 g2.setStroke(new BasicStroke(1.5f));
                 g2.setColor(new Color(0x666666));
                 g2.drawOval(2, 2, w - 4, h - 4);
-                // 向下箭头
-                g2.setColor(new Color(0xCCCCCC));
-                g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 18));
-                FontMetrics fm = g2.getFontMetrics();
-                String arrow = "\u2304";
-                int ax = (w - fm.stringWidth(arrow)) / 2;
-                int ay = (h + fm.getAscent() - fm.getDescent()) / 2;
-                g2.drawString(arrow, ax, ay);
                 g2.dispose();
+                // 绘制 SVG 图标居中
+                if (caretIcon != null) {
+                    int ix = (w - iconSize) / 2;
+                    int iy = (h - iconSize) / 2;
+                    caretIcon.paintIcon(this, g, ix, iy);
+                }
             }
         };
         btn.setContentAreaFilled(false);
@@ -272,10 +379,10 @@ public class AiChatPanel extends AbstractCommandPanel {
         btn.setFocusPainted(false);
         btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         btn.setVisible(false);
-        int btnSize = 42;
         btn.setSize(btnSize, btnSize);
         btn.setPreferredSize(new Dimension(btnSize, btnSize));
         btn.addActionListener(e -> {
+            userScrolledUp = false;
             hideScrollToBottomButton();
             scrollToBottom();
         });
@@ -326,22 +433,26 @@ public class AiChatPanel extends AbstractCommandPanel {
         bar.setBackground(C_INPUT_BG);
         bar.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
 
-        // 左侧：模型下拉选择器 + 编辑按钮 + 添加模型按钮
+        // 左侧：模型下拉选择器 + 编辑按钮 + 添加模型按钮（图标按钮，垂直居中对齐）
         JPanel leftBtnPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         leftBtnPanel.setOpaque(false);
-        leftBtnPanel.add(modelSelector);
-        // 编辑当前选中模型的图标标签
-        editModelBtn = new JLabel(loadEditIcon(24));
-        editModelBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        editModelBtn.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) { editSelectedModel(); }
-        });
+        // 用垂直居中的包装
+        JPanel selectorWrap = new JPanel(new GridBagLayout());
+        selectorWrap.setOpaque(false);
+        selectorWrap.add(modelSelector);
+        leftBtnPanel.add(selectorWrap);
+
+        // 编辑按钮（图标按钮，和发送按钮对齐）
+        editModelBtn = createIconButton("/icons/edit.svg", 20, "编辑模型", e -> editSelectedModel());
         leftBtnPanel.add(editModelBtn);
-        addModelBtn = createFilledButton("＋ 添加模型", e -> showAddModelDialog());
+
+        // 添加模型按钮（图标按钮，和发送按钮对齐）
+        addModelBtn = createIconButton("/icons/add.svg", 20, "添加模型", e -> showAddModelDialog());
         leftBtnPanel.add(addModelBtn);
+
         bar.add(leftBtnPanel, BorderLayout.WEST);
 
-        // 中间：输入框（带 placeholder）
+        // 中间：输入框（带 placeholder），包在 JScrollPane 中支持多行滚动
         JPanel centerPanel = new JPanel(new BorderLayout());
         centerPanel.setOpaque(false);
         inputArea = new PromptTextArea(1, 0, "输入消息，Enter 发送");
@@ -351,9 +462,21 @@ public class AiChatPanel extends AbstractCommandPanel {
         inputArea.setCaretColor(NetUtil.TEXT_COLOR);
         inputArea.setLineWrap(true);
         inputArea.setWrapStyleWord(true);
+        NetUtil.fixPaste(inputArea);
         inputArea.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(C_BORDER, 1, true),
             BorderFactory.createEmptyBorder(5, 10, 5, 10)));
+
+        // 文本域内容变化时切换发送按钮启用状态
+        inputArea.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) { updateSendBtnState(); }
+            @Override
+            public void removeUpdate(DocumentEvent e) { updateSendBtnState(); }
+            @Override
+            public void changedUpdate(DocumentEvent e) { updateSendBtnState(); }
+        });
+
         // Enter 发送，Shift+Enter 换行
         inputArea.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "send");
         inputArea.getActionMap().put("send", new AbstractAction() {
@@ -366,27 +489,241 @@ public class AiChatPanel extends AbstractCommandPanel {
             public void actionPerformed(ActionEvent e) { inputArea.append("\n"); }
         });
 
-        // 用 Box 做垂直居中包装，避免默认 FlowLayout 导致的拉伸
-        centerPanel.add(inputArea, BorderLayout.CENTER);
+        // Ctrl+Z 撤销 / Ctrl+Y 恢复
+        inputUndoManager = new UndoManager();
+        inputUndoManager.setLimit(200);  // 最多保留 200 步操作历史
+        inputArea.getDocument().addUndoableEditListener(inputUndoManager);
+        inputArea.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK), "undo");
+        inputArea.getActionMap().put("undo", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (inputUndoManager.canUndo()) {
+                    inputUndoManager.undo();
+                }
+            }
+        });
+        inputArea.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_Y, InputEvent.CTRL_DOWN_MASK), "redo");
+        inputArea.getActionMap().put("redo", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (inputUndoManager.canRedo()) {
+                    inputUndoManager.redo();
+                }
+            }
+        });
+
+        // 用 JScrollPane 包住 inputArea，支持多行时滚动
+        JScrollPane inputScrollPane = new JScrollPane(inputArea);
+        inputScrollPane.setBorder(BorderFactory.createEmptyBorder());
+        inputScrollPane.setOpaque(false);
+        inputScrollPane.getViewport().setOpaque(false);
+        inputScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        inputScrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+        centerPanel.add(inputScrollPane, BorderLayout.CENTER);
         bar.add(centerPanel, BorderLayout.CENTER);
 
         // 右侧按钮
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         btnPanel.setOpaque(false);
-        clearBtn = createOutlinedButton("清除", C_TIME, e -> clearChat());
-        sendBtn  = createFilledButton("发送", e -> sendMessage());
-        btnPanel.add(clearBtn);
+
+        // 新建会话按钮
+        JButton newSessionBtn = createIconButton("/icons/create_say.svg", 20, "新建会话", e -> newSession());
+        btnPanel.add(newSessionBtn);
+
+        sendBtn = createIconSendButton();
         btnPanel.add(sendBtn);
 
         bar.add(btnPanel, BorderLayout.EAST);
 
-        // 输入栏宽度
-        bar.setPreferredSize(new Dimension(900, 40));
-        bar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        // 输入栏高度：最小 40，最大 120（约 6 行），宽度由父容器决定
+        bar.setMinimumSize(new Dimension(0, 40));
+        bar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
         return bar;
     }
 
     // ---- 按钮工厂 ----
+
+    // ---- SVG 图标按钮（发送/停止，带动画） ----
+
+    /** 发送模式 SVG 图标 */
+    private Icon sendIcon;
+    /** 停止模式 SVG 图标 */
+    private Icon stopIcon;
+    /** 当前是否处于发送模式（true=发送, false=停止） */
+    private boolean sendMode = true;
+
+    /** 按钮缩放动画系数（1.0 = 原始大小） */
+    private float btnScale = 1.0f;
+    /** 缩放动画时间线 */
+    private Timeline btnScaleTimeline;
+
+    /** 创建发送/停止图标按钮 */
+    private JButton createIconSendButton() {
+        sendIcon = loadSvgIcon("/icons/send.svg", 20);
+        stopIcon = loadSvgIcon("/icons/stop.svg", 20);
+
+        JButton btn = new JButton() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                // 缩放变换
+                float scale = btnScale;
+                int sw = (int)(w * scale);
+                int sh = (int)(h * scale);
+                int sx = (w - sw) / 2;
+                int sy = (h - sh) / 2;
+                // 图标居中缩放
+                Icon icon = sendMode ? sendIcon : stopIcon;
+                if (icon != null) {
+                    int iconW = (int)(icon.getIconWidth() * scale);
+                    int iconH = (int)(icon.getIconHeight() * scale);
+                    int ix = (w - iconW) / 2;
+                    int iy = (h - iconH) / 2;
+                    // 绘制缩放后的图标
+                    g2.translate(ix, iy);
+                    g2.scale(scale, scale);
+                    icon.paintIcon(this, g2, 0, 0);
+                }
+                g2.dispose();
+            }
+        };
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(false);
+        btn.setEnabled(false);
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        btn.setToolTipText("发送消息 (Enter)");
+        int size = 36;
+        btn.setPreferredSize(new Dimension(size, size));
+        btn.setMinimumSize(new Dimension(size, size));
+        btn.setMaximumSize(new Dimension(size, size));
+
+        // 按下/松开动画
+        btn.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                animateButtonScale(0.85f, 100);
+            }
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                animateButtonScale(1.0f, 150);
+            }
+            @Override
+            public void mouseExited(MouseEvent e) {
+                // 鼠标移出时还原（防止卡在缩小状态）
+                if (btnScale < 1.0f) {
+                    animateButtonScale(1.0f, 100);
+                }
+            }
+        });
+
+        btn.addActionListener(e -> {
+            if (sendMode) {
+                sendMessage();
+            } else {
+                stopStreaming();
+            }
+        });
+
+        return btn;
+    }
+
+    /** 按钮缩放动画 */
+    private void animateButtonScale(float target, int durationMs) {
+        if (btnScaleTimeline != null) {
+            btnScaleTimeline.abort();
+        }
+        float from = btnScale;
+        btnScaleTimeline = Timeline.builder(this)
+            .setDuration(durationMs)
+            .addCallback(new TimelineCallback() {
+                @Override
+                public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
+                                                   float durationFraction, float timelinePosition) {
+                    // no-op
+                }
+                @Override
+                public void onTimelinePulse(float durationFraction, float timelinePosition) {
+                    btnScale = from + (target - from) * timelinePosition;
+                    if (sendBtn != null) sendBtn.repaint();
+                }
+            })
+            .build();
+        btnScaleTimeline.play();
+    }
+
+    /** 根据输入内容切换发送按钮启用/禁用 */
+    private void updateSendBtnState() {
+        if (sendBtn != null) {
+            boolean hasText = !inputArea.getText().trim().isEmpty();
+            sendBtn.setEnabled(hasText && sendMode);
+        }
+    }
+
+    /** 切换到发送模式 */
+    private void switchToSendMode() {
+        sendMode = true;
+        if (sendBtn != null) {
+            sendBtn.setToolTipText("发送消息 (Enter)");
+            updateSendBtnState();
+        }
+    }
+
+    /** 切换到停止模式 */
+    private void switchToStopMode() {
+        sendMode = false;
+        if (sendBtn != null) {
+            sendBtn.setToolTipText("停止生成");
+            sendBtn.setEnabled(true);
+            sendBtn.repaint();
+        }
+    }
+
+    /** 停止流式输出 */
+    private void stopStreaming() {
+        stopRequested = true;
+        // 先禁用按钮防止重复点击，等后台线程确认停止后再恢复
+        if (sendBtn != null) {
+            sendBtn.setEnabled(false);
+            sendBtn.repaint();
+        }
+    }
+
+    /** 从 resources 加载 SVG 图标 */
+    private static Icon loadSvgIcon(String path, int size) {
+        URL url = AiChatPanel.class.getResource(path);
+        if (url != null) {
+            return new FlatSVGIcon(url).derive(size, size);
+        }
+        return null;
+    }
+
+    /** 创建通用图标按钮（无背景圆，纯图标），用于编辑/添加等操作 */
+    private JButton createIconButton(String iconPath, int iconSize, String tooltip, ActionListener action) {
+        Icon icon = loadSvgIcon(iconPath, iconSize);
+        JButton btn = new JButton(icon) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                super.paintComponent(g2);
+                g2.dispose();
+            }
+        };
+        btn.setToolTipText(tooltip);
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(false);
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        int size = 36;
+        btn.setPreferredSize(new Dimension(size, size));
+        btn.setMinimumSize(new Dimension(size, size));
+        btn.setMaximumSize(new Dimension(size, size));
+        btn.addActionListener(action);
+        return btn;
+    }
 
     /** 填充按钮（主操作，如"发送"），宽度自适应文字 */
     private JButton createFilledButton(String text, ActionListener action) {
@@ -473,19 +810,28 @@ public class AiChatPanel extends AbstractCommandPanel {
         String userTime = LocalTime.now().format(TF);
         addMessageBubble("你", text, userTime, true);
         inputArea.setText("");
+        if (inputUndoManager != null) {
+            inputUndoManager.discardAllEdits();  // 清空撤销历史，防止 Ctrl+Z 恢复已发送消息
+        }
 
         // 先创建空的 AI 气泡，准备流式填充（thinking=true 表示等待首 token）
         String aiTime = LocalTime.now().format(TF);
         ChatBubble aiBubble = new ChatBubble("AI", "", aiTime, false, true);
         aiBubble.setAlpha(0.0f);
+        aiBubble.setSlideOffset(1.0f);  // 初始在左侧屏幕外
 
         JPanel wrapper = new JPanel(new BorderLayout());
         wrapper.setOpaque(false);
-        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+        wrapper.setBorder(BorderFactory.createEmptyBorder(2, 12, 2, 12));
         JPanel alignPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         alignPanel.setOpaque(false);
         alignPanel.add(aiBubble);
         wrapper.add(alignPanel, BorderLayout.CENTER);
+
+        // 限制 wrapper 高度防止 BoxLayout 间隙过大
+        aiBubble.setSize(aiBubble.getPreferredSize());
+        int prefH = aiBubble.getPreferredSize().height + 4;
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, prefH));
 
         chatMessagePanel.add(wrapper);
         chatMessagePanel.revalidate();
@@ -494,7 +840,26 @@ public class AiChatPanel extends AbstractCommandPanel {
         this.streamingBubble = aiBubble;
         this.streamingWrapper = wrapper;
 
-        // 淡入动画
+        // 设置 revalidate 回调：用户手动滚上去后不再自动滚动；同时更新 wrapper 高度防止间隙
+        aiBubble.onRevalidate = () -> {
+            if (!isShowing()) return;  // 面板不可见时跳过，避免切 Tab 闪烁
+            // 流式输出时 bubble 高度不断增长，同步更新 wrapper 的 maxHeight
+            if (streamingWrapper != null) {
+                int newH = aiBubble.getPreferredSize().height + 4;
+                streamingWrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH));
+                streamingWrapper.revalidate();
+            }
+            if (!userScrolledUp) {
+                // 双重 invokeLater：等布局完全稳定后再滚动
+                SwingUtilities.invokeLater(() -> {
+                    SwingUtilities.invokeLater(() -> scrollToBottom());
+                });
+            } else {
+                updateScrollToBottomButton();
+            }
+        };
+
+        // 滑入 + 淡入动画（AI从左→右）
         Timeline.builder(aiBubble)
             .setDuration(300)
             .addCallback(new TimelineCallback() {
@@ -502,10 +867,21 @@ public class AiChatPanel extends AbstractCommandPanel {
                 public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
                                                    float durationFraction, float timelinePosition) {
                     aiBubble.repaint();
+                    if (newState == TimelineState.DONE) {
+                        SwingUtilities.invokeLater(() -> {
+                            SwingUtilities.invokeLater(() -> {
+                                chatScrollPane.getVerticalScrollBar().setValue(
+                                    chatScrollPane.getVerticalScrollBar().getMaximum());
+                            });
+                        });
+                    }
                 }
                 @Override
                 public void onTimelinePulse(float durationFraction, float timelinePosition) {
-                    aiBubble.setAlpha(timelinePosition);
+                    // ease-out-quad: 1 - (1-t)^2（比 cubic 更轻量）
+                    float eased = timelinePosition * (2f - timelinePosition);
+                    aiBubble.setAlpha(eased);
+                    aiBubble.setSlideOffset(1f - eased);
                     aiBubble.repaint();
                 }
             })
@@ -514,8 +890,11 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         scrollToBottom();
 
-        // 标记流式开始，禁用编辑按钮防止模态弹窗卡死 UI
+        // 标记流式开始，切换到停止按钮，禁用编辑按钮防止模态弹窗卡死 UI
         streamingActive = true;
+        stopRequested = false;
+        userScrolledUp = false;
+        switchToStopMode();
         setModelButtonsEnabled(false);
         // 思考中状态已在 AI 气泡内部显示（● AI 思考中...），不再单独添加指示器
 
@@ -540,78 +919,179 @@ public class AiChatPanel extends AbstractCommandPanel {
                     .modelName(modelName)
                     .logRequests(true)
                     .logResponses(true)
+                    .strictTools(true)
                     .build();
 
+                // 将用户消息加入对话记忆
+                chatMemory.add(UserMessage.from(text));
+
+                // 构建 ChatRequest，附带工具定义（静态 + 动态）
+                ChatRequest chatRequest = ChatRequest.builder()
+                        .messages(chatMemory.messages())
+                        .toolSpecifications(AiUtils.getAllToolSpecifications())
+                        .build();
+
                 StringBuilder fullResponse = new StringBuilder();
-                model.chat(text, new StreamingChatResponseHandler() {
+                model.chat(chatRequest, new StreamingChatResponseHandler() {
                     @Override
                     public void onPartialResponse(String partialResponse) {
+                        if (stopRequested) {
+                            throw new RuntimeException("User stopped");
+                        }
                         fullResponse.append(partialResponse);
                         SwingUtilities.invokeLater(() -> {
                             if (streamingBubble != null) {
                                 streamingBubble.appendContent(partialResponse);
-                                // 不再强制滚动到底部，让用户自由浏览
                             }
                         });
                     }
 
                     @Override
                     public void onCompleteResponse(ChatResponse completeResponse) {
-                        SwingUtilities.invokeLater(() -> {
-                            streamingBubble = null;
-                            streamingWrapper = null;
-                            streamingActive = false;
-                            hideScrollToBottomButton();
-                            setModelButtonsEnabled(true);
-                        });
+                        // AI 返回了 Tool Call 请求，执行工具并继续对话
+                        if (completeResponse.aiMessage() != null
+                                && completeResponse.aiMessage().hasToolExecutionRequests()) {
+                            AiMessage aiMsg = completeResponse.aiMessage();
+                            chatMemory.add(aiMsg);
+
+                            // 执行工具调用（优先动态，再走 @Tool 静态反射）
+                            for (ToolExecutionRequest toolRequest : aiMsg.toolExecutionRequests()) {
+                                String result = AiUtils.executeTool(toolRequest);
+                                chatMemory.add(ToolExecutionResultMessage.from(toolRequest, result));
+                                SwingUtilities.invokeLater(() -> {
+                                    if (streamingBubble != null) {
+                                        streamingBubble.appendContent(
+                                            "\n\n🔧 执行工具: " + toolRequest.name()
+                                            + " → " + (result.length() > 200
+                                                ? result.substring(0, 200) + "..." : result));
+                                    }
+                                });
+                            }
+
+                            // 工具执行完后，让 AI 基于结果生成最终回复
+                            ChatRequest followUp = ChatRequest.builder()
+                                    .messages(chatMemory.messages())
+                                    .toolSpecifications(AiUtils.getAllToolSpecifications())
+                                    .build();
+                            model.chat(followUp, new StreamingChatResponseHandler() {
+                                StringBuilder followUpText = new StringBuilder();
+                                @Override
+                                public void onPartialResponse(String partialResponse) {
+                                    followUpText.append(partialResponse);
+                                    SwingUtilities.invokeLater(() -> {
+                                        if (streamingBubble != null) {
+                                            streamingBubble.appendContent(partialResponse);
+                                        }
+                                    });
+                                }
+                                @Override
+                                public void onCompleteResponse(ChatResponse followUpResponse) {
+                                    String text = followUpText.toString();
+                                    if (!text.isEmpty()) {
+                                        chatMemory.add(AiMessage.from(text));
+                                    }
+                                    finishStreaming();
+                                }
+                                @Override
+                                public void onError(Throwable error) {
+                                    handleStreamError(error, false);
+                                }
+                            });
+                        } else {
+                            // 普通文本回复
+                            String aiContent = fullResponse.toString();
+                            if (!aiContent.isEmpty()) {
+                                chatMemory.add(AiMessage.from(aiContent));
+                            }
+                            finishStreaming();
+                        }
                     }
 
                     @Override
                     public void onError(Throwable error) {
-                        error.printStackTrace();
-                        SwingUtilities.invokeLater(() -> {
-                            // 移除流式气泡
-                            if (streamingWrapper != null) {
-                                chatMessagePanel.remove(streamingWrapper);
-                                streamingWrapper = null;
-                                streamingBubble = null;
-                                chatMessagePanel.revalidate();
-                                chatMessagePanel.repaint();
-                            }
-                            streamingActive = false;
-                            hideScrollToBottomButton();
-                            setModelButtonsEnabled(true);
-                            String errTime = LocalTime.now().format(TF);
-                            String errDetail = error.getMessage() != null ? error.getMessage() : "";
-                            Throwable cause = error.getCause();
-                            if (cause != null && cause.getMessage() != null) {
-                                errDetail = cause.getMessage();
-                            }
-                            addErrorMessage("API call failed: " + errDetail, errTime);
-                        });
+                        handleStreamError(error, true);
                     }
                 });
             } catch (Exception ex) {
-                ex.printStackTrace();
+                boolean isUserStop = "User stopped".equals(ex.getMessage());
+                if (!isUserStop) {
+                    ex.printStackTrace();
+                }
                 SwingUtilities.invokeLater(() -> {
-                    if (streamingWrapper != null) {
+                    if (!isUserStop && streamingWrapper != null) {
                         chatMessagePanel.remove(streamingWrapper);
                         streamingWrapper = null;
+                        if (streamingBubble != null) streamingBubble.onRevalidate = null;
                         streamingBubble = null;
                         chatMessagePanel.revalidate();
                         chatMessagePanel.repaint();
+                    } else {
+                        if (streamingBubble != null) streamingBubble.onRevalidate = null;
+                        streamingBubble = null;
+                        streamingWrapper = null;
                     }
                     streamingActive = false;
-                    hideScrollToBottomButton();
+                    updateScrollToBottomButton();   // 结束后根据滚动位置判断显隐
                     setModelButtonsEnabled(true);
-                    String errTime = LocalTime.now().format(TF);
-                    String errDetail = ex.getMessage();
-                    Throwable cause = ex.getCause();
-                    if (cause != null && cause.getMessage() != null) {
-                        errDetail = cause.getMessage();
+                    switchToSendMode();
+                    if (!isUserStop) {
+                        String errTime = LocalTime.now().format(TF);
+                        String errDetail = ex.getMessage();
+                        Throwable cause = ex.getCause();
+                        if (cause != null && cause.getMessage() != null) {
+                            errDetail = cause.getMessage();
+                        }
+                        addErrorMessage("API call failed: " + errDetail, errTime);
                     }
-                    addErrorMessage("API call failed: " + errDetail, errTime);
                 });
+            }
+        });
+    }
+
+    /** 流式对话结束后的清理工作 */
+    private void finishStreaming() {
+        SwingUtilities.invokeLater(() -> {
+            if (streamingBubble != null) streamingBubble.onRevalidate = null;
+            streamingBubble = null;
+            streamingWrapper = null;
+            streamingActive = false;
+            updateScrollToBottomButton();   // 结束后根据滚动位置判断显隐
+            setModelButtonsEnabled(true);
+            switchToSendMode();
+        });
+    }
+
+    /** 流式对话出错后的清理工作 */
+    private void handleStreamError(Throwable error, boolean isOuter) {
+        boolean isUserStop = "User stopped".equals(error.getMessage());
+        if (!isUserStop) {
+            error.printStackTrace();
+        }
+        SwingUtilities.invokeLater(() -> {
+            if (!isUserStop && streamingWrapper != null) {
+                chatMessagePanel.remove(streamingWrapper);
+                streamingWrapper = null;
+                if (streamingBubble != null) streamingBubble.onRevalidate = null;
+                streamingBubble = null;
+                chatMessagePanel.revalidate();
+                chatMessagePanel.repaint();
+            } else {
+                if (streamingBubble != null) streamingBubble.onRevalidate = null;
+                streamingBubble = null;
+                streamingWrapper = null;
+            }
+            streamingActive = false;
+            updateScrollToBottomButton();   // 结束后根据滚动位置判断显隐
+            setModelButtonsEnabled(true);
+            switchToSendMode();
+            if (!isUserStop) {
+                String errTime = LocalTime.now().format(TF);
+                String errDetail = error.getMessage() != null ? error.getMessage() : "";
+                Throwable cause = error.getCause();
+                if (cause != null && cause.getMessage() != null) {
+                    errDetail = cause.getMessage();
+                }
+                addErrorMessage("API call failed: " + errDetail, errTime);
             }
         });
     }
@@ -642,12 +1122,18 @@ public class AiChatPanel extends AbstractCommandPanel {
     private void addMessageBubble(String sender, String content, String time, boolean isUser) {
         ChatBubble bubble = new ChatBubble(sender, content, time, isUser);
         bubble.setAlpha(0.0f);
+        bubble.setSlideOffset(1.0f);  // 初始在屏幕外
 
-        // 外层包装：控制左/右对齐和最大宽度
+        // 外层包装：控制左/右对齐
         JPanel wrapper = new JPanel(new BorderLayout());
         wrapper.setOpaque(false);
-        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, bubble.getPreferredSize().height + 10));
-        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+        wrapper.setBorder(BorderFactory.createEmptyBorder(2, 12, 2, 12));
+
+        // 限制 wrapper 最大高度为其 preferredSize，防止 BoxLayout 在气泡间产生巨大间隙
+        // 先让 bubble 计算一次 preferredSize，再约束 wrapper 高度
+        bubble.setSize(bubble.getPreferredSize());
+        int prefH = bubble.getPreferredSize().height + 4; // +4 = wrapper 上下 border 各 2px
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, prefH));
 
         JPanel alignPanel = new JPanel(new FlowLayout(
             isUser ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0));
@@ -658,18 +1144,30 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatMessagePanel.add(wrapper);
         chatMessagePanel.revalidate();
 
-        // 淡入动画
+        // 滑入 + 淡入动画（用户右→左，AI左→右）
         Timeline timeline = Timeline.builder(bubble)
-            .setDuration(450)
+            .setDuration(350)
             .addCallback(new TimelineCallback() {
                 @Override
                 public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
                                                    float durationFraction, float timelinePosition) {
                     bubble.repaint();
+                    // 动画结束时确保滚到底
+                    if (newState == TimelineState.DONE) {
+                        SwingUtilities.invokeLater(() -> {
+                            SwingUtilities.invokeLater(() -> {
+                                chatScrollPane.getVerticalScrollBar().setValue(
+                                    chatScrollPane.getVerticalScrollBar().getMaximum());
+                            });
+                        });
+                    }
                 }
                 @Override
                 public void onTimelinePulse(float durationFraction, float timelinePosition) {
-                    bubble.setAlpha(timelinePosition);
+                    // ease-out-quad: t*(2-t)
+                    float eased = timelinePosition * (2f - timelinePosition);
+                    bubble.setAlpha(eased);
+                    bubble.setSlideOffset(1f - eased);
                     bubble.repaint();
                 }
             })
@@ -683,14 +1181,17 @@ public class AiChatPanel extends AbstractCommandPanel {
     /** 添加错误消息气泡 */
     private void addErrorMessage(String content, String time) {
         ChatBubble bubble = new ChatBubble("系统", content, time, false);
-        bubble.setBubbleBg(new Color(0x4A2020)); // 红色调背景
-        bubble.setBorderColor(new Color(0xC62828));
         bubble.setAlpha(0.0f);
+        bubble.setSlideOffset(1.0f);
 
         JPanel wrapper = new JPanel(new BorderLayout());
         wrapper.setOpaque(false);
-        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, bubble.getPreferredSize().height + 10));
-        wrapper.setBorder(BorderFactory.createEmptyBorder(4, 12, 4, 12));
+        wrapper.setBorder(BorderFactory.createEmptyBorder(2, 12, 2, 12));
+
+        // 限制 wrapper 高度防止 BoxLayout 间隙过大
+        bubble.setSize(bubble.getPreferredSize());
+        int prefH = bubble.getPreferredSize().height + 4;
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, prefH));
 
         JPanel alignPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         alignPanel.setOpaque(false);
@@ -701,7 +1202,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatMessagePanel.revalidate();
 
         Timeline.builder(bubble)
-            .setDuration(350)
+            .setDuration(300)
             .addCallback(new TimelineCallback() {
                 @Override
                 public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
@@ -710,7 +1211,9 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
                 @Override
                 public void onTimelinePulse(float durationFraction, float timelinePosition) {
-                    bubble.setAlpha(timelinePosition);
+                    float eased = timelinePosition * (2f - timelinePosition);
+                    bubble.setAlpha(eased);
+                    bubble.setSlideOffset(1f - eased);
                     bubble.repaint();
                 }
             })
@@ -785,30 +1288,60 @@ public class AiChatPanel extends AbstractCommandPanel {
     }
 
     // ==================== 滚动 ====================
-    private void scrollToBottom() {
-        SwingUtilities.invokeLater(() -> {
-            JScrollBar vBar = chatScrollPane.getVerticalScrollBar();
-            int from = vBar.getValue();
-            int to = vBar.getMaximum();
-            if (to <= from + vBar.getVisibleAmount()) return; // 已经在底部
+    /** 滚动动画用的单线程调度器（高精度，不受 EDT 排队影响） */
+    private static final ScheduledExecutorService SCROLL_SCHEDULER =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "scroll-animator");
+                t.setDaemon(true);
+                t.setPriority(Thread.MAX_PRIORITY);
+                return t;
+            });
 
-            Timeline scrollTimeline = Timeline.builder(new Object())
-                .setDuration(300)
-                .addCallback(new TimelineCallback() {
-                    @Override
-                    public void onTimelineStateChanged(TimelineState oldState, TimelineState newState,
-                                                       float durationFraction, float timelinePosition) {
-                        // no-op
-                    }
-                    @Override
-                    public void onTimelinePulse(float durationFraction, float timelinePosition) {
-                        int val = from + (int)((to - from) * timelinePosition);
-                        vBar.setValue(val);
-                    }
-                })
-                .build();
-            scrollTimeline.play();
-        });
+    /** 当前正在运行的滚动动画 Future，新动画会取消旧的 */
+    private ScheduledFuture<?> activeScrollFuture = null;
+
+    /**
+     * 平滑滚动到底部，120fps + easeOutQuad 缓动曲线。
+     * 定时由独立后台线程驱动，仅在 setValue 时切到 EDT。
+     * 动画结束后使用双重 invokeLater 确保布局完全稳定后再滚动到底。
+     */
+    private void scrollToBottom() {
+        if (!isShowing()) return;  // 面板不可见时跳过，避免切 Tab 闪烁
+        JScrollBar vBar = chatScrollPane.getVerticalScrollBar();
+        int from = vBar.getValue();
+        int to = vBar.getMaximum();
+        if (to <= from + vBar.getVisibleAmount()) return;
+
+        // 取消上一个未完成的滚动动画
+        if (activeScrollFuture != null && !activeScrollFuture.isDone()) {
+            activeScrollFuture.cancel(false);
+        }
+
+        long durationMs = 180;
+        int fps = 120;
+        long intervalUs = 1_000_000 / fps;
+        long startTime = System.nanoTime();
+
+        activeScrollFuture = SCROLL_SCHEDULER.scheduleAtFixedRate(() -> {
+            float elapsed = (System.nanoTime() - startTime) / 1_000_000f / durationMs;
+            if (elapsed >= 1.0f) {
+                elapsed = 1.0f;
+                ScheduledFuture<?> self = activeScrollFuture;
+                if (self != null && !self.isDone()) {
+                    self.cancel(false);
+                }
+                // 双重 invokeLater：等待布局完全稳定后再滚到底
+                SwingUtilities.invokeLater(() -> {
+                    SwingUtilities.invokeLater(() -> {
+                        vBar.setValue(vBar.getMaximum());
+                    });
+                });
+            }
+            // easeOutQuad
+            float eased = elapsed * (2.0f - elapsed);
+            final int val = from + Math.round((to - from) * eased);
+            SwingUtilities.invokeLater(() -> vBar.setValue(val));
+        }, 0, intervalUs, TimeUnit.MICROSECONDS);
     }
 
     /** 是否已滚动到底部附近（容差 20px） */
@@ -818,6 +1351,19 @@ public class AiChatPanel extends AbstractCommandPanel {
         int max = vBar.getMaximum();
         int extent = vBar.getVisibleAmount();
         return val + extent >= max - 20;
+    }
+
+    /** 距离底部是否超过视口的 1/3（用于决定是否显示"滚到底部"按钮） */
+    private boolean isFarFromBottom() {
+        JScrollBar vBar = chatScrollPane.getVerticalScrollBar();
+        int val = vBar.getValue();
+        int max = vBar.getMaximum();
+        int extent = vBar.getVisibleAmount();
+        if (extent <= 0) return false;
+        int bottom = max - extent;
+        if (bottom <= 0) return false;
+        // 当前值距离底部 > 视口高度的 1/3
+        return (bottom - val) > extent / 3;
     }
 
     /** 定位浮动按钮：水平居中，距视口底部 16px */
@@ -833,7 +1379,11 @@ public class AiChatPanel extends AbstractCommandPanel {
     /** 根据滚动位置和流式状态决定浮动按钮显隐 */
     private void updateScrollToBottomButton() {
         if (scrollToBottomBtn == null) return;
-        if (streamingActive && !isScrolledToBottom()) {
+        // 流式进行中且不在底部 → 显示
+        // 流式结束后用户滚远了（距底部超过视口 1/3） → 显示
+        boolean shouldShow = (streamingActive && !isScrolledToBottom())
+                          || (!streamingActive && isFarFromBottom());
+        if (shouldShow) {
             showScrollToBottomButton();
         } else {
             hideScrollToBottomButton();
@@ -854,8 +1404,21 @@ public class AiChatPanel extends AbstractCommandPanel {
     }
 
     private void clearChat() {
+        chatMemory.clear();  // 重置对话记忆
         showPlaceholder();
         inputArea.setText("");
+        if (inputUndoManager != null) {
+            inputUndoManager.discardAllEdits();
+        }
+    }
+
+    /** 新建会话：停止流式输出 + 清空面板 + 清除记忆 */
+    private void newSession() {
+        // 如果正在流式输出，取消它
+        if (streamingActive) {
+            stopRequested = true;
+        }
+        clearChat();
     }
 
     // ==================== 设置对话框 ====================
@@ -931,7 +1494,6 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         dialog.setVisible(true);
         refreshModelSelector();
-        showPlaceholder();
     }
 
     private void refreshList(DefaultListModel<String> listModel) {
@@ -1056,17 +1618,21 @@ public class AiChatPanel extends AbstractCommandPanel {
         if (!(sel instanceof ModelConfig mc)) return;
         if (mc.getModelName() == null || mc.getModelName().isEmpty()) return;
         Window owner = SwingUtilities.getWindowAncestor(this);
-        new ModelConfigDialog(owner, mc).setVisible(true);
-        refreshModelSelector();
-        showPlaceholder();
+        ModelConfigDialog dlg = new ModelConfigDialog(owner, mc);
+        dlg.setVisible(true);
+        if (dlg.confirmed) {
+            refreshModelSelector();
+        }
     }
 
     private void showAddModelDialog() {
         if (streamingActive) return;
         Window owner = SwingUtilities.getWindowAncestor(this);
-        new ModelConfigDialog(owner, null).setVisible(true);
-        refreshModelSelector();
-        showPlaceholder();
+        ModelConfigDialog dlg = new ModelConfigDialog(owner, null);
+        dlg.setVisible(true);
+        if (dlg.confirmed) {
+            refreshModelSelector();
+        }
     }
 
     /** 流式进行中禁用/启用模型编辑相关按钮 */
@@ -1246,10 +1812,6 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
             }
             confirmed = true;
-
-            // 刷新外部下拉选择器
-            refreshModelSelector();
-
             dispose();
         }
 
@@ -1327,13 +1889,16 @@ public class AiChatPanel extends AbstractCommandPanel {
         private boolean isUser;
         private boolean isError;
         private float alpha = 1.0f;
+        private float slideOffset = 0f;      // 滑入偏移 (0=滑入完成, 1=完全在屏幕外)
         private Color bubbleBg;
+        private Color bubbleBgTop;           // 渐变顶部色
         private Color borderColor;
         private JTextArea contentArea;      // 内容文本区域引用，支持流式增量更新
         private boolean thinking;            // 是否正在等待 AI 首 token
         private float thinkingAlpha = 1.0f;  // "思考中..." 文字呼吸动画 alpha
         private boolean thinkingForward = true;
         private Timeline thinkingTimeline;   // 思考中呼吸动画时间线
+        Runnable onRevalidate;               // 流式刷新时的回调
 
         ChatBubble(String sender, String content, String time, boolean isUser) {
             this(sender, content, time, isUser, false);
@@ -1346,12 +1911,20 @@ public class AiChatPanel extends AbstractCommandPanel {
             this.isUser = isUser;
             this.isError = "系统".equals(sender);
             this.thinking = thinking;
-            this.bubbleBg = isUser ? new Color(0x1B5E20)
-                    : isError ? new Color(0x4A2020)
-                    : new Color(0x21212E);      // AI 消息：深蓝灰底色
-            this.borderColor = isUser ? new Color(0x2E7D32)
-                    : isError ? new Color(0xC62828)
-                    : new Color(0x2F2F40);       // AI 消息：柔和边框
+            // 渐变配色：更精致的双色渐变
+            if (isUser) {
+                this.bubbleBg = new Color(0x1B6B3A);       // 深绿底
+                this.bubbleBgTop = new Color(0x218F4E);     // 浅绿顶
+                this.borderColor = new Color(0x3BA064);     // 翠绿边框
+            } else if (isError) {
+                this.bubbleBg = new Color(0x5C2020);        // 深红底
+                this.bubbleBgTop = new Color(0x7A2828);     // 浅红顶
+                this.borderColor = new Color(0xC0392B);     // 红边框
+            } else {
+                this.bubbleBg = new Color(0x1C1E2E);        // 深蓝紫底
+                this.bubbleBgTop = new Color(0x252740);     // 浅蓝紫顶
+                this.borderColor = new Color(0x3A3D55);     // 灰蓝边框
+            }
             setOpaque(false);
             buildLayout();
             if (thinking) {
@@ -1376,6 +1949,12 @@ public class AiChatPanel extends AbstractCommandPanel {
             this.alpha = Math.max(0.0f, Math.min(1.0f, alpha));
         }
 
+        // ---- slideOffset for slide-in animation ----
+        public float getSlideOffset() { return slideOffset; }
+        public void setSlideOffset(float offset) {
+            this.slideOffset = Math.max(0.0f, Math.min(1.0f, offset));
+        }
+
         /** 流式追加文本内容（在 EDT 上调用） */
         void appendContent(String text) {
             if (contentArea == null) return;
@@ -1394,12 +1973,29 @@ public class AiChatPanel extends AbstractCommandPanel {
             int curW = contentArea.getWidth();
             if (curW <= 0) {
                 Container p = getParent();
-                curW = (p != null && p.getWidth() > 0) ? p.getWidth() - 56 : 500 - 56;
+                if (p != null && p.getWidth() > 0) {
+                    curW = p.getWidth() - 64;
+                } else {
+                    // 兜底：回溯找 chatMessagePanel 宽度
+                    Container pp = getParent();
+                    int fallbackW = 500;
+                    while (pp != null) {
+                        if (pp instanceof JViewport vp) { fallbackW = vp.getWidth(); break; }
+                        if (pp.getParent() instanceof JViewport vp) { fallbackW = vp.getWidth(); break; }
+                        pp = pp.getParent();
+                    }
+                    curW = (int) (fallbackW * 0.65) - 40;
+                    if (curW < 160) curW = 160;
+                }
             }
             if (curW > 0) {
                 contentArea.setSize(curW, Short.MAX_VALUE);
             }
             revalidateAndRepaint();
+            // 通知外部（用于判断是否需要滚动）
+            if (onRevalidate != null) {
+                onRevalidate.run();
+            }
         }
 
         /** 启动"思考中..."呼吸动画 */
@@ -1424,7 +2020,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     thinkingAlpha = thinkingForward
                         ? 0.35f + timelinePosition * 0.65f   // 0.35 → 1.0
                         : 1.0f - timelinePosition * 0.65f;   // 1.0 → 0.35
-                    if (contentArea != null) contentArea.repaint();
+                    if (contentArea != null && contentArea.isShowing()) contentArea.repaint();
                 }
             };
             thinkingTimeline = Timeline.builder(this)
@@ -1443,8 +2039,25 @@ public class AiChatPanel extends AbstractCommandPanel {
             thinkingAlpha = 1.0f;
         }
 
-        /** 重新计算布局（内容尺寸变化后调用） */
+        /** 暂停"思考中..."呼吸动画（切换 Tab 隐藏面板时调用） */
+        void pauseThinkingAnimation() {
+            if (thinkingTimeline != null) {
+                thinkingTimeline.abort();
+                thinkingTimeline = null;
+            }
+            // 保留 thinking = true，恢复时重新创建
+        }
+
+        /** 恢复"思考中..."呼吸动画（切换 Tab 重新显示面板时调用） */
+        void resumeThinkingAnimation() {
+            if (!thinking) return;
+            if (thinkingTimeline != null) return; // 已在运行
+            startThinkingAnimation();
+        }
+
+        /** 重新计算布局（内容尺寸变化后调用）。仅在可见时触发重绘，避免隐藏 Tab 时闪烁。 */
         void revalidateAndRepaint() {
+            if (!isShowing()) return;
             revalidate();
             repaint();
             Container p = getParent();
@@ -1482,10 +2095,10 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             JLabel timeLabel = new JLabel(time);
             timeLabel.setFont(new Font("Consolas", Font.PLAIN, 10));
-            timeLabel.setForeground(new Color(0x777777));
+            timeLabel.setForeground(Color.WHITE);
 
             header.add(timeLabel, BorderLayout.EAST);
-            header.setBorder(BorderFactory.createEmptyBorder(0, 0, 6, 0));
+            header.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
 
             // 内容：使用 JTextArea 自动换行
             String initialText = thinking ? "● AI 思考中..." : content;
@@ -1514,8 +2127,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             this.contentArea.setEditable(false);
             this.contentArea.setLineWrap(true);
             this.contentArea.setWrapStyleWord(true);
-            this.contentArea.setCursor(null);
-            this.contentArea.setFocusable(false);
+            // 允许文本选中（用于拖选复制），但不可编辑
+            this.contentArea.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
 
             // 内容内边距面板
             JPanel contentPane = new JPanel(new BorderLayout());
@@ -1523,29 +2136,43 @@ public class AiChatPanel extends AbstractCommandPanel {
             contentPane.add(this.contentArea, BorderLayout.CENTER);
 
             JPanel innerPanel = new JPanel(new BorderLayout());
-            innerPanel.setBackground(bubbleBg);
-            innerPanel.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
+            innerPanel.setOpaque(false);
+            innerPanel.setBorder(BorderFactory.createEmptyBorder(6, 14, 6, 14));
             innerPanel.add(header, BorderLayout.NORTH);
             innerPanel.add(contentPane, BorderLayout.CENTER);
 
             add(innerPanel, BorderLayout.CENTER);
-            setBorder(BorderFactory.createEmptyBorder(2, 0, 2, 0));
+            setBorder(BorderFactory.createEmptyBorder(0, 4, 0, 4));
         }
 
         @Override
         public Dimension getPreferredSize() {
-            Container parent = getParent();
-            int parentW = (parent != null) ? parent.getWidth() : 0;
-            int maxW = (parentW > 0) ? Math.min(500, parentW) : 500;
+            // 回溯找到 chatMessagePanel 的实际宽度
+            int chatPanelW = 500; // 默认兜底
+            Container p = getParent();
+            while (p != null) {
+                if (p instanceof JViewport vp) {
+                    chatPanelW = vp.getWidth();
+                    break;
+                }
+                if (p.getParent() instanceof JViewport vp) {
+                    chatPanelW = vp.getWidth();
+                    break;
+                }
+                p = p.getParent();
+            }
+            // 气泡宽度取 chatMessagePanel 宽度的 65%，适配窗口缩放
+            int maxW = (int) (chatPanelW * 0.65);
+            if (maxW < 200) maxW = 200;
 
             // 让 JTextArea 按其宽度重新计算换行后的真实高度
             if (contentArea != null) {
-                int textWidth = maxW - 32; // 减去内外面板边距
+                int textWidth = maxW - 28; // 减去内外面板边距（含tail空间）
                 if (textWidth > 0) {
                     contentArea.setSize(textWidth, Short.MAX_VALUE);
                 }
             }
-            return new Dimension(maxW, super.getPreferredSize().height + 4);
+            return new Dimension(maxW + 8, super.getPreferredSize().height);
         }
 
         @Override
@@ -1553,26 +2180,68 @@ public class AiChatPanel extends AbstractCommandPanel {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
-            // 使用 alpha 做整体透明度
-            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
-
             int w = getWidth() - 1;
             int h = getHeight() - 1;
+            int slideX = (int) (w * slideOffset * (isUser ? 1 : -1));
 
-            // 绘制圆角矩形背景
-            g2.setColor(bubbleBg);
-            g2.fillRoundRect(0, 0, w, h, 14, 14);
+            // 整体透明度
+            float compositeAlpha = alpha * (1f - slideOffset * 0.3f);
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, compositeAlpha));
 
-            // 绘制边框
-            g2.setStroke(new BasicStroke(1.0f));
-            g2.setColor(new Color(
-                borderColor.getRed(), borderColor.getGreen(), borderColor.getBlue(),
-                (int)(borderColor.getAlpha() * alpha)));
-            g2.drawRoundRect(0, 0, w, h, 14, 14);
+            // ---- 单层柔和阴影 ----
+            g2.setColor(new Color(0, 0, 0, (int)(30 * alpha)));
+            g2.fillRoundRect(2 + slideX, 3, w - 2, h - 2, 16, 16);
+
+            // ---- 渐变背景（缓存 GradientPaint 避免每帧创建） ----
+            if (cachedGradient == null || cachedGradientH != h) {
+                cachedGradient = new GradientPaint(0, 0, bubbleBgTop, 0, h, bubbleBg);
+                cachedGradientH = h;
+            }
+            g2.setPaint(cachedGradient);
+            g2.fillRoundRect(slideX, 0, w, h, 16, 16);
+
+            // ---- 小三角尾巴 ----
+            int tailSize = 8;
+            int tailY = Math.min(28, h / 2);
+            if (isUser) {
+                g2.fillPolygon(
+                    new int[]{w + slideX, w + tailSize + slideX, w + slideX},
+                    new int[]{tailY, tailY + tailSize / 2, tailY + tailSize}, 3);
+            } else {
+                g2.fillPolygon(
+                    new int[]{slideX, slideX - tailSize, slideX},
+                    new int[]{tailY, tailY + tailSize / 2, tailY + tailSize}, 3);
+            }
+
+            // ---- 边框（缓存颜色对象） ----
+            if (cachedBorderColor == null || cachedBorderAlpha != (int)(borderColor.getAlpha() * alpha)) {
+                cachedBorderAlpha = (int)(borderColor.getAlpha() * alpha);
+                cachedBorderColor = new Color(
+                    borderColor.getRed(), borderColor.getGreen(), borderColor.getBlue(), cachedBorderAlpha);
+            }
+            g2.setStroke(STROKE_1PX);
+            g2.setColor(cachedBorderColor);
+            g2.drawRoundRect(slideX, 0, w, h, 16, 16);
+
+            // 小三角边框
+            if (isUser) {
+                g2.drawLine(w + slideX, tailY, w + tailSize + slideX, tailY + tailSize / 2);
+                g2.drawLine(w + tailSize + slideX, tailY + tailSize / 2, w + slideX, tailY + tailSize);
+            } else {
+                g2.drawLine(slideX, tailY, slideX - tailSize, tailY + tailSize / 2);
+                g2.drawLine(slideX - tailSize, tailY + tailSize / 2, slideX, tailY + tailSize);
+            }
 
             g2.dispose();
             super.paintComponent(g);
         }
+
+        // 缓存对象减少 GC 压力
+        private GradientPaint cachedGradient;
+        private int cachedGradientH = -1;
+        private Color cachedBorderColor;
+        private int cachedBorderAlpha = -1;
+        private static final BasicStroke STROKE_1PX = new BasicStroke(1.0f);
     }
 
     /** 支持透明度动画的 JLabel（用于打字指示器和滚动等） */

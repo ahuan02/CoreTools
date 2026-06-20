@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.NetUtil;
 import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
 import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
 import org.fife.ui.rtextarea.RTextScrollPane;
@@ -57,6 +58,11 @@ public class HttpPanel extends AbstractCommandPanel {
     }
 
     private class HttpRequestPanel extends JPanel {
+        // ---- 全局 Token ----
+        private JTextField tokenField;
+        private JCheckBox tokenEnabledCb;
+        private JComboBox<String> tokenTypeCombo;
+
         // ---- 请求行 ----
         private JComboBox<String> methodCombo;
         private JTextField urlField;
@@ -109,6 +115,30 @@ public class HttpPanel extends AbstractCommandPanel {
             // ---- 左侧：请求区 ----
             JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
 
+            // 全局 Token 栏
+            JPanel tokenBar = new JPanel(new BorderLayout(4, 0));
+            tokenBar.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(100, 100, 100), 1, true),
+                    BorderFactory.createEmptyBorder(2, 6, 2, 6)));
+            JPanel tokenLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            tokenEnabledCb = new JCheckBox("全局 Token");
+            tokenEnabledCb.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+            tokenEnabledCb.setToolTipText("勾选后自动在所有请求头中添加 Authorization: Bearer <token>");
+            tokenLeft.add(tokenEnabledCb);
+            tokenField = new JTextField("", 30);
+            tokenField.setFont(new Font("Consolas", Font.PLAIN, 11));
+            tokenField.setToolTipText("输入 Bearer Token（JWT/API Key），认证类型可在下方选择");
+            NetUtil.fixPaste(tokenField);
+            tokenLeft.add(tokenField);
+
+            tokenTypeCombo = new JComboBox<>(new String[]{"Bearer", "Basic", "Token", "API-Key"});
+            tokenTypeCombo.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+            tokenTypeCombo.setPreferredSize(new Dimension(80, 22));
+            tokenTypeCombo.setToolTipText("认证类型：Bearer / Basic / Token / API-Key");
+            tokenLeft.add(new JLabel("类型:"));
+            tokenLeft.add(tokenTypeCombo);
+            tokenBar.add(tokenLeft, BorderLayout.CENTER);
+
             // 请求行
             JPanel urlRow = new JPanel(new BorderLayout(4, 0));
             JPanel urlLeft = new JPanel(new BorderLayout(2, 0));
@@ -117,6 +147,7 @@ public class HttpPanel extends AbstractCommandPanel {
             urlLeft.add(methodCombo, BorderLayout.WEST);
             urlField = new JTextField("http://httpbin.org/get");
             urlField.setFont(FONT_TEXT);
+            NetUtil.fixPaste(urlField);
             // 启用 Ctrl+Z/Y 撤销/恢复
             UndoManager undoManager = new UndoManager();
             urlField.getDocument().addUndoableEditListener(undoManager);
@@ -494,7 +525,12 @@ public class HttpPanel extends AbstractCommandPanel {
 
             reqTabs.addTab("Body", bodyPanel);
 
-            leftPanel.add(urlRow, BorderLayout.NORTH);
+            // 请求行 + Token 栏组合
+            JPanel topBar = new JPanel(new BorderLayout(0, 3));
+            topBar.add(tokenBar, BorderLayout.NORTH);
+            topBar.add(urlRow, BorderLayout.CENTER);
+
+            leftPanel.add(topBar, BorderLayout.NORTH);
             leftPanel.add(reqTabs, BorderLayout.CENTER);
 
             // ---- 右侧：响应区 ----
@@ -605,6 +641,25 @@ public class HttpPanel extends AbstractCommandPanel {
 
                     // 从表格读取请求头（仅勾选启用的行）
                     Map<String, String> headers = readHeaderTable();
+
+                    // 全局 Token 自动注入：如果勾选了全局 Token 且请求头中没有 Authorization
+                    if (tokenEnabledCb.isSelected()) {
+                        String token = tokenField.getText().trim();
+                        if (!token.isEmpty() && !headers.containsKey("Authorization")) {
+                            String authType = (String) tokenTypeCombo.getSelectedItem();
+                            if (authType == null) authType = "Bearer";
+                            // 处理 Basic 认证的 Base64 编码
+                            if ("Basic".equals(authType) && !token.contains(":")) {
+                                // 非 user:pass 格式则只用 token
+                            }
+                            String authValue = authType + " " + token;
+                            builder.header("Authorization", authValue);
+                            String finalAuthType = authType;
+                            SwingUtilities.invokeLater(() ->
+                                    logSys(logPane, "已注入全局 Token (" + finalAuthType + ")"));
+                        }
+                    }
+
                     for (Map.Entry<String, String> e : headers.entrySet()) {
                         builder.header(e.getKey(), e.getValue());
                     }
@@ -1057,10 +1112,32 @@ public class HttpPanel extends AbstractCommandPanel {
     @Override
     public void loadConfig(ConfigManager config) {
         loadField(httpPanel.urlField, config, "http.url");
+        // 全局 Token
+        String savedToken = config.get("http.token", "");
+        if (savedToken != null && !savedToken.isEmpty()) {
+            httpPanel.tokenField.setText(savedToken);
+        }
+        String tokenEnabled = config.get("http.token.enabled", "false");
+        httpPanel.tokenEnabledCb.setSelected("true".equals(tokenEnabled));
+        String tokenType = config.get("http.token.type", "Bearer");
+        if (httpPanel.tokenTypeCombo != null) {
+            for (int i = 0; i < httpPanel.tokenTypeCombo.getItemCount(); i++) {
+                if (tokenType.equals(httpPanel.tokenTypeCombo.getItemAt(i))) {
+                    httpPanel.tokenTypeCombo.setSelectedIndex(i);
+                    break;
+                }
+            }
+        }
     }
 
     @Override
     public void saveConfig(ConfigManager config) {
         saveField(httpPanel.urlField, config, "http.url");
+        // 全局 Token
+        config.set("http.token", httpPanel.tokenField.getText().trim());
+        config.set("http.token.enabled", String.valueOf(httpPanel.tokenEnabledCb.isSelected()));
+        if (httpPanel.tokenTypeCombo != null) {
+            config.set("http.token.type", (String) httpPanel.tokenTypeCombo.getSelectedItem());
+        }
     }
 }
