@@ -26,9 +26,6 @@ import org.bytedeco.javacv.Java2DFrameConverter;
 import org.bytedeco.javacv.OpenCVFrameConverter;
 import org.bytedeco.opencv.opencv_core.Mat;
 import org.bytedeco.opencv.opencv_core.Size;
-import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
-import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
-import org.fife.ui.rsyntaxtextarea.Theme;
 import org.pushingpixels.radiance.animation.api.Timeline;
 import org.pushingpixels.radiance.animation.api.Timeline.TimelineState;
 import org.pushingpixels.radiance.animation.api.callback.TimelineCallback;
@@ -55,6 +52,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -118,12 +116,8 @@ public class AiChatPanel extends AbstractCommandPanel {
     private String agnesApiKey;
     /** 图片生成服务实例（延迟初始化） */
     private AgnesImageService imageService;
-    /** 图片生成按钮 */
-    private JButton imageGenBtn;
     /** 视频生成服务实例（延迟初始化，复用同一 API Key） */
     private AgnesVideoService videoService;
-    /** 视频生成按钮 */
-    private JButton videoGenBtn;
 
     /** 预置模型（别名默认用 modelName，key 和 url 留空让用户填） */
     private static final ModelConfig[] PRESET_MODELS = {
@@ -161,6 +155,8 @@ public class AiChatPanel extends AbstractCommandPanel {
         "hunyuan-turbos-latest", "hunyuan-lite",
         // 文心一言
         "ernie-4.0-turbo-8k", "ernie-3.5-8k",
+        // Agnes AI (图片/视频生成)
+        "agnes-image-2.0-flash", "agnes-video-v2.0",
     };
 
     private static final DateTimeFormatter TF = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -564,14 +560,6 @@ public class AiChatPanel extends AbstractCommandPanel {
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         btnPanel.setOpaque(false);
 
-        // 图片生成按钮（AI 图标）
-        imageGenBtn = createIconButton("/icons/ai.svg", 20, "AI 图片生成 (Agnes-Image-2.0-Flash)", e -> showImageGenerationDialog());
-        btnPanel.add(imageGenBtn);
-
-        // 视频生成按钮
-        videoGenBtn = createIconButton("/icons/video.svg", 20, "AI 视频生成 (Agnes-Video-V2.0)", e -> showVideoGenerationDialog());
-        btnPanel.add(videoGenBtn);
-
         // 新建会话按钮
         JButton newSessionBtn = createIconButton("/icons/create_say.svg", 20, "新建会话", e -> newSession());
         btnPanel.add(newSessionBtn);
@@ -851,6 +839,18 @@ public class AiChatPanel extends AbstractCommandPanel {
             return;
         }
 
+        String modelName = selectedModel.getModelName();
+
+        // === Agnes 图片/视频生成路由 ===
+        if ("agnes-image-2.0-flash".equals(modelName)) {
+            handleAgnesImageSend(text, selectedModel);
+            return;
+        }
+        if ("agnes-video-v2.0".equals(modelName)) {
+            handleAgnesVideoSend(text, selectedModel);
+            return;
+        }
+
         // 清除占位文字，显示用户消息（右侧绿色气泡）
         clearPlaceholderIfNeeded();
         String userTime = LocalTime.now().format(TF);
@@ -949,7 +949,6 @@ public class AiChatPanel extends AbstractCommandPanel {
             try {
                 String apiKey = selectedModel.getApiKey();
                 String apiUrl = selectedModel.getApiUrl();
-                String modelName = selectedModel.getModelName();
 
                 // 去除 baseUrl 末尾的 /chat/completions，LangChain4j 会自动追加
                 String baseUrl = apiUrl;
@@ -1586,11 +1585,12 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         });
 
-        // 选中模型时清空历史对话记忆，避免新模型延续旧模型的上下文
+        // 选中模型时清空历史对话记忆，避免新模型延续旧模型的上下文（Agnes 模型不清理，因为不是对话模型）
         combo.addItemListener(e -> {
             if (e.getStateChange() == java.awt.event.ItemEvent.SELECTED) {
                 Object item = e.getItem();
-                if (item instanceof ModelConfig mc && !"请先添加模型".equals(mc.getAlias())) {
+                if (item instanceof ModelConfig mc && !"请先添加模型".equals(mc.getAlias())
+                        && !mc.getModelName().startsWith("agnes-")) {
                     chatMemory.clear();
                     System.out.println("[AI Chat] 切换到模型: " + mc.comboLabel() + "，已清空对话记忆");
                 }
@@ -1716,8 +1716,23 @@ public class AiChatPanel extends AbstractCommandPanel {
         private final JComboBox<String> nameCombo = createModelCombo();
         private boolean confirmed;
 
+        // Agnes 扩展配置面板（根据选中模型动态显示/隐藏）
+        private JPanel extraPanel;
+        private JPanel imageConfigPanel;
+        private JPanel videoConfigPanel;
+        private JComboBox<String> imgSizeCombo, imgModeCombo;
+        private JTextArea imgUrlArea;
+        private JComboBox<String> vidResCombo, vidDurCombo, vidFpsCombo, vidModeCombo;
+        private JTextField vidSeedField;
+        private JTextArea vidUrlArea;
+        private JLabel imgUrlLabel;
+        private JScrollPane imgUrlScroll;
+        private JLabel vidUrlLabel;
+        private JScrollPane vidUrlScroll;
+
         ModelConfigDialog(Window owner, ModelConfig editing) {
             super(owner, editing == null ? "添加模型" : "编辑模型", ModalityType.APPLICATION_MODAL);
+            this.editingRef = editing;
             init(editing);
         }
 
@@ -1782,13 +1797,42 @@ public class AiChatPanel extends AbstractCommandPanel {
             // 模型全称（可编辑下拉框）
             addFormRow(form, gbc, 3, "模型全称：", nameCombo, "可输入或下拉选择预定义模型名");
 
+            // Agnes 扩展配置面板（放在模型全称下方，动态显示/隐藏）
+            extraPanel = new JPanel(new BorderLayout());
+            extraPanel.setOpaque(false);
+            gbc.gridy = 4;
+            gbc.gridx = 0;
+            gbc.gridwidth = 2;
+            gbc.weightx = 1;
+            gbc.fill = GridBagConstraints.HORIZONTAL;
+            form.add(extraPanel, gbc);
+            gbc.gridwidth = 1; // 恢复
+            buildAgnesPanels();
+
+            // 模型全称变更时切换面板
+            nameCombo.addActionListener(e -> toggleAgnesPanel());
+            // Focus 离开时也检查（用户可能手动输入 Agnes 模型名）
+            Component editorComp = nameCombo.getEditor().getEditorComponent();
+            if (editorComp instanceof JTextField tf) {
+                tf.addFocusListener(new FocusAdapter() {
+                    @Override public void focusLost(FocusEvent e) { toggleAgnesPanel(); }
+                });
+            }
+
             // 回填编辑数据
             if (editing != null) {
                 aliasField.setText(editing.getAlias());
                 keyField.setText(editing.getApiKey());
                 urlField.setText(editing.getApiUrl());
                 nameCombo.setSelectedItem(editing.getModelName());
+                // 回填 Agnes 扩展配置
+                Map<String, String> ext = editing.getExtraConfig();
+                if (ext != null && !ext.isEmpty()) {
+                    SwingUtilities.invokeLater(this::toggleAgnesPanel); // 等面板构建完
+                }
             }
+
+            toggleAgnesPanel(); // 初始状态
 
             // 按钮栏
             JPanel btnBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
@@ -1832,6 +1876,300 @@ public class AiChatPanel extends AbstractCommandPanel {
             form.add(comp, gbc);
         }
 
+        // ==================== Agnes 扩展配置面板 ====================
+
+        /** 构建图片生成的配置面板 */
+        private JPanel buildImageConfigPanel() {
+            JPanel p = new JPanel(new GridBagLayout());
+            p.setOpaque(false);
+            p.setBorder(BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY), "图片生成参数",
+                    javax.swing.border.TitledBorder.LEFT,
+                    javax.swing.border.TitledBorder.TOP, NetUtil.FONT_TEXT, C_PRIMARY));
+            GridBagConstraints g = new GridBagConstraints();
+            g.insets = new Insets(3, 4, 3, 4);
+            g.anchor = GridBagConstraints.WEST;
+            g.fill = GridBagConstraints.HORIZONTAL;
+
+            // 尺寸
+            g.gridx = 0; g.gridy = 0; g.weightx = 0;
+            JLabel szLbl = new JLabel("尺寸：");
+            szLbl.setFont(NetUtil.FONT_TEXT); szLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(szLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            imgSizeCombo = new JComboBox<>(new String[]{
+                    "1024x1024 (1:1)", "1024x768 (4:3)", "768x1024 (3:4)",
+                    "512x512 (1:1)", "1024x576 (16:9)", "576x1024 (9:16)"
+            });
+            imgSizeCombo.setFont(NetUtil.FONT_TEXT);
+            imgSizeCombo.setForeground(NetUtil.TEXT_COLOR);
+            imgSizeCombo.setBackground(C_FIELD_BG);
+            p.add(imgSizeCombo, g);
+
+            // 模式
+            g.gridx = 0; g.gridy = 1; g.weightx = 0;
+            JLabel mdLbl = new JLabel("模式：");
+            mdLbl.setFont(NetUtil.FONT_TEXT); mdLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(mdLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            imgModeCombo = new JComboBox<>(new String[]{"文生图", "图生图（输入URL）", "多图合成"});
+            imgModeCombo.setFont(NetUtil.FONT_TEXT);
+            imgModeCombo.setForeground(NetUtil.TEXT_COLOR);
+            imgModeCombo.setBackground(C_FIELD_BG);
+            p.add(imgModeCombo, g);
+
+            // 输入图片URL（图生图时显示）
+            g.gridx = 0; g.gridy = 2; g.weightx = 0;
+            imgUrlLabel = new JLabel("图片URL：");
+            imgUrlLabel.setFont(NetUtil.FONT_TEXT); imgUrlLabel.setForeground(NetUtil.TEXT_COLOR);
+            p.add(imgUrlLabel, g);
+            g.gridx = 1; g.weightx = 1;
+            imgUrlArea = new JTextArea(2, 30);
+            imgUrlArea.setFont(NetUtil.FONT_TEXT);
+            imgUrlArea.setForeground(NetUtil.TEXT_COLOR);
+            imgUrlArea.setBackground(C_FIELD_BG);
+            imgUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
+            imgUrlArea.setLineWrap(true);
+            imgUrlArea.setWrapStyleWord(true);
+            imgUrlArea.setToolTipText("每行一个URL（图生图/多图合成时需要）");
+            imgUrlScroll = new JScrollPane(imgUrlArea);
+            imgUrlScroll.setPreferredSize(new Dimension(300, 45));
+            p.add(imgUrlScroll, g);
+
+            // 模式切换
+            imgModeCombo.addActionListener(e -> {
+                boolean show = !"文生图".equals(imgModeCombo.getSelectedItem());
+                imgUrlLabel.setVisible(show);
+                imgUrlScroll.setVisible(show);
+                p.revalidate(); p.repaint();
+                pack();
+            });
+            imgUrlLabel.setVisible(false);
+            imgUrlScroll.setVisible(false);
+
+            return p;
+        }
+
+        /** 构建视频生成的配置面板 */
+        private JPanel buildVideoConfigPanel() {
+            JPanel p = new JPanel(new GridBagLayout());
+            p.setOpaque(false);
+            p.setBorder(BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY), "视频生成参数",
+                    javax.swing.border.TitledBorder.LEFT,
+                    javax.swing.border.TitledBorder.TOP, NetUtil.FONT_TEXT, C_PRIMARY));
+            GridBagConstraints g = new GridBagConstraints();
+            g.insets = new Insets(3, 4, 3, 4);
+            g.anchor = GridBagConstraints.WEST;
+            g.fill = GridBagConstraints.HORIZONTAL;
+
+            // 分辨率
+            g.gridx = 0; g.gridy = 0; g.weightx = 0;
+            JLabel resLbl = new JLabel("分辨率：");
+            resLbl.setFont(NetUtil.FONT_TEXT); resLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(resLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            vidResCombo = new JComboBox<>(new String[]{
+                    "1152x768 (16:9 720p)", "1280x720 (16:9 720p)", "1536x640 (约2.4:1)",
+                    "768x1280 (9:16 竖屏)", "720x1280 (9:16 竖屏)", "1024x1024 (1:1 方形)"
+            });
+            vidResCombo.setFont(NetUtil.FONT_TEXT);
+            vidResCombo.setForeground(NetUtil.TEXT_COLOR);
+            vidResCombo.setBackground(C_FIELD_BG);
+            p.add(vidResCombo, g);
+
+            // 时长
+            g.gridx = 0; g.gridy = 1; g.weightx = 0;
+            JLabel durLbl = new JLabel("时长：");
+            durLbl.setFont(NetUtil.FONT_TEXT); durLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(durLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            vidDurCombo = new JComboBox<>(new String[]{
+                    "约 3 秒 (81帧@24fps)", "约 5 秒 (121帧@24fps)",
+                    "约 10 秒 (241帧@24fps)", "约 18 秒 (441帧@24fps)"
+            });
+            vidDurCombo.setFont(NetUtil.FONT_TEXT);
+            vidDurCombo.setForeground(NetUtil.TEXT_COLOR);
+            vidDurCombo.setBackground(C_FIELD_BG);
+            vidDurCombo.setSelectedIndex(1);
+            p.add(vidDurCombo, g);
+
+            // 帧率
+            g.gridx = 0; g.gridy = 2; g.weightx = 0;
+            JLabel fpsLbl = new JLabel("帧率：");
+            fpsLbl.setFont(NetUtil.FONT_TEXT); fpsLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(fpsLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            int screenHz = getScreenRefreshRate();
+            java.util.List<String> fpsOpts = new java.util.ArrayList<>();
+            for (int f : new int[]{10, 15, 24, 30, 60, 120, 144, 240}) {
+                if (f <= screenHz) fpsOpts.add(f + " fps");
+            }
+            String screenHzStr = screenHz + " fps";
+            if (!fpsOpts.contains(screenHzStr)) fpsOpts.add(screenHzStr);
+            vidFpsCombo = new JComboBox<>(fpsOpts.toArray(new String[0]));
+            int defFpsIdx = fpsOpts.indexOf("24 fps");
+            if (defFpsIdx >= 0) vidFpsCombo.setSelectedIndex(defFpsIdx);
+            vidFpsCombo.setFont(NetUtil.FONT_TEXT);
+            vidFpsCombo.setForeground(NetUtil.TEXT_COLOR);
+            vidFpsCombo.setBackground(C_FIELD_BG);
+            p.add(vidFpsCombo, g);
+
+            // 模式
+            g.gridx = 0; g.gridy = 3; g.weightx = 0;
+            JLabel vmdLbl = new JLabel("模式：");
+            vmdLbl.setFont(NetUtil.FONT_TEXT); vmdLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(vmdLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            vidModeCombo = new JComboBox<>(new String[]{
+                    "文生视频", "图生视频（输入URL）", "多图视频", "关键帧动画"
+            });
+            vidModeCombo.setFont(NetUtil.FONT_TEXT);
+            vidModeCombo.setForeground(NetUtil.TEXT_COLOR);
+            vidModeCombo.setBackground(C_FIELD_BG);
+            p.add(vidModeCombo, g);
+
+            // 输入图片URL
+            g.gridx = 0; g.gridy = 4; g.weightx = 0;
+            vidUrlLabel = new JLabel("图片URL：");
+            vidUrlLabel.setFont(NetUtil.FONT_TEXT); vidUrlLabel.setForeground(NetUtil.TEXT_COLOR);
+            p.add(vidUrlLabel, g);
+            g.gridx = 1; g.weightx = 1;
+            vidUrlArea = new JTextArea(2, 30);
+            vidUrlArea.setFont(NetUtil.FONT_TEXT);
+            vidUrlArea.setForeground(NetUtil.TEXT_COLOR);
+            vidUrlArea.setBackground(C_FIELD_BG);
+            vidUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
+            vidUrlArea.setLineWrap(true);
+            vidUrlArea.setWrapStyleWord(true);
+            vidUrlArea.setToolTipText("每行一个URL（图生视频/多图视频/关键帧动画时需要）");
+            vidUrlScroll = new JScrollPane(vidUrlArea);
+            vidUrlScroll.setPreferredSize(new Dimension(300, 45));
+            p.add(vidUrlScroll, g);
+
+            vidModeCombo.addActionListener(e -> {
+                boolean show = !"文生视频".equals(vidModeCombo.getSelectedItem());
+                vidUrlLabel.setVisible(show);
+                vidUrlScroll.setVisible(show);
+                p.revalidate(); p.repaint();
+                pack();
+            });
+            vidUrlLabel.setVisible(false);
+            vidUrlScroll.setVisible(false);
+
+            // Seed
+            g.gridx = 0; g.gridy = 5; g.weightx = 0;
+            JLabel seedLbl = new JLabel("Seed：");
+            seedLbl.setFont(NetUtil.FONT_TEXT); seedLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(seedLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            vidSeedField = new JTextField(10);
+            vidSeedField.setFont(NetUtil.FONT_TEXT);
+            vidSeedField.setForeground(NetUtil.TEXT_COLOR);
+            vidSeedField.setBackground(C_FIELD_BG);
+            vidSeedField.setCaretColor(NetUtil.TEXT_COLOR);
+            vidSeedField.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(C_BORDER),
+                    BorderFactory.createEmptyBorder(3, 6, 3, 6)));
+            vidSeedField.setToolTipText("留空为随机，填入数字可复现结果");
+            p.add(vidSeedField, g);
+
+            return p;
+        }
+
+        /** 预构建两个面板 */
+        private void buildAgnesPanels() {
+            imageConfigPanel = buildImageConfigPanel();
+            videoConfigPanel = buildVideoConfigPanel();
+        }
+
+        /** 根据当前模型名切换显示对应的配置面板 */
+        private void toggleAgnesPanel() {
+            String name = getCurrentModelName();
+            extraPanel.removeAll();
+
+            if ("agnes-image-2.0-flash".equals(name)) {
+                // API 链接自动填充（服务类内置），设为只读
+                urlField.setText(com.szh.agnes.AgnesImageService.BASE_URL);
+                urlField.setEditable(false);
+                urlField.setBackground(C_INPUT_BG);
+                // 回填已有配置
+                ModelConfig editing = getEditingConfig();
+                if (editing != null) {
+                    Map<String, String> ext = editing.getExtraConfig();
+                    if (ext != null) {
+                        if (ext.containsKey("image.size")) setComboByPrefix(imgSizeCombo, ext.get("image.size"));
+                        if (ext.containsKey("image.mode")) imgModeCombo.setSelectedItem(ext.get("image.mode"));
+                        if (ext.containsKey("image.urls")) imgUrlArea.setText(ext.get("image.urls"));
+                    }
+                }
+                extraPanel.add(imageConfigPanel, BorderLayout.CENTER);
+                extraPanel.setVisible(true);
+            } else if ("agnes-video-v2.0".equals(name)) {
+                // API 链接自动填充（服务类内置），设为只读
+                urlField.setText(com.szh.agnes.AgnesVideoService.BASE_URL);
+                urlField.setEditable(false);
+                urlField.setBackground(C_INPUT_BG);
+                ModelConfig editing = getEditingConfig();
+                if (editing != null) {
+                    Map<String, String> ext = editing.getExtraConfig();
+                    if (ext != null) {
+                        if (ext.containsKey("video.size")) setComboByPrefix(vidResCombo, ext.get("video.size"));
+                        if (ext.containsKey("video.duration")) vidDurCombo.setSelectedItem(ext.get("video.duration"));
+                        if (ext.containsKey("video.fps")) setComboByPrefix(vidFpsCombo, ext.get("video.fps"));
+                        if (ext.containsKey("video.mode")) vidModeCombo.setSelectedItem(ext.get("video.mode"));
+                        if (ext.containsKey("video.urls")) vidUrlArea.setText(ext.get("video.urls"));
+                        if (ext.containsKey("video.seed")) vidSeedField.setText(ext.get("video.seed"));
+                    }
+                }
+                extraPanel.add(videoConfigPanel, BorderLayout.CENTER);
+                extraPanel.setVisible(true);
+            } else {
+                // 非 Agnes 模型：恢复 URL 可编辑
+                urlField.setEditable(true);
+                urlField.setBackground(C_FIELD_BG);
+                extraPanel.setVisible(false);
+            }
+            extraPanel.revalidate();
+            extraPanel.repaint();
+            pack();
+        }
+
+        /** 通过前缀匹配选中 ComboBox 项 */
+        private void setComboByPrefix(JComboBox<String> combo, String prefix) {
+            if (prefix == null) return;
+            for (int i = 0; i < combo.getItemCount(); i++) {
+                if (combo.getItemAt(i).startsWith(prefix)) {
+                    combo.setSelectedIndex(i);
+                    return;
+                }
+            }
+        }
+
+        /** 获取当前编辑框中的模型名 */
+        private String getCurrentModelName() {
+            Object sel = nameCombo.getSelectedItem();
+            if (sel != null) {
+                String s = sel.toString().trim();
+                if (!s.isEmpty()) return s;
+            }
+            // 可能用户手动输入了但还没确认
+            Component ec = nameCombo.getEditor().getEditorComponent();
+            if (ec instanceof JTextField tf) {
+                String t = tf.getText().trim();
+                if (!t.isEmpty()) return t;
+            }
+            return "";
+        }
+
+        /** 获取正在编辑的 ModelConfig（仅编辑模式有值） */
+        private ModelConfig getEditingConfig() {
+            // 查找当前 ModelConfigDialog 构造时传入的 editing
+            // 通过调用者获取 - 使用实例字段
+            return editingRef;
+        }
+        private ModelConfig editingRef;
+
         private void onConfirm(ModelConfig editing) {
             String alias = aliasField.getText().trim();
             String key   = keyField.getText().trim();
@@ -1839,8 +2177,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             Object sel   = nameCombo.getSelectedItem();
             String name  = (sel != null) ? sel.toString().trim() : "";
 
-            // 校验
-            if (url.isEmpty()) {
+            // 校验：Agnes 模型不需要 API 链接
+            if (url.isEmpty() && !name.startsWith("agnes-")) {
                 JOptionPane.showMessageDialog(this, "API 链接不能为空", "提示", JOptionPane.WARNING_MESSAGE);
                 return;
             }
@@ -1854,6 +2192,10 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
 
             ModelConfig mc = new ModelConfig(alias, key, url, name);
+
+            // 保存 Agnes 扩展配置
+            saveAgnesExtraConfig(mc);
+
             if (editing != null) {
                 // 编辑模式：替换旧配置
                 int idx = modelConfigs.indexOf(editing);
@@ -1877,6 +2219,35 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
             confirmed = true;
             dispose();
+        }
+
+        /** 保存 Agnes 扩展配置到 ModelConfig */
+        private void saveAgnesExtraConfig(ModelConfig mc) {
+            String name = mc.getModelName();
+            if ("agnes-image-2.0-flash".equals(name) && imgSizeCombo != null) {
+                mc.putExtra("image.size", ((String) imgSizeCombo.getSelectedItem()).split(" ")[0]);
+                mc.putExtra("image.mode", (String) imgModeCombo.getSelectedItem());
+                if (!"文生图".equals(imgModeCombo.getSelectedItem())) {
+                    mc.putExtra("image.urls", imgUrlArea.getText().trim());
+                } else {
+                    mc.getExtraConfig().remove("image.urls");
+                }
+            } else if ("agnes-video-v2.0".equals(name) && vidResCombo != null) {
+                mc.putExtra("video.size", ((String) vidResCombo.getSelectedItem()).split(" ")[0]);
+                mc.putExtra("video.duration", (String) vidDurCombo.getSelectedItem());
+                mc.putExtra("video.fps", ((String) vidFpsCombo.getSelectedItem()).split(" ")[0]);
+                mc.putExtra("video.mode", (String) vidModeCombo.getSelectedItem());
+                if (!"文生视频".equals(vidModeCombo.getSelectedItem())) {
+                    mc.putExtra("video.urls", vidUrlArea.getText().trim());
+                } else {
+                    mc.getExtraConfig().remove("video.urls");
+                }
+                if (!vidSeedField.getText().trim().isEmpty()) {
+                    mc.putExtra("video.seed", vidSeedField.getText().trim());
+                } else {
+                    mc.getExtraConfig().remove("video.seed");
+                }
+            }
         }
 
         private void registerEscClose(JButton cancelBtn) {
@@ -1957,8 +2328,9 @@ public class AiChatPanel extends AbstractCommandPanel {
         private Color bubbleBg;
         private Color bubbleBgTop;           // 渐变顶部色
         private Color borderColor;
-        private RSyntaxTextArea contentArea; // 代码语法高亮文本区域
+        private TextBubbleContent contentArea; // 自定义绘制文本区域
         private JPanel mediaPanel;           // 图片/视频媒体容器
+        private JPanel headerPanel;          // 头部面板（发送者+时间）
         private boolean thinking;            // 是否正在等待 AI 首 token
         private float thinkingAlpha = 1.0f;  // "思考中..." 文字呼吸动画 alpha
         private boolean thinkingForward = true;
@@ -2029,8 +2401,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                 // 首 token 到达，退出思考模式，清空"思考中"占位文字
                 thinking = false;
                 stopThinkingAnimation();
-                contentArea.setText("");
-                contentArea.setForeground(isUser ? new Color(0xE8E8E8)
+                contentArea.clear();
+                contentArea.setTextColor(isUser ? new Color(0xE8E8E8)
                         : isError ? new Color(0xFFCDD2)
                         : new Color(0xEAEAEA));
             }
@@ -2067,7 +2439,11 @@ public class AiChatPanel extends AbstractCommandPanel {
                     thinkingAlpha = thinkingForward
                         ? 0.35f + timelinePosition * 0.65f   // 0.35 → 1.0
                         : 1.0f - timelinePosition * 0.65f;   // 1.0 → 0.35
-                    if (contentArea != null && contentArea.isShowing()) contentArea.repaint();
+                    if (contentArea != null && contentArea.isShowing()) {
+                        contentArea.setTextColor(new Color(C_PRIMARY.getRed(), C_PRIMARY.getGreen(),
+                                C_PRIMARY.getBlue(), (int)(thinkingAlpha * 255)));
+                        contentArea.repaint();
+                    }
                 }
             };
             thinkingTimeline = Timeline.builder(this)
@@ -2177,31 +2553,101 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         }
 
-        /** 把图片添加到媒体面板 */
+        /** 把图片添加到媒体面板（独立绘制 + 右键菜单） */
         void addImageToPanel(BufferedImage img, String sourceUrl) {
             if (img == null || mediaPanel == null) return;
-            // 按气泡宽度等比缩放
-            int maxW = getWidth() - 40;
-            if (maxW < 160) maxW = 400;
-            int w = img.getWidth(), h = img.getHeight();
-            if (w > maxW) { h = (int) ((long) h * maxW / w); w = maxW; }
-            if (h > 600) { w = (int) ((long) w * 600 / h); h = 600; }
 
-            Image scaled = img.getScaledInstance(w, h, Image.SCALE_SMOOTH);
-            JLabel imgLabel = new JLabel(new ImageIcon(scaled));
-            imgLabel.setBorder(BorderFactory.createCompoundBorder(
-                    BorderFactory.createLineBorder(new Color(0x555555), 1),
-                    BorderFactory.createEmptyBorder(4, 4, 4, 4)));
-            imgLabel.setToolTipText(sourceUrl);
-            imgLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            imgLabel.addMouseListener(new MouseAdapter() {
+            // 计算可用宽度：ChatBubble 内部 contentPane 宽度
+            int availW = getContentPaneWidth();
+            if (availW < 200) availW = 400;
+            int imgRatio = img.getWidth() > 0 ? img.getWidth() : 1;
+            int displayW = availW - 4;
+            if (displayW > imgRatio) displayW = imgRatio;
+            int displayH = (int) ((long) img.getHeight() * displayW / imgRatio);
+            if (displayH > 600) { displayW = (int) ((long) displayW * 600 / displayH); displayH = 600; }
+
+            final BufferedImage source = img;
+            final int fDisplayW = displayW, fDisplayH = displayH;
+
+            JPanel imgPanel = new JPanel() {
                 @Override
-                public void mouseClicked(MouseEvent e) {
-                    try { Desktop.getDesktop().browse(URI.create(sourceUrl)); } catch (Exception ignored) {}
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    int pw = getWidth(), ph = getHeight();
+                    if (pw <= 0 || ph <= 0) return;
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    // 填满面板宽度，保持比例
+                    int dw = pw - 2;
+                    int dh = (int) ((long) source.getHeight() * dw / source.getWidth());
+                    if (dh > ph - 2) { dh = ph - 2; dw = (int) ((long) source.getWidth() * dh / source.getHeight()); }
+                    int dx = (pw - dw) / 2, dy = (ph - dh) / 2;
+                    g2.drawImage(source, dx, dy, dw, dh, null);
+                    // 圆角边框
+                    g2.setColor(new Color(0x3A3D55));
+                    g2.drawRoundRect(0, 0, pw - 1, ph - 1, 12, 12);
+                    g2.dispose();
+                }
+            };
+            imgPanel.setOpaque(false);
+            imgPanel.setPreferredSize(new Dimension(availW, displayH + 8));
+            imgPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, displayH + 8));
+
+            // 右键菜单
+            boolean hasValidUrl = sourceUrl != null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"));
+            JPopupMenu popup = new JPopupMenu();
+
+            if (hasValidUrl) {
+                JMenuItem copyLinkItem = new JMenuItem("复制链接");
+                copyLinkItem.addActionListener(e -> {
+                    java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                            .setContents(new java.awt.datatransfer.StringSelection(sourceUrl), null);
+                });
+                popup.add(copyLinkItem);
+            }
+
+            JMenuItem saveItem = new JMenuItem("保存图片");
+            saveItem.addActionListener(e -> {
+                JFileChooser fc = new JFileChooser();
+                fc.setSelectedFile(new java.io.File("image.png"));
+                if (fc.showSaveDialog(SwingUtilities.getWindowAncestor(imgPanel)) == JFileChooser.APPROVE_OPTION) {
+                    try {
+                        javax.imageio.ImageIO.write(img, "png", fc.getSelectedFile());
+                    } catch (IOException ex) {
+                        JOptionPane.showMessageDialog(imgPanel, "保存失败: " + ex.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                    }
                 }
             });
+            popup.add(saveItem);
 
-            mediaPanel.add(imgLabel);
+            if (hasValidUrl) {
+                JMenuItem openItem = new JMenuItem("浏览器打开");
+                openItem.addActionListener(e -> {
+                    try {
+                        Desktop.getDesktop().browse(URI.create(sourceUrl));
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(imgPanel, "无法打开浏览器: " + ex.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                    }
+                });
+                popup.add(openItem);
+            }
+
+            imgPanel.setComponentPopupMenu(popup);
+            if (hasValidUrl) {
+                imgPanel.setToolTipText("右键菜单 | 单击浏览器打开");
+                imgPanel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                imgPanel.addMouseListener(new MouseAdapter() {
+                    @Override
+                    public void mouseClicked(MouseEvent e) {
+                        if (SwingUtilities.isLeftMouseButton(e)) {
+                            try { Desktop.getDesktop().browse(URI.create(sourceUrl)); } catch (Exception ignored) {}
+                        }
+                    }
+                });
+            }
+
+            mediaPanel.add(imgPanel);
             mediaPanel.add(Box.createVerticalStrut(8));
             revalidateAndRepaint();
             if (onRevalidate != null) onRevalidate.run();
@@ -2210,7 +2656,9 @@ public class AiChatPanel extends AbstractCommandPanel {
         /** 添加视频面板（嵌入式 FFmpeg 播放器） */
         private void addVideoPanel(String videoUrl) {
             if (mediaPanel == null) return;
-            ChatVideoPlayer player = new ChatVideoPlayer(videoUrl);
+            int contentW = getContentPaneWidth();
+            if (contentW < 240) contentW = 240;
+            ChatVideoPlayer player = new ChatVideoPlayer(videoUrl, contentW);
             mediaPanel.add(player);
             mediaPanel.add(Box.createVerticalStrut(8));
             revalidateAndRepaint();
@@ -2247,8 +2695,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             setLayout(new BorderLayout());
 
             // 头部：头像/发送者 + 时间
-            JPanel header = new JPanel(new BorderLayout());
-            header.setOpaque(false);
+            this.headerPanel = new JPanel(new BorderLayout());
+            this.headerPanel.setOpaque(false);
 
             if (!isUser && !isError) {
                 // AI 消息：显示圆形头像图标
@@ -2257,72 +2705,30 @@ public class AiChatPanel extends AbstractCommandPanel {
                 JPanel avatarPanel = new JPanel(new BorderLayout());
                 avatarPanel.setOpaque(false);
                 avatarPanel.add(avatarLabel, BorderLayout.CENTER);
-                header.add(avatarPanel, BorderLayout.WEST);
+                this.headerPanel.add(avatarPanel, BorderLayout.WEST);
             } else {
                 // 用户/系统消息：显示发送者文字
                 JLabel senderLabel = new JLabel(sender);
                 senderLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 11));
                 senderLabel.setForeground(isUser ? new Color(0xA5D6A7) : new Color(0xEF9A9A));
-                header.add(senderLabel, BorderLayout.WEST);
+                this.headerPanel.add(senderLabel, BorderLayout.WEST);
             }
 
             JLabel timeLabel = new JLabel(time);
             timeLabel.setFont(new Font("Consolas", Font.PLAIN, 10));
             timeLabel.setForeground(Color.WHITE);
 
-            header.add(timeLabel, BorderLayout.EAST);
-            header.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
+            this.headerPanel.add(timeLabel, BorderLayout.EAST);
+            this.headerPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
 
-            // 内容：使用 RSyntaxTextArea 支持代码语法高亮、自动缩进
+            // 内容：使用自定义绘制文本面板（去掉 RSyntaxTextArea 嵌套感）
             String initialText = thinking ? "● AI 思考中..." : content;
-            this.contentArea = new RSyntaxTextArea(0, 45) {
-                @Override
-                protected void paintComponent(Graphics g) {
-                    if (thinking && thinkingAlpha < 1.0f) {
-                        Graphics2D g2 = (Graphics2D) g.create();
-                        try {
-                            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, thinkingAlpha));
-                            super.paintComponent(g2);
-                        } finally {
-                            g2.dispose();
-                        }
-                    } else {
-                        super.paintComponent(g);
-                    }
-                }
-            };
-            this.contentArea.setText(initialText);
-            this.contentArea.setSyntaxEditingStyle(SyntaxConstants.SYNTAX_STYLE_NONE);
-            this.contentArea.setEditable(false);
-            this.contentArea.setCodeFoldingEnabled(true);
-            this.contentArea.setAutoIndentEnabled(true);
-            this.contentArea.setCloseCurlyBraces(false);
-            this.contentArea.setCloseMarkupTags(false);
-            this.contentArea.setLineWrap(true);
-            this.contentArea.setWrapStyleWord(true);
-            this.contentArea.setTabSize(4);
-            this.contentArea.setTabsEmulated(true);
-            // 尝试加载 RSyntaxTextArea 暗色主题（先于手动配色，供代码高亮着色）
-            try {
-                Theme darkTheme = Theme.load(getClass().getResourceAsStream(
-                    "/org/fife/ui/rsyntaxtextarea/themes/dark.xml"));
-                if (darkTheme != null) {
-                    darkTheme.apply(this.contentArea);
-                }
-            } catch (Exception ignored) { }
-
-            this.contentArea.setFont(new Font("Consolas", Font.PLAIN, 14));
-            this.contentArea.setForeground(isUser ? new Color(0xE8E8E8)
+            this.contentArea = new TextBubbleContent(initialText);
+            Color textClr = isUser ? new Color(0xE8E8E8)
                     : isError ? new Color(0xFFCDD2)
                     : thinking ? C_PRIMARY
-                    : new Color(0xEAEAEA));
-            // 手动覆盖配色以匹配聊天 UI 暗色风格
-            this.contentArea.setBackground(new Color(0x1E1E22));
-            this.contentArea.setCurrentLineHighlightColor(new Color(0x2A2A30));
-            this.contentArea.setCaretColor(Color.WHITE);
-            this.contentArea.setSelectionColor(new Color(0x3A6EA5));
-            this.contentArea.setSelectedTextColor(Color.WHITE);
-            this.contentArea.setMatchedBracketBGColor(new Color(0x3A6EA5, true));
+                    : new Color(0xEAEAEA);
+            this.contentArea.setTextColor(textClr);
             this.contentArea.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
 
             // 内容容器：BoxLayout 纵向排列 文本区 + 媒体面板
@@ -2341,7 +2747,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             JPanel innerPanel = new JPanel(new BorderLayout());
             innerPanel.setOpaque(false);
             innerPanel.setBorder(BorderFactory.createEmptyBorder(6, 14, 6, 14));
-            innerPanel.add(header, BorderLayout.NORTH);
+            innerPanel.add(this.headerPanel, BorderLayout.NORTH);
             innerPanel.add(contentPane, BorderLayout.CENTER);
 
             add(innerPanel, BorderLayout.CENTER);
@@ -2351,7 +2757,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         @Override
         public Dimension getPreferredSize() {
             // 回溯找到 chatMessagePanel 的实际宽度
-            int chatPanelW = 500; // 默认兜底
+            int chatPanelW = 500;
             Container p = getParent();
             while (p != null) {
                 if (p instanceof JViewport vp) {
@@ -2364,45 +2770,57 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
                 p = p.getParent();
             }
-            int maxW = (int) (chatPanelW * 0.65);
-            if (maxW < 200) maxW = 200;
+            int maxW = (int) (chatPanelW * 0.75);
+            if (maxW < 240) maxW = 240;
 
-            // RSyntaxTextArea 高度计算
+            // 文本换行宽度
             if (contentArea != null) {
                 int textWidth = maxW - 28;
                 if (textWidth > 0) {
-                    contentArea.setSize(textWidth, Integer.MAX_VALUE / 2);
+                    contentArea.setTargetWidth(textWidth);
                 }
             }
-            // 叠加媒体面板高度
+
+            // 直接累加子组件高度，不用 super.getPreferredSize() 避免嵌套计算误差
+            // ChatBubble border(0,4,0,4) + innerPanel border(6,14,6,14)
+            Insets insets = getInsets();
+            int chatBorderV = insets.top + insets.bottom;          // 0 + 0 = 0
+            int innerBorderV = 6 + 6;                             // innerPanel top + bottom
+            int contentH = contentArea != null ? contentArea.getPreferredSize().height : 0;
             int mediaH = (mediaPanel != null && mediaPanel.getComponentCount() > 0)
                     ? mediaPanel.getPreferredSize().height : 0;
-            return new Dimension(maxW + 8, super.getPreferredSize().height + mediaH);
+            int h = chatBorderV + innerBorderV + contentH + mediaH + headerPanel.getPreferredSize().height;
+            return new Dimension(maxW + 8, h);
         }
 
-        /** 重新计算内容区尺寸（RSyntaxTextArea 版本） */
+        /** 重新计算内容区尺寸 */
         void recalcContentSize() {
             if (contentArea == null) return;
-            int curW = contentArea.getWidth();
-            if (curW <= 0) {
-                Container p = getParent();
-                if (p != null && p.getWidth() > 0) {
-                    curW = p.getWidth() - 64;
-                } else {
-                    Container pp = getParent();
-                    int fallbackW = 500;
-                    while (pp != null) {
-                        if (pp instanceof JViewport vp) { fallbackW = vp.getWidth(); break; }
-                        if (pp.getParent() instanceof JViewport vp) { fallbackW = vp.getWidth(); break; }
-                        pp = pp.getParent();
-                    }
-                    curW = (int) (fallbackW * 0.65) - 40;
-                    if (curW < 160) curW = 160;
-                }
+            int chatPanelW = 500;
+            Container pp = getParent();
+            while (pp != null) {
+                if (pp instanceof JViewport vp) { chatPanelW = vp.getWidth(); break; }
+                if (pp.getParent() instanceof JViewport vp) { chatPanelW = vp.getWidth(); break; }
+                pp = pp.getParent();
             }
-            if (curW > 0) {
-                contentArea.setSize(curW, Integer.MAX_VALUE / 2);
+            int maxW = (int) (chatPanelW * 0.75) - 40;
+            if (maxW < 160) maxW = 160;
+            contentArea.setTargetWidth(maxW);
+        }
+
+        /** 计算 contentPane 可用宽度：ChatBubble宽度 - 两边border/padding */
+        private int getContentPaneWidth() {
+            int chatPanelW = 500;
+            Container pp = getParent();
+            while (pp != null) {
+                if (pp instanceof JViewport vp) { chatPanelW = vp.getWidth(); break; }
+                if (pp.getParent() instanceof JViewport vp) { chatPanelW = vp.getWidth(); break; }
+                pp = pp.getParent();
             }
+            // maxW + 8 是 ChatBubble 宽度，减去 ChatBubble border(4+4) + innerPanel border(14+14)
+            int maxW = (int) (chatPanelW * 0.75);
+            if (maxW < 240) maxW = 240;
+            return maxW - 28;  // (maxW + 8) - 8 - 28 = maxW - 28
         }
 
         @Override
@@ -2474,6 +2892,137 @@ public class AiChatPanel extends AbstractCommandPanel {
         private static final BasicStroke STROKE_1PX = new BasicStroke(1.0f);
     }
 
+    // ==================== 文本气泡内容面板（自定义绘制，替代 RSyntaxTextArea） ====================
+
+    /** 聊天消息文本内容面板，纯 Graphics2D 绘制，无嵌套文本域 */
+    private static class TextBubbleContent extends JPanel {
+        private static final int PADDING = 6;
+
+        private final StringBuilder buffer = new StringBuilder();
+        private Color textColor = new Color(0xEAEAEA);
+        private int lineHeight;
+        private List<String> wrappedLines = new ArrayList<>();
+        private int targetWidth = 400;
+
+        TextBubbleContent(String initialText) {
+            setOpaque(false);
+            buffer.append(initialText);
+            setFont(NetUtil.FONT_TEXT);
+            updateMetrics();
+        }
+
+        private void updateMetrics() {
+            FontMetrics fm = getFontMetrics(getFont());
+            lineHeight = fm.getHeight();
+        }
+
+        @Override
+        public void setFont(Font font) {
+            super.setFont(font);
+            updateMetrics();
+        }
+
+        void setTextColor(Color c) { this.textColor = c; repaint(); }
+
+        void setText(String text) {
+            buffer.setLength(0);
+            buffer.append(text);
+            rewrap();
+            repaint();
+        }
+
+        void append(String text) {
+            buffer.append(text);
+            rewrap();
+        }
+
+        void clear() {
+            buffer.setLength(0);
+            wrappedLines.clear();
+            repaint();
+        }
+
+        private void rewrap() {
+            wrappedLines.clear();
+            if (buffer.length() == 0) return;
+
+            FontMetrics fm = getFontMetrics(getFont());
+            int maxW = targetWidth - PADDING * 2;
+            if (maxW <= 0) maxW = 400;
+
+            String text = buffer.toString();
+            StringBuilder lineBuf = new StringBuilder();
+
+            for (int i = 0; i < text.length(); i++) {
+                char ch = text.charAt(i);
+                if (ch == '\n') {
+                    wrappedLines.add(lineBuf.toString());
+                    lineBuf.setLength(0);
+                } else {
+                    String tentative = lineBuf.toString() + ch;
+                    if (fm.stringWidth(tentative) <= maxW) {
+                        lineBuf.append(ch);
+                    } else {
+                        wrappedLines.add(lineBuf.toString());
+                        lineBuf.setLength(0);
+                        lineBuf.append(ch);
+                    }
+                }
+            }
+            if (lineBuf.length() > 0) {
+                wrappedLines.add(lineBuf.toString());
+            }
+            if (wrappedLines.isEmpty()) {
+                wrappedLines.add("");
+            }
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            if (wrappedLines.isEmpty()) {
+                return new Dimension(100, lineHeight + PADDING * 2 + 4);
+            }
+            FontMetrics fm = getFontMetrics(getFont());
+            int maxLineW = 0;
+            for (String line : wrappedLines) {
+                int w = fm.stringWidth(line);
+                if (w > maxLineW) maxLineW = w;
+            }
+            int prefW = Math.min(maxLineW + PADDING * 2, targetWidth) + 4;
+            if (prefW < 120) prefW = 120;
+            int prefH = wrappedLines.size() * lineHeight + PADDING * 2 + 4;
+            return new Dimension(prefW, prefH);
+        }
+
+        void setTargetWidth(int w) {
+            if (w != targetWidth) {
+                targetWidth = w;
+                rewrap();
+                repaint();
+            }
+        }
+
+        int getLineCount() { return wrappedLines.size(); }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            // 不画背景，让气泡渐变直接透出，只绘制文字
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            g2.setColor(textColor);
+            g2.setFont(getFont());
+            FontMetrics fm = g2.getFontMetrics();
+            int y = fm.getAscent() + PADDING;
+
+            for (String line : wrappedLines) {
+                g2.drawString(line, PADDING, y);
+                y += lineHeight;
+            }
+
+            g2.dispose();
+        }
+    }
+
     // ==================== 嵌入式视频播放器（FFmpegFrameGrabber） ====================
 
     /**
@@ -2482,7 +3031,6 @@ public class AiChatPanel extends AbstractCommandPanel {
      */
     private static class ChatVideoPlayer extends JPanel {
 
-        private static final Color C_PLAYER_BG = new Color(0x1A1A1A);
         private static final Color C_CONTROL_BG = new Color(0x2A2A2A);
         private static final Color C_BTN_BG = new Color(0x444444);
         private static final Color C_PRIMARY = new Color(0x6BCB77);
@@ -2491,7 +3039,6 @@ public class AiChatPanel extends AbstractCommandPanel {
         private final JPanel canvas;
         private final JButton playPauseBtn;
         private final JLabel statusLabel;
-        private final JButton openBtn;
 
         private FFmpegFrameGrabber grabber;
         private Thread grabThread;
@@ -2507,15 +3054,20 @@ public class AiChatPanel extends AbstractCommandPanel {
         // 视频尺寸
         private int videoW = 640, videoH = 360;
 
-        ChatVideoPlayer(String videoUrl) {
+        ChatVideoPlayer(String videoUrl, int contentWidth) {
             this.videoUrl = videoUrl;
+            int dispW = contentWidth > 0 ? contentWidth : 400;
+            // 16:9 默认比例
+            int dispH = dispW * 9 / 16;
+            if (dispH > 400) { dispH = 400; dispW = dispH * 16 / 9; }
+
             setLayout(new BorderLayout());
-            setBackground(C_PLAYER_BG);
+            setOpaque(false);
             setBorder(BorderFactory.createCompoundBorder(
                     BorderFactory.createLineBorder(new Color(0x555555), 1),
                     BorderFactory.createEmptyBorder(4, 4, 4, 4)));
 
-            // ---- 视频画面画布 ----
+            // ---- 视频画面画布（透明背景，帧填满宽度） ----
             canvas = new JPanel() {
                 @Override
                 protected void paintComponent(Graphics g) {
@@ -2523,24 +3075,75 @@ public class AiChatPanel extends AbstractCommandPanel {
                     BufferedImage img = currentFrame;
                     if (img != null) {
                         int cw = getWidth(), ch = getHeight();
-                        // 保持宽高比居中
-                        double scale = Math.min((double) cw / videoW, (double) ch / videoH);
-                        int dw = (int) (videoW * scale), dh = (int) (videoH * scale);
+                        // 填满画布宽度，保持比例
+                        int dw = cw;
+                        int dh = (int) ((long) videoH * cw / videoW);
+                        if (dh > ch) { dh = ch; dw = (int) ((long) videoW * ch / videoH); }
                         int dx = (cw - dw) / 2, dy = (ch - dh) / 2;
                         g.drawImage(img, dx, dy, dw, dh, null);
                     } else {
-                        g.setColor(new Color(0x666666));
+                        g.setColor(new Color(0xAAAAAA));
                         g.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
                         FontMetrics fm = g.getFontMetrics();
-                        String text = videoEnded ? "⏸ 播放完毕" : "⏳ 加载中...";
+                        String text = videoEnded ? "播放完毕" : "加载中...";
                         g.drawString(text,
                                 (getWidth() - fm.stringWidth(text)) / 2,
                                 getHeight() / 2);
                     }
                 }
             };
-            canvas.setBackground(C_PLAYER_BG);
-            canvas.setOpaque(true);
+            canvas.setOpaque(false);
+
+            // 右键菜单
+            JPopupMenu videoPopup = new JPopupMenu();
+            JMenuItem copyLink = new JMenuItem("复制链接");
+            copyLink.addActionListener(e -> java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(videoUrl), null));
+            videoPopup.add(copyLink);
+
+            JMenuItem saveVideo = new JMenuItem("保存视频");
+            saveVideo.addActionListener(e -> {
+                JFileChooser fc = new JFileChooser();
+                String defaultName = videoUrl.substring(videoUrl.lastIndexOf('/') + 1);
+                if (defaultName.contains("?")) defaultName = defaultName.substring(0, defaultName.indexOf('?'));
+                if (defaultName.isEmpty()) defaultName = "video.mp4";
+                fc.setSelectedFile(new java.io.File(defaultName));
+                if (fc.showSaveDialog(SwingUtilities.getWindowAncestor(this)) == JFileChooser.APPROVE_OPTION) {
+                    Thread.ofVirtual().start(() -> {
+                        try {
+                            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                                    .followRedirects(java.net.http.HttpClient.Redirect.NORMAL).build();
+                            java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder(URI.create(videoUrl))
+                                    .GET().build();
+                            java.net.http.HttpResponse<InputStream> resp =
+                                    client.send(req, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+                            java.nio.file.Files.copy(resp.body(), fc.getSelectedFile().toPath(),
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                                    "视频已保存到: " + fc.getSelectedFile().getAbsolutePath(), "保存成功",
+                                    JOptionPane.INFORMATION_MESSAGE));
+                        } catch (Exception ex) {
+                            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                                    "保存失败: " + ex.getMessage(), "错误", JOptionPane.ERROR_MESSAGE));
+                        }
+                    });
+                }
+            });
+            videoPopup.add(saveVideo);
+
+            JMenuItem openBrowser = new JMenuItem("浏览器打开");
+            openBrowser.addActionListener(e -> {
+                try {
+                    Desktop.getDesktop().browse(URI.create(videoUrl));
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(this, "无法打开浏览器: " + ex.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                }
+            });
+            videoPopup.add(openBrowser);
+
+            canvas.setComponentPopupMenu(videoPopup);
+            canvas.setToolTipText("右键菜单 | 单击播放/暂停");
+
             add(canvas, BorderLayout.CENTER);
 
             // ---- 底部控制栏 ----
@@ -2551,8 +3154,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             JPanel leftCtrls = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
             leftCtrls.setOpaque(false);
 
-            playPauseBtn = new JButton("▶");
-            playPauseBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 14));
+            playPauseBtn = new JButton(">");
+            playPauseBtn.setFont(new Font("Microsoft YaHei", Font.BOLD, 14));
             playPauseBtn.setForeground(C_PRIMARY);
             playPauseBtn.setBackground(C_BTN_BG);
             playPauseBtn.setFocusable(false);
@@ -2582,34 +3185,15 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             controlBar.add(leftCtrls, BorderLayout.WEST);
 
-            // 右侧按钮：在系统播放器中打开
-            openBtn = new JButton("外部打开");
-            openBtn.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
-            openBtn.setForeground(new Color(0xCCCCCC));
-            openBtn.setBackground(C_BTN_BG);
-            openBtn.setFocusable(false);
-            openBtn.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
-            openBtn.addActionListener(e -> {
-                try {
-                    Desktop.getDesktop().browse(URI.create(videoUrl));
-                } catch (Exception ex) {
-                    // 本地文件路径尝试
-                    try {
-                        Desktop.getDesktop().open(new java.io.File(videoUrl));
-                    } catch (Exception ignored) {}
-                }
-            });
-            controlBar.add(openBtn, BorderLayout.EAST);
-
             add(controlBar, BorderLayout.SOUTH);
 
-            setPreferredSize(new Dimension(400, 280));
-            setMaximumSize(new Dimension(Integer.MAX_VALUE, 320));
+            setPreferredSize(new Dimension(dispW, dispH + 36));
+            setMaximumSize(new Dimension(Integer.MAX_VALUE, dispH + 36));
             setMinimumSize(new Dimension(240, 200));
         }
 
         private void updatePlayPauseBtn() {
-            playPauseBtn.setText(playing ? "⏸" : "▶");
+            playPauseBtn.setText(playing ? "||" : ">");
         }
 
         /** 启动视频抓帧线程（平台线程，避免 JNI pin 住虚拟线程 carrier） */
@@ -2812,166 +3396,186 @@ public class AiChatPanel extends AbstractCommandPanel {
 
     // ==================== AI 图片生成 (Agnes-Image-2.0-Flash) ====================
 
+    /** 从模型配置中解析图片生成参数（提取尺寸纯数字部分） */
+    private String parseImageSize(ModelConfig mc) {
+        String size = mc.getExtra("image.size");
+        return (size != null && !size.isBlank()) ? size : "1024x1024";
+    }
+
+    /** 从模型配置中解析图片生成模式 */
+    private String parseImageMode(ModelConfig mc) {
+        String mode = mc.getExtra("image.mode");
+        return (mode != null && !mode.isBlank()) ? mode : "文生图";
+    }
+
+    /** 从模型配置中解析图片输入 URL 列表 */
+    private List<String> parseImageUrls(ModelConfig mc) {
+        String urls = mc.getExtra("image.urls");
+        if (urls != null && !urls.isBlank()) {
+            List<String> list = new ArrayList<>(Arrays.asList(urls.split("\\n")));
+            list.removeIf(String::isBlank);
+            return list.isEmpty() ? null : list;
+        }
+        return null;
+    }
+
+    /** 从模型配置中解析视频参数 */
+    private int[] parseVideoResolution(ModelConfig mc) {
+        String size = mc.getExtra("video.size");
+        if (size != null && !size.isBlank()) {
+            String[] parts = size.split("x");
+            if (parts.length == 2) {
+                try { return new int[] { Integer.parseInt(parts[0]), Integer.parseInt(parts[1]) }; }
+                catch (NumberFormatException ignored) {}
+            }
+        }
+        return new int[]{1152, 768};
+    }
+
+    private int[] parseVideoDuration(ModelConfig mc) {
+        String dur = mc.getExtra("video.duration");
+        if (dur != null) {
+            if (dur.contains("3 秒")) return new int[]{81, 24};
+            if (dur.contains("5 秒")) return new int[]{121, 24};
+            if (dur.contains("10 秒")) return new int[]{241, 24};
+            if (dur.contains("18 秒")) return new int[]{441, 24};
+        }
+        return new int[]{121, 24};
+    }
+
+    private double parseVideoFps(ModelConfig mc) {
+        String fps = mc.getExtra("video.fps");
+        if (fps != null && !fps.isBlank()) {
+            try { return Double.parseDouble(fps); } catch (NumberFormatException ignored) {}
+        }
+        return 24;
+    }
+
+    private String parseVideoMode(ModelConfig mc) {
+        String mode = mc.getExtra("video.mode");
+        return (mode != null && !mode.isBlank()) ? mode : "文生视频";
+    }
+
+    private Integer parseVideoSeed(ModelConfig mc) {
+        String seed = mc.getExtra("video.seed");
+        if (seed != null && !seed.isBlank()) {
+            try { return Integer.parseInt(seed); } catch (NumberFormatException ignored) {}
+        }
+        return null;
+    }
+
+    private List<String> parseVideoUrls(ModelConfig mc) {
+        String urls = mc.getExtra("video.urls");
+        if (urls != null && !urls.isBlank()) {
+            List<String> list = new ArrayList<>(Arrays.asList(urls.split("\\n")));
+            list.removeIf(String::isBlank);
+            return list.isEmpty() ? null : list;
+        }
+        return null;
+    }
+
+    /** 处理 Agnes 图片生成（从 sendMessage 路由过来） */
+    private void handleAgnesImageSend(String prompt, ModelConfig mc) {
+        // 优先使用模型配置中的 API Key
+        String key = resolveAgnesApiKey(mc);
+        if (key == null) return;
+
+        String size = parseImageSize(mc);
+        String mode = parseImageMode(mc);
+        List<String> imageUrls = parseImageUrls(mc);
+
+        // 对于非文生图模式但未配置 URL，在输入中检测 URL
+        if (!"文生图".equals(mode) && (imageUrls == null || imageUrls.isEmpty())) {
+            // 尝试从 prompt 中提取 URL
+            imageUrls = extractUrlsFromText(prompt);
+        }
+
+        // 检查非文本模式是否有图片输入
+        if (!"文生图".equals(mode) && (imageUrls == null || imageUrls.isEmpty())) {
+            JOptionPane.showMessageDialog(this,
+                    "图生图/多图合成需要提供图片 URL\n请在模型配置中填写或输入消息中包含图片 URL",
+                    "提示", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        inputArea.setText("");
+        if (inputUndoManager != null) inputUndoManager.discardAllEdits();
+        executeImageGeneration(mode, prompt, size, imageUrls);
+    }
+
+    /** 处理 Agnes 视频生成（从 sendMessage 路由过来） */
+    private void handleAgnesVideoSend(String prompt, ModelConfig mc) {
+        // 优先使用模型配置中的 API Key
+        String key = resolveAgnesApiKey(mc);
+        if (key == null) return;
+
+        int[] wh = parseVideoResolution(mc);
+        int[] fd = parseVideoDuration(mc);
+        double fps = parseVideoFps(mc);
+        String mode = parseVideoMode(mc);
+        Integer seed = parseVideoSeed(mc);
+        List<String> imageUrls = parseVideoUrls(mc);
+
+        // 对于非文生视频模式但未配置 URL，尝试从 prompt 中提取
+        if (!"文生视频".equals(mode) && (imageUrls == null || imageUrls.isEmpty())) {
+            imageUrls = extractUrlsFromText(prompt);
+        }
+
+        if (!"文生视频".equals(mode) && (imageUrls == null || imageUrls.isEmpty())) {
+            JOptionPane.showMessageDialog(this,
+                    "图生视频/多图视频/关键帧动画需要提供图片 URL\n请在模型配置中填写或输入消息中包含图片 URL",
+                    "提示", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        inputArea.setText("");
+        if (inputUndoManager != null) inputUndoManager.discardAllEdits();
+        executeVideoGeneration(mode, prompt, wh[0], wh[1], fd[0], fps, seed, imageUrls);
+    }
+
+    /** 解析 Agnes API Key：优先用模型配置中的 Key，其次用缓存的 agnesApiKey，都没有则弹框 */
+    private String resolveAgnesApiKey(ModelConfig mc) {
+        // 优先使用模型配置中保存的 Key
+        String key = mc.getApiKey();
+        if (key != null && !key.isBlank()) {
+            agnesApiKey = key;
+            imageService = null;
+            videoService = null;
+            return key;
+        }
+        // 其次使用之前缓存的 Key
+        if (agnesApiKey != null && !agnesApiKey.isBlank()) {
+            return agnesApiKey;
+        }
+        // 都没有则弹框输入
+        String inputKey = JOptionPane.showInputDialog(this,
+                "请输入 Agnes API Key：\n（获取地址：https://apihub.agnes-ai.com）",
+                "配置 Agnes API Key", JOptionPane.PLAIN_MESSAGE);
+        if (inputKey != null && !inputKey.isBlank()) {
+            agnesApiKey = inputKey.trim();
+            imageService = null;
+            videoService = null;
+            return agnesApiKey;
+        }
+        return null;
+    }
+
+    /** 从文本中提取 URL */
+    private List<String> extractUrlsFromText(String text) {
+        List<String> urls = new ArrayList<>();
+        java.util.regex.Matcher m = Pattern.compile("https?://[^\\s]+").matcher(text);
+        while (m.find()) {
+            urls.add(m.group());
+        }
+        return urls.isEmpty() ? null : urls;
+    }
+
     /** 获取或创建图片生成服务 */
     private AgnesImageService getOrCreateImageService() {
         if (imageService == null && agnesApiKey != null && !agnesApiKey.isBlank()) {
             imageService = new AgnesImageService(agnesApiKey);
         }
         return imageService;
-    }
-
-    /** 显示图片生成对话框 */
-    private void showImageGenerationDialog() {
-        // 检查 API Key
-        if (agnesApiKey == null || agnesApiKey.isBlank()) {
-            String inputKey = JOptionPane.showInputDialog(this,
-                    "请输入 Agnes API Key：\n（获取地址：https://apihub.agnes-ai.com）",
-                    "配置 Agnes API Key", JOptionPane.PLAIN_MESSAGE);
-            if (inputKey != null && !inputKey.isBlank()) {
-                agnesApiKey = inputKey.trim();
-                imageService = null; // 重置，下次重建
-            } else {
-                return;
-            }
-        }
-
-        // 构建对话框面板
-        JPanel dialogPanel = new JPanel(new GridBagLayout());
-        dialogPanel.setBackground(C_INPUT_BG);
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(4, 8, 4, 8);
-        gbc.fill = GridBagConstraints.HORIZONTAL;
-        gbc.gridx = 0;
-        gbc.gridy = 0;
-        gbc.weightx = 0;
-        gbc.anchor = GridBagConstraints.WEST;
-
-        // Prompt 输入
-        JLabel promptLabel = new JLabel("Prompt：");
-        promptLabel.setFont(NetUtil.FONT_TEXT);
-        promptLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(promptLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JTextArea promptArea = new JTextArea(3, 40);
-        promptArea.setFont(NetUtil.FONT_TEXT);
-        promptArea.setForeground(NetUtil.TEXT_COLOR);
-        promptArea.setBackground(C_FIELD_BG);
-        promptArea.setCaretColor(NetUtil.TEXT_COLOR);
-        promptArea.setLineWrap(true);
-        promptArea.setWrapStyleWord(true);
-        JScrollPane promptScroll = new JScrollPane(promptArea);
-        promptScroll.setPreferredSize(new Dimension(400, 70));
-        dialogPanel.add(promptScroll, gbc);
-
-        // 尺寸选择
-        gbc.gridx = 0;
-        gbc.gridy = 1;
-        gbc.weightx = 0;
-        JLabel sizeLabel = new JLabel("尺寸：");
-        sizeLabel.setFont(NetUtil.FONT_TEXT);
-        sizeLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(sizeLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JComboBox<String> sizeCombo = new JComboBox<>(new String[]{
-                "1024x1024", "1024x768", "768x1024", "512x512", "1024x576", "576x1024"
-        });
-        sizeCombo.setFont(NetUtil.FONT_TEXT);
-        sizeCombo.setForeground(NetUtil.TEXT_COLOR);
-        sizeCombo.setBackground(C_FIELD_BG);
-        dialogPanel.add(sizeCombo, gbc);
-
-        // 模式选择
-        gbc.gridx = 0;
-        gbc.gridy = 2;
-        gbc.weightx = 0;
-        JLabel modeLabel = new JLabel("模式：");
-        modeLabel.setFont(NetUtil.FONT_TEXT);
-        modeLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(modeLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JComboBox<String> modeCombo = new JComboBox<>(new String[]{"文生图", "图生图（输入URL）", "多图合成"});
-        modeCombo.setFont(NetUtil.FONT_TEXT);
-        modeCombo.setForeground(NetUtil.TEXT_COLOR);
-        modeCombo.setBackground(C_FIELD_BG);
-        dialogPanel.add(modeCombo, gbc);
-
-        // 输入图片 URL（图生图模式显示）
-        gbc.gridx = 0;
-        gbc.gridy = 3;
-        gbc.weightx = 0;
-        JLabel imageLabel = new JLabel("输入图片URL：");
-        imageLabel.setFont(NetUtil.FONT_TEXT);
-        imageLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(imageLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JTextArea imageUrlArea = new JTextArea(2, 40);
-        imageUrlArea.setFont(NetUtil.FONT_TEXT);
-        imageUrlArea.setForeground(NetUtil.TEXT_COLOR);
-        imageUrlArea.setBackground(C_FIELD_BG);
-        imageUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
-        imageUrlArea.setLineWrap(true);
-        imageUrlArea.setWrapStyleWord(true);
-        imageUrlArea.setToolTipText("每行一个URL（图生图/多图合成时需要）");
-        JScrollPane imageScroll = new JScrollPane(imageUrlArea);
-        imageScroll.setPreferredSize(new Dimension(400, 50));
-        dialogPanel.add(imageScroll, gbc);
-
-        // 初始隐藏图生图输入
-        imageLabel.setVisible(false);
-        imageScroll.setVisible(false);
-
-        // 模式切换时显示/隐藏图生图输入
-        modeCombo.addActionListener(e -> {
-            boolean show = !"文生图".equals(modeCombo.getSelectedItem());
-            imageLabel.setVisible(show);
-            imageScroll.setVisible(show);
-            dialogPanel.revalidate();
-            dialogPanel.repaint();
-            // 调整对话框大小
-            Window w = SwingUtilities.getWindowAncestor(dialogPanel);
-            if (w != null) w.pack();
-        });
-
-        int result = JOptionPane.showConfirmDialog(this,
-                dialogPanel, "AI 图片生成 (Agnes-Image-2.0-Flash)",
-                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
-
-        if (result != JOptionPane.OK_OPTION) return;
-
-        String prompt = promptArea.getText().trim();
-        if (prompt.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请输入 Prompt", "提示", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
-        String size = (String) sizeCombo.getSelectedItem();
-        String mode = (String) modeCombo.getSelectedItem();
-
-        List<String> imageUrls = null;
-        if (!"文生图".equals(mode)) {
-            String urlsText = imageUrlArea.getText().trim();
-            if (urlsText.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "请输入输入图片 URL（每行一个）", "提示", JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-            imageUrls = Arrays.asList(urlsText.split("\\n"));
-            imageUrls.removeIf(String::isBlank);
-            if (imageUrls.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "请输入有效的图片 URL", "提示", JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-        }
-
-        // 执行图片生成
-        executeImageGeneration(mode, prompt, size, imageUrls);
     }
 
     /** 执行图片生成并在对话中展示结果 */
@@ -2983,14 +3587,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
 
         // 显示用户消息气泡（用户发起的图片生成请求）
-        String userMsg = "🎨 " + mode + "：" + prompt;
+        String userMsg = mode + "：" + prompt;
         String userTime = LocalTime.now().format(TF);
         clearPlaceholderIfNeeded();
         addMessageBubble("你", userMsg, userTime, true);
 
         // 显示生成中的 AI 气泡
         String aiTime = LocalTime.now().format(TF);
-        ChatBubble genBubble = new ChatBubble("AI", "🎨 正在生成图片...", aiTime, false);
+        ChatBubble genBubble = new ChatBubble("AI", "正在生成图片...", aiTime, false);
 
         JPanel wrapper = new JPanel(new BorderLayout());
         wrapper.setOpaque(false);
@@ -3016,9 +3620,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                     // 成功：将生成的图片显示在气泡中
                     SwingUtilities.invokeLater(() -> {
                         // 更新气泡内容
-                        genBubble.contentArea.setText("✅ 图片生成完成！\n\nPrompt：" + prompt);
-                        genBubble.contentArea.append("\n尺寸：" + size);
-                        genBubble.contentArea.append("\n模式：" + mode);
+                        genBubble.contentArea.setText("[成功] 图片生成完成！\n\nPrompt：" + prompt
+                                + "\n尺寸：" + size + "\n模式：" + mode);
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
 
@@ -3043,8 +3646,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 error -> {
                     // 失败：显示错误
                     SwingUtilities.invokeLater(() -> {
-                        genBubble.contentArea.setText("❌ 图片生成失败");
-                        genBubble.contentArea.append("\n\n" + error.getMessage());
+                        genBubble.contentArea.setText("[失败] 图片生成失败\n\n" + error.getMessage());
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
                         chatMessagePanel.revalidate();
@@ -3081,262 +3683,6 @@ public class AiChatPanel extends AbstractCommandPanel {
             videoService = new AgnesVideoService(agnesApiKey);
         }
         return videoService;
-    }
-
-    /** 显示视频生成对话框 */
-    private void showVideoGenerationDialog() {
-        // 检查 API Key
-        if (agnesApiKey == null || agnesApiKey.isBlank()) {
-            String inputKey = JOptionPane.showInputDialog(this,
-                    "请输入 Agnes API Key：\n（获取地址：https://apihub.agnes-ai.com）",
-                    "配置 Agnes API Key", JOptionPane.PLAIN_MESSAGE);
-            if (inputKey != null && !inputKey.isBlank()) {
-                agnesApiKey = inputKey.trim();
-                imageService = null;
-                videoService = null;
-            } else {
-                return;
-            }
-        }
-
-        // 构建对话框面板
-        JPanel dialogPanel = new JPanel(new GridBagLayout());
-        dialogPanel.setBackground(C_INPUT_BG);
-        GridBagConstraints gbc = new GridBagConstraints();
-        gbc.insets = new Insets(4, 8, 4, 8);
-        gbc.fill = GridBagConstraints.HORIZONTAL;
-        gbc.gridx = 0;
-        gbc.gridy = 0;
-        gbc.weightx = 0;
-        gbc.anchor = GridBagConstraints.WEST;
-
-        // Prompt 输入
-        JLabel promptLabel = new JLabel("Prompt：");
-        promptLabel.setFont(NetUtil.FONT_TEXT);
-        promptLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(promptLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JTextArea promptArea = new JTextArea(3, 40);
-        promptArea.setFont(NetUtil.FONT_TEXT);
-        promptArea.setForeground(NetUtil.TEXT_COLOR);
-        promptArea.setBackground(C_FIELD_BG);
-        promptArea.setCaretColor(NetUtil.TEXT_COLOR);
-        promptArea.setLineWrap(true);
-        promptArea.setWrapStyleWord(true);
-        JScrollPane promptScroll = new JScrollPane(promptArea);
-        promptScroll.setPreferredSize(new Dimension(400, 70));
-        dialogPanel.add(promptScroll, gbc);
-
-        // 模式选择
-        gbc.gridx = 0;
-        gbc.gridy = 1;
-        gbc.weightx = 0;
-        JLabel modeLabel = new JLabel("模式：");
-        modeLabel.setFont(NetUtil.FONT_TEXT);
-        modeLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(modeLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JComboBox<String> modeCombo = new JComboBox<>(new String[]{
-                "文生视频", "图生视频（输入URL）", "多图视频", "关键帧动画"
-        });
-        modeCombo.setFont(NetUtil.FONT_TEXT);
-        modeCombo.setForeground(NetUtil.TEXT_COLOR);
-        modeCombo.setBackground(C_FIELD_BG);
-        dialogPanel.add(modeCombo, gbc);
-
-        // 分辨率
-        gbc.gridx = 0;
-        gbc.gridy = 2;
-        gbc.weightx = 0;
-        JLabel sizeLabel = new JLabel("分辨率：");
-        sizeLabel.setFont(NetUtil.FONT_TEXT);
-        sizeLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(sizeLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JComboBox<String> sizeCombo = new JComboBox<>(new String[]{
-                "1152x768 (16:9 720p)", "1280x720 (16:9 720p)", "1536x640 (约2.4:1)",
-                "768x1280 (9:16 竖屏)", "720x1280 (9:16 竖屏)", "1024x1024 (1:1 方形)"
-        });
-        sizeCombo.setFont(NetUtil.FONT_TEXT);
-        sizeCombo.setForeground(NetUtil.TEXT_COLOR);
-        sizeCombo.setBackground(C_FIELD_BG);
-        dialogPanel.add(sizeCombo, gbc);
-
-        // 时长预设
-        gbc.gridx = 0;
-        gbc.gridy = 3;
-        gbc.weightx = 0;
-        JLabel durLabel = new JLabel("时长：");
-        durLabel.setFont(NetUtil.FONT_TEXT);
-        durLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(durLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JComboBox<String> durationCombo = new JComboBox<>(new String[]{
-                "约 3 秒 (81帧@24fps)", "约 5 秒 (121帧@24fps)",
-                "约 10 秒 (241帧@24fps)", "约 18 秒 (441帧@24fps)"
-        });
-        durationCombo.setFont(NetUtil.FONT_TEXT);
-        durationCombo.setForeground(NetUtil.TEXT_COLOR);
-        durationCombo.setBackground(C_FIELD_BG);
-        durationCombo.setSelectedIndex(1); // 默认 5 秒
-        dialogPanel.add(durationCombo, gbc);
-
-        // 帧率
-        gbc.gridx = 0;
-        gbc.gridy = 4;
-        gbc.weightx = 0;
-        JLabel fpsLabel = new JLabel("帧率：");
-        fpsLabel.setFont(NetUtil.FONT_TEXT);
-        fpsLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(fpsLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-
-        // 动态构建帧率选项，不超过屏幕刷新率
-        int screenHz = getScreenRefreshRate();
-        java.util.List<String> fpsOptions = new java.util.ArrayList<>();
-        for (int f : new int[]{10, 15, 24, 30, 60, 120, 144, 240}) {
-            if (f <= screenHz) {
-                fpsOptions.add(f + " fps");
-            }
-        }
-        // 如果屏幕刷新率不在预设列表中，额外添加
-        String screenHzStr = screenHz + " fps";
-        if (!fpsOptions.contains(screenHzStr)) {
-            fpsOptions.add(screenHzStr);
-        }
-
-        JComboBox<String> fpsCombo = new JComboBox<>(fpsOptions.toArray(new String[0]));
-        // 默认选中 24 fps，没有则选第一个
-        int defaultFpsIdx = fpsOptions.indexOf("24 fps");
-        if (defaultFpsIdx >= 0) {
-            fpsCombo.setSelectedIndex(defaultFpsIdx);
-        }
-        fpsCombo.setFont(NetUtil.FONT_TEXT);
-        fpsCombo.setForeground(NetUtil.TEXT_COLOR);
-        fpsCombo.setBackground(C_FIELD_BG);
-        dialogPanel.add(fpsCombo, gbc);
-
-        // 输入图片 URL（非文生视频模式显示）
-        gbc.gridx = 0;
-        gbc.gridy = 5;
-        gbc.weightx = 0;
-        JLabel imageLabel = new JLabel("输入图片URL：");
-        imageLabel.setFont(NetUtil.FONT_TEXT);
-        imageLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(imageLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JTextArea imageUrlArea = new JTextArea(2, 40);
-        imageUrlArea.setFont(NetUtil.FONT_TEXT);
-        imageUrlArea.setForeground(NetUtil.TEXT_COLOR);
-        imageUrlArea.setBackground(C_FIELD_BG);
-        imageUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
-        imageUrlArea.setLineWrap(true);
-        imageUrlArea.setWrapStyleWord(true);
-        imageUrlArea.setToolTipText("每行一个URL（图生视频/多图视频/关键帧动画时需要）");
-        JScrollPane imageScroll = new JScrollPane(imageUrlArea);
-        imageScroll.setPreferredSize(new Dimension(400, 50));
-        dialogPanel.add(imageScroll, gbc);
-
-        // 初始隐藏图生图输入
-        imageLabel.setVisible(false);
-        imageScroll.setVisible(false);
-
-        // 模式切换时显示/隐藏图片 URL 输入
-        modeCombo.addActionListener(e -> {
-            boolean show = !"文生视频".equals(modeCombo.getSelectedItem());
-            imageLabel.setVisible(show);
-            imageScroll.setVisible(show);
-            dialogPanel.revalidate();
-            dialogPanel.repaint();
-            Window w = SwingUtilities.getWindowAncestor(dialogPanel);
-            if (w != null) w.pack();
-        });
-
-        // Seed 输入
-        gbc.gridx = 0;
-        gbc.gridy = 6;
-        gbc.weightx = 0;
-        JLabel seedLabel = new JLabel("Seed（可选）：");
-        seedLabel.setFont(NetUtil.FONT_TEXT);
-        seedLabel.setForeground(NetUtil.TEXT_COLOR);
-        dialogPanel.add(seedLabel, gbc);
-
-        gbc.gridx = 1;
-        gbc.weightx = 1;
-        JTextField seedField = new JTextField(10);
-        seedField.setFont(NetUtil.FONT_TEXT);
-        seedField.setForeground(NetUtil.TEXT_COLOR);
-        seedField.setBackground(C_FIELD_BG);
-        seedField.setCaretColor(NetUtil.TEXT_COLOR);
-        seedField.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(C_BORDER),
-                BorderFactory.createEmptyBorder(3, 6, 3, 6)));
-        seedField.setToolTipText("留空为随机，填入数字可复现结果");
-        dialogPanel.add(seedField, gbc);
-
-        int result = JOptionPane.showConfirmDialog(this,
-                dialogPanel, "AI 视频生成 (Agnes-Video-V2.0)",
-                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
-
-        if (result != JOptionPane.OK_OPTION) return;
-
-        String prompt = promptArea.getText().trim();
-        if (prompt.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请输入 Prompt", "提示", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
-        String mode = (String) modeCombo.getSelectedItem();
-
-        // 解析分辨率
-        String sizeStr = (String) sizeCombo.getSelectedItem();
-        int[] wh = parseResolution(sizeStr);
-
-        // 解析时长
-        int durIdx = durationCombo.getSelectedIndex();
-        int[] fd = parseDuration(durIdx);
-
-        // 解析帧率
-        String fpsStr = (String) fpsCombo.getSelectedItem();
-        double fps = parseFps(fpsStr);
-
-        // 解析 Seed
-        Integer seed = null;
-        String seedText = seedField.getText().trim();
-        if (!seedText.isEmpty()) {
-            try { seed = Integer.parseInt(seedText); } catch (NumberFormatException ignored) {}
-        }
-
-        // 解析图片 URL
-        List<String> imageUrls = null;
-        if (!"文生视频".equals(mode)) {
-            String urlsText = imageUrlArea.getText().trim();
-            if (urlsText.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "请输入输入图片 URL（每行一个）", "提示", JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-            imageUrls = new ArrayList<>(Arrays.asList(urlsText.split("\\n")));
-            imageUrls.removeIf(String::isBlank);
-            if (imageUrls.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "请输入有效的图片 URL", "提示", JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-        }
-
-        // 执行视频生成
-        executeVideoGeneration(mode, prompt, wh[0], wh[1], fd[0], fps, seed, imageUrls);
     }
 
     /** 解析分辨率字符串，返回 [width, height] */
@@ -3399,11 +3745,11 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         // 显示用户消息气泡
         String modeLabel = switch (mode) {
-            case "文生视频" -> "🎬 文生视频";
-            case "图生视频（输入URL）" -> "🎬 图生视频";
-            case "多图视频" -> "🎬 多图视频";
-            case "关键帧动画" -> "🎬 关键帧动画";
-            default -> "🎬 视频生成";
+            case "文生视频" -> "文生视频";
+            case "图生视频（输入URL）" -> "图生视频";
+            case "多图视频" -> "多图视频";
+            case "关键帧动画" -> "关键帧动画";
+            default -> "视频生成";
         };
         String userMsg = modeLabel + "：" + prompt;
         String userTime = LocalTime.now().format(TF);
@@ -3413,7 +3759,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         // 显示生成中的 AI 气泡
         String aiTime = LocalTime.now().format(TF);
         ChatBubble genBubble = new ChatBubble("AI",
-                "🎬 正在创建视频任务...\n\nPrompt：" + prompt
+                "正在创建视频任务...\n\nPrompt：" + prompt
                         + "\n分辨率：" + width + "x" + height
                         + "\n帧数：" + numFrames + " @ " + fps + "fps",
                 aiTime, false);
@@ -3445,7 +3791,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 30 * 60 * 1000, // 最长 30 分钟
                 progress -> {
                     // 进度更新
-                    String progressText = "🎬 " + progress.getStatusText()
+                    String progressText = progress.getStatusText()
                             + " (" + progress.progress + "%)"
                             + "\n\nPrompt：" + prompt
                             + "\n分辨率：" + width + "x" + height
@@ -3465,11 +3811,11 @@ public class AiChatPanel extends AbstractCommandPanel {
                         String sizeInfo = completed.getSize() != null ? completed.getSize() : (width + "x" + height);
                         String secondsInfo = completed.getSeconds() != null ? completed.getSeconds() : "—";
 
-                        genBubble.contentArea.setText("✅ 视频生成完成！"
+                        genBubble.contentArea.setText("[成功] 视频生成完成！"
                                 + "\n\nPrompt：" + prompt
                                 + "\n分辨率：" + sizeInfo
                                 + "\n时长：" + secondsInfo + " 秒"
-                                + "\n\n▶ 视频正在加载...");
+                                + "\n\n[>] 视频正在加载...");
 
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
@@ -3500,7 +3846,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 error -> {
                     // 失败
                     SwingUtilities.invokeLater(() -> {
-                        genBubble.contentArea.setText("❌ 视频生成失败"
+                        genBubble.contentArea.setText("[失败] 视频生成失败"
                                 + "\n\nPrompt：" + prompt
                                 + "\n\n错误：" + error.getMessage());
                         genBubble.recalcContentSize();

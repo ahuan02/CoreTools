@@ -1,5 +1,8 @@
 package com.szh.entity;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * AI 模型配置实体
  */
@@ -8,6 +11,8 @@ public class ModelConfig {
     private String apiKey;    // 自定义 Key
     private String apiUrl;    // API 地址
     private String modelName; // 模型全称
+    /** 扩展配置（用于存储图片/视频生成参数等） */
+    private Map<String, String> extraConfig;
 
     public ModelConfig() {
         this("", "", "", "");
@@ -18,6 +23,7 @@ public class ModelConfig {
         this.apiKey = apiKey != null ? apiKey : "";
         this.apiUrl = apiUrl != null ? apiUrl : "";
         this.modelName = modelName != null ? modelName : "";
+        this.extraConfig = new LinkedHashMap<>();
     }
 
     /** 下拉列表显示的标签 */
@@ -39,6 +45,13 @@ public class ModelConfig {
     public void setApiUrl(String apiUrl)       { this.apiUrl = apiUrl != null ? apiUrl : ""; }
     public void setModelName(String modelName) { this.modelName = modelName != null ? modelName : ""; }
 
+    public Map<String, String> getExtraConfig() { return extraConfig; }
+    public void setExtraConfig(Map<String, String> extraConfig) {
+        this.extraConfig = extraConfig != null ? extraConfig : new LinkedHashMap<>();
+    }
+    public String getExtra(String key) { return extraConfig.get(key); }
+    public void putExtra(String key, String value) { extraConfig.put(key, value); }
+
     @Override
     public String toString() {
         return comboLabel();
@@ -51,11 +64,12 @@ public class ModelConfig {
         return alias.equals(that.alias)
             && apiKey.equals(that.apiKey)
             && apiUrl.equals(that.apiUrl)
-            && modelName.equals(that.modelName);
+            && modelName.equals(that.modelName)
+            && extraConfig.equals(that.extraConfig);
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(alias, apiKey, apiUrl, modelName);
+        return java.util.Objects.hash(alias, apiKey, apiUrl, modelName, extraConfig);
     }
 }
