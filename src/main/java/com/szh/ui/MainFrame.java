@@ -1149,7 +1149,7 @@ public class MainFrame extends JFrame {
                 + "<tr><td style='padding:2px 8px;text-align:left;'>Jedis (Redis)</td><td style='padding:2px 8px;color:#666;'>MIT</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>Radiance (Substance)</td><td style='padding:2px 8px;color:#666;'>BSD 3-Clause</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>OSHI</td><td style='padding:2px 8px;color:#666;'>MIT</td></tr>"
-                + "<tr><td style='padding:2px 8px;text-align:left;'>JSch</td><td style='padding:2px 8px;color:#666;'>BSD</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>Apache MINA SSHD</td><td style='padding:2px 8px;color:#666;'>Apache-2.0</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>LangChain4j</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>Eclipse Paho MQTT</td><td style='padding:2px 8px;color:#666;'>EPL 2.0</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>gRPC / Protobuf</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"

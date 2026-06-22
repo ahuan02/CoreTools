@@ -1,9 +1,16 @@
 package com.szh.ui.panel;
 
 import com.formdev.flatlaf.extras.FlatSVGIcon;
-import com.jcraft.jsch.*;
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import org.apache.sshd.client.SshClient;
+import org.apache.sshd.client.channel.ChannelExec;
+import org.apache.sshd.client.channel.ChannelShell;
+import org.apache.sshd.client.channel.ClientChannelEvent;
+import org.apache.sshd.client.future.ConnectFuture;
+import org.apache.sshd.client.session.ClientSession;
+import org.apache.sshd.sftp.client.SftpClient;
+import org.apache.sshd.sftp.client.SftpClientFactory;
 
 import javax.swing.Timer;
 import javax.swing.*;
@@ -56,10 +63,14 @@ public class SshPanel extends AbstractCommandPanel {
         String password;
 
         transient boolean connected;
-        transient Session session;
+        transient ClientSession session;
         transient ChannelShell channel;
         transient OutputStream toChannel;
-        transient JSch jsch;
+        transient SshClient client;
+        /** 该连接的全部终端输出（含 ANSI 转义码），用于切换连接时恢复显示 */
+        transient final StringBuffer terminalBuffer = new StringBuffer();
+        /** 该连接的远程当前工作目录，切换时保存/恢复 */
+        transient String pwdCache;
 
         @Override
         public String toString() {
@@ -109,7 +120,7 @@ public class SshPanel extends AbstractCommandPanel {
     private DefaultMutableTreeNode dirRootNode;
     private javax.swing.Timer dirRefreshTimer;
     private static final int DIR_REFRESH_DELAY_MS = 600; // 命令执行后延迟刷新（等 shell 回显完成）
-    private String cachedRemotePwd; // 本地推算的远程当前目录，避免每次刷新都发 pwd 命令到终端
+    private volatile String cachedRemotePwd; // 本地推算的远程当前目录，避免每次刷新都发 pwd 命令到终端
 
     // 已知主机密钥
     private final Map<String, String> knownHosts = new LinkedHashMap<>();
@@ -326,16 +337,21 @@ public class SshPanel extends AbstractCommandPanel {
                     return;
                 }
 
+                // Backspace / Delete: 消费事件，交给 JTextField 默认 Action 处理
+                // 不消费会导致 keyTyped 收到 \b / \u007F 作为可打印字符插入文本
+                if (e.getKeyCode() == KeyEvent.VK_BACK_SPACE || e.getKeyCode() == KeyEvent.VK_DELETE) {
+                    // 不 consume，让 JTextField 的 DeletePrevCharAction / DeleteNextCharAction 正常执行
+                    return;
+                }
+
                 switch (e.getKeyCode()) {
                     case KeyEvent.VK_TAB:
                         e.consume();
-                        // Tab: 把输入框内容 + \t 发给远程做补全
+                        // Tab: 先把输入框内容发给远程 shell，再发 \t 触发补全
                         String tabText = commandInput.getText();
                         if (!tabText.isEmpty()) {
                             sendToChannel((tabText + "\t").getBytes(StandardCharsets.UTF_8));
                             commandInput.setText("");
-                            // 等 200ms 后从终端显示区提取补全结果回填输入框
-                            scheduleTabCompletion(tabText);
                         }
                         break;
 
@@ -352,8 +368,11 @@ public class SshPanel extends AbstractCommandPanel {
                             historyIndex = commandHistory.size();
                         }
                         commandInput.setText("");
-                        // 每次命令执行后都通过 SFTP 拉取真实目录，目录变化则自动同步树上
-                        if (!text.isEmpty()) schedulePwdVerify(500);
+                        // 解析 cd 命令更新缓存目录，立刻刷新目录浏览器
+                        if (!text.isEmpty()) {
+                            updateCachedPwdFromCommand(text);
+                            refreshDirectoryBrowser(false);
+                        }
                         break;
 
                     case KeyEvent.VK_UP:
@@ -378,6 +397,15 @@ public class SshPanel extends AbstractCommandPanel {
                             commandInput.setText("");
                         }
                         break;
+                }
+            }
+
+            @Override
+            public void keyTyped(KeyEvent e) {
+                char c = e.getKeyChar();
+                // 阻止 Backspace(\b)、Delete(\u007f) 等控制字符被当作可打印字符插入文本框
+                if (c == '\b' || c == '\u007f' || c < ' ') {
+                    e.consume();
                 }
             }
         });
@@ -617,7 +645,7 @@ public class SshPanel extends AbstractCommandPanel {
         return panel;
     }
 
-    /** 刷新目录浏览器。forceQuery=true 时向 shell 发 pwd 获取真实目录，否则用本地缓存。 */
+    /** 刷新目录浏览器。始终使用本地缓存的 cachedRemotePwd，不查询远程（exec 通道的 PWD 并非交互式 shell 的工作目录）。 */
     private void refreshDirectoryBrowser(boolean forceQuery) {
         SshConn conn;
         synchronized (connLock) { conn = currentConn; }
@@ -625,8 +653,9 @@ public class SshPanel extends AbstractCommandPanel {
 
         Thread.startVirtualThread(() -> {
             String cwd = cachedRemotePwd;
-            if (cwd == null || forceQuery) {
-                cwd = getRemotePwd(conn);
+            if (cwd == null) {
+                // 首次连接：用 $HOME 作为初始目录
+                cwd = getRemoteHome(conn.session);
                 if (cwd != null) cachedRemotePwd = cwd;
             }
             if (cwd == null) {
@@ -635,24 +664,22 @@ public class SshPanel extends AbstractCommandPanel {
             }
 
             List<RemoteFileNode> children = new ArrayList<>();
-            ChannelSftp sftp = null;
+            SftpClient sftp = null;
+            SftpClient.Handle dirHandle = null;
             try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(3000);
-
-                @SuppressWarnings("unchecked")
-                Vector<ChannelSftp.LsEntry> entries = sftp.ls(cwd);
-                for (ChannelSftp.LsEntry entry : entries) {
+                sftp = SftpClientFactory.instance().createSftpClient(conn.session);
+                dirHandle = sftp.openDir(cwd);
+                for (SftpClient.DirEntry entry : sftp.listDir(dirHandle)) {
                     String name = entry.getFilename();
                     if (".".equals(name) || "..".equals(name)) continue;
-                    SftpATTRS attrs = entry.getAttrs();
+                    SftpClient.Attributes attrs = entry.getAttributes();
                     children.add(new RemoteFileNode(
                             name,
                             cwd + "/" + name,
-                            attrs.isDir(),
-                            attrs.isLink(),
+                            attrs.isDirectory(),
+                            attrs.isSymbolicLink(),
                             attrs.getSize(),
-                            attrs.getPermissionsString()
+                            formatUnixPerms(attrs.getPermissions())
                     ));
                 }
             } catch (Exception e) {
@@ -661,7 +688,8 @@ public class SshPanel extends AbstractCommandPanel {
                     dirPathLabel.setText(errPath + "  (无权限)"));
                 return;
             } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+                if (dirHandle != null) try { sftp.close(dirHandle); } catch (Exception ignored) {}
+                if (sftp != null) try { sftp.close(); } catch (Exception ignored) {}
             }
 
             // 排序：目录优先，然后按名称
@@ -684,6 +712,97 @@ public class SshPanel extends AbstractCommandPanel {
         });
     }
 
+    /** 将 Unix 权限位转为字符串，如 -rwxr-xr-x */
+    private static String formatUnixPerms(int perms) {
+        char[] c = new char[10];
+        c[0] = (perms & 0040000) != 0 ? 'd' : (perms & 0120000) != 0 ? 'l' : '-';
+        c[1] = (perms & 0400) != 0 ? 'r' : '-';
+        c[2] = (perms & 0200) != 0 ? 'w' : '-';
+        c[3] = (perms & 0100) != 0 ? (perms & 04000) != 0 ? 's' : 'x' : '-';
+        c[4] = (perms & 0040) != 0 ? 'r' : '-';
+        c[5] = (perms & 0020) != 0 ? 'w' : '-';
+        c[6] = (perms & 0010) != 0 ? (perms & 02000) != 0 ? 's' : 'x' : '-';
+        c[7] = (perms & 0004) != 0 ? 'r' : '-';
+        c[8] = (perms & 0002) != 0 ? 'w' : '-';
+        c[9] = (perms & 0001) != 0 ? (perms & 01000) != 0 ? 't' : 'x' : '-';
+        return new String(c);
+    }
+
+    /** 解析终端 cd 命令，更新 cachedRemotePwd */
+    private void updateCachedPwdFromCommand(String cmd) {
+        String trimmed = cmd.trim();
+        // 处理命令中的 ; 分隔（如 cd /opt; ls），仅处理 cd 部分
+        int semiIdx = trimmed.indexOf(';');
+        String cdPart = semiIdx > 0 ? trimmed.substring(0, semiIdx).trim() : trimmed;
+
+        if (cdPart.equals("cd") || cdPart.equals("cd ~")) {
+            // cd 不带参数 / cd ~ → HOME
+            SshConn conn;
+            synchronized (connLock) { conn = currentConn; }
+            if (conn != null && conn.session != null) {
+                String home = getRemoteHome(conn.session);
+                if (home != null) cachedRemotePwd = home;
+            }
+            return;
+        }
+        if (!cdPart.startsWith("cd ")) return;
+
+        String target = cdPart.substring(3).trim();
+        // 去外层引号
+        if (target.length() >= 2) {
+            char first = target.charAt(0), last = target.charAt(target.length() - 1);
+            if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+                target = target.substring(1, target.length() - 1);
+            }
+        }
+        if (target.isEmpty()) return;
+
+        // 处理 ~ 开头
+        if (target.startsWith("~/") || target.equals("~")) {
+            SshConn conn;
+            synchronized (connLock) { conn = currentConn; }
+            String home = getRemoteHome(conn != null ? conn.session : null);
+            if (home == null) return;
+            target = target.equals("~") ? home : home + target.substring(1);
+        }
+
+        if (target.startsWith("/")) {
+            cachedRemotePwd = target;
+        } else {
+            // 相对路径
+            String base = cachedRemotePwd != null ? cachedRemotePwd : "/";
+            if (target.equals(".")) return;
+            if (target.equals("-")) return; // cd - 不处理
+            // 逐段解析 .. 和路径段
+            String resolved = resolveRelativePath(base, target);
+            if (resolved != null) cachedRemotePwd = resolved;
+        }
+    }
+
+    /** 解析相对路径，返回规范化后的绝对路径 */
+    private static String resolveRelativePath(String base, String relative) {
+        String[] baseParts = base.equals("/") ? new String[0] : base.split("/");
+        java.util.ArrayDeque<String> stack = new java.util.ArrayDeque<>();
+        if (baseParts.length > 0) {
+            for (String p : baseParts) {
+                if (p.isEmpty()) continue;
+                stack.add(p);
+            }
+        }
+        for (String seg : relative.split("/")) {
+            if (seg.isEmpty() || seg.equals(".")) continue;
+            if (seg.equals("..")) {
+                if (!stack.isEmpty()) stack.removeLast();
+            } else {
+                stack.add(seg);
+            }
+        }
+        StringBuilder sb = new StringBuilder("/");
+        for (String s : stack) sb.append(s).append("/");
+        if (sb.length() > 1) sb.setLength(sb.length() - 1);
+        return sb.toString();
+    }
+
     /** cd 到远程目录 */
     private void cdIntoRemote(String path) {
         SshConn conn;
@@ -693,7 +812,7 @@ public class SshPanel extends AbstractCommandPanel {
             conn.toChannel.write(("cd \"" + path + "\"\r").getBytes(StandardCharsets.UTF_8));
             conn.toChannel.flush();
             cachedRemotePwd = path; // 本地缓存，不向 shell 发 pwd
-            if (dirRefreshTimer != null) dirRefreshTimer.restart();
+            refreshDirectoryBrowser(false);
         } catch (Exception ignored) {}
     }
 
@@ -710,7 +829,7 @@ public class SshPanel extends AbstractCommandPanel {
             try {
                 conn.toChannel.write(("cd \"" + parent + "\"\r").getBytes(StandardCharsets.UTF_8));
                 conn.toChannel.flush();
-                if (dirRefreshTimer != null) dirRefreshTimer.restart();
+                refreshDirectoryBrowser(false);
             } catch (Exception ignored) {}
         }
     }
@@ -724,61 +843,46 @@ public class SshPanel extends AbstractCommandPanel {
             return;
         }
         Thread.startVirtualThread(() -> {
-            String cwd = getRemotePwd(conn);
+            // 优先通过交互式 shell 执行 pwd 获取真实当前目录
+            String cwd = getRemotePwdViaShell(conn.session, conn.toChannel);
             if (cwd == null) {
-                appendTerminal("[无法获取远程当前目录]\n", C_ERR);
+                cwd = cachedRemotePwd;
+            } else {
+                cachedRemotePwd = cwd;
+            }
+            if (cwd == null) {
+                cwd = getRemoteHome(conn.session);
+                if (cwd != null) cachedRemotePwd = cwd;
+            }
+            if (cwd == null) {
+                appendTerminal("[无法获取远程目录]\n", C_ERR);
                 return;
             }
-            ChannelSftp sftp = null;
-            try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(5000);
-                for (File file : files) {
-                    if (!file.isFile()) continue;
-                    String remotePath = cwd + "/" + file.getName();
-                    appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
-                    TransferProgressDialog dlg = new TransferProgressDialog(
-                            SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
-                    try {
-                        sftp.put(file.getAbsolutePath(), remotePath,
-                            new SftpProgressMonitor() {
-                                private long total;
-                                @Override public void init(int op, String src, String dest, long max) {
-                                    total = max;
-                                    SwingUtilities.invokeLater(() -> dlg.setVisible(true));
-                                }
-                                @Override public boolean count(long count) {
-                                    dlg.setTarget(count, total);
-                                    return !dlg.cancelled;
-                                }
-                                @Override public void end() {
-                                    SwingUtilities.invokeLater(() -> {
-                                        dlg.setTarget(total, total);
-                                        dlg.markFinished();
-                                    });
-                                }
-                            }, ChannelSftp.OVERWRITE);
-                        if (dlg.cancelled) {
-                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
-                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
-                        } else {
-                            appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
-                        }
-                    } catch (Exception e) {
-                        if (dlg.cancelled) {
-                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
-                            dlg.markFinished();
-                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
-                        } else {
-                            dlg.markFinished();
-                            appendTerminal("[上传失败: " + e.getMessage() + "]\n", C_ERR);
-                        }
-                    }
+            appendTerminal("[上传目标: " + cwd + "/]\n", C_SYS);
+
+            // 预检写权限
+            java.util.concurrent.atomic.AtomicReference<String> permErr = new java.util.concurrent.atomic.AtomicReference<>();
+            if (!checkWritePermission(conn.session, cwd, permErr)) {
+                appendTerminal("[无写权限: " + cwd + "/ — " + permErr.get() + "]\n", C_ERR);
+                appendTerminal("[提示: 执行 sudo chown szh " + cwd + " 或 cd 到有权限的目录]\n", C_WARN);
+                return;
+            }
+
+            for (File file : files) {
+                if (!file.isFile()) continue;
+                String remotePath = cwd + "/" + file.getName();
+                appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
+                TransferProgressDialog dlg = new TransferProgressDialog(
+                        SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
+                java.util.concurrent.atomic.AtomicReference<String> errRef = new java.util.concurrent.atomic.AtomicReference<>();
+                if (uploadViaSftp(conn.session, file, remotePath, dlg, errRef)) {
+                    dlg.markFinished();
+                    appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
+                } else {
+                    dlg.markFinished();
+                    String detail = errRef.get();
+                    appendTerminal("[上传失败: " + file.getName() + (detail != null ? " — " + detail : "") + "]\n", C_ERR);
                 }
-            } catch (Exception e) {
-                appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
-            } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
             }
             refreshDirectoryBrowser(false);
         });
@@ -803,38 +907,35 @@ public class SshPanel extends AbstractCommandPanel {
         }
 
         Thread.startVirtualThread(() -> {
-            ChannelSftp sftp = null;
+            SftpClient sftp = null;
             TransferProgressDialog dlg = null;
             try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(5000);
+                sftp = SftpClientFactory.instance().createSftpClient(conn.session);
+                long fileSize = sftp.stat(remotePath).getSize();
 
                 dlg = new TransferProgressDialog(
                         SwingUtilities.getWindowAncestor(this), "下载 " + fileName);
-                try {
-                    TransferProgressDialog finalDlg = dlg;
-                    sftp.get(remotePath, localFile.getAbsolutePath(),
-                        new SftpProgressMonitor() {
-                            private long total;
-                            @Override public void init(int op, String src, String dest, long max) {
-                                total = max;
-                                SwingUtilities.invokeLater(() -> finalDlg.setVisible(true));
-                            }
-                            @Override public boolean count(long count) {
-                                finalDlg.setTarget(count, total);
-                                return !finalDlg.cancelled;
-                            }
-                            @Override public void end() {
-                                SwingUtilities.invokeLater(() -> {
-                                    finalDlg.setTarget(total, total);
-                                    finalDlg.markFinished();
-                                });
-                            }
-                        });
+                dlg.setTarget(0, fileSize > 0 ? fileSize : 1);
+                TransferProgressDialog finalDlg = dlg;
+                SwingUtilities.invokeLater(() -> finalDlg.setVisible(true));
+
+                long total = fileSize;
+                try (InputStream in = sftp.read(remotePath);
+                     OutputStream out = new FileOutputStream(localFile)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    long read = 0;
+                    while ((n = in.read(buf)) != -1 && !dlg.cancelled) {
+                        out.write(buf, 0, n);
+                        read += n;
+                        dlg.setTarget(read, total);
+                    }
                     if (dlg.cancelled) {
                         try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        dlg.markFinished();
                         appendTerminal("[已取消下载: " + fileName + "]\n", C_WARN);
                     } else {
+                        dlg.markFinished();
                         appendTerminal("[下载完成: " + fileName + "]\n", C_RECV);
                     }
                 } catch (Exception e) {
@@ -850,7 +951,7 @@ public class SshPanel extends AbstractCommandPanel {
             } catch (Exception e) {
                 appendTerminal("[下载失败: " + e.getMessage() + "]\n", C_ERR);
             } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+                if (sftp != null) try { sftp.close(); } catch (Exception ignored) {}
             }
         });
     }
@@ -866,17 +967,16 @@ public class SshPanel extends AbstractCommandPanel {
         if (ret != JOptionPane.YES_OPTION) return;
 
         Thread.startVirtualThread(() -> {
-            ChannelSftp sftp = null;
+            SftpClient sftp = null;
             try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(3000);
-                sftp.rm(remotePath);
+                sftp = SftpClientFactory.instance().createSftpClient(conn.session);
+                sftp.remove(remotePath);
                 appendTerminal("[已删除: " + fileName + "]\n", C_SYS);
                 refreshDirectoryBrowser(false);
             } catch (Exception e) {
                 appendTerminal("[删除失败: " + e.getMessage() + "]\n", C_ERR);
             } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+                if (sftp != null) try { sftp.close(); } catch (Exception ignored) {}
             }
         });
     }
@@ -937,10 +1037,51 @@ public class SshPanel extends AbstractCommandPanel {
         SshConn conn = connList.getSelectedValue();
         if (conn == null) return;
         if (conn.connected) {
-            appendTerminal("[连接 " + conn.name + " 已处于打开状态]\n", C_WARN);
+            // 已连接 → 切换过去
+            if (conn == currentConn) {
+                appendTerminal("[当前已是连接 " + conn.name + "]\n", C_WARN);
+                return;
+            }
+            switchToConnection(conn);
             return;
         }
         openConnection(conn);
+    }
+
+    /** 切换到已打开的目标连接（保持各自终端内容独立） */
+    private void switchToConnection(SshConn conn) {
+        if (conn == null || !conn.connected || conn == currentConn) return;
+        // 保存旧连接的当前目录
+        SshConn old;
+        synchronized (connLock) {
+            old = currentConn;
+            if (old != null) old.pwdCache = cachedRemotePwd;
+            currentConn = conn;
+        }
+        // 恢复目标连接的缓存目录
+        cachedRemotePwd = conn.pwdCache;
+        // 兜底退出 RAW 模式
+        exitRawMode();
+        resetAnsiState();
+        // 清空终端，恢复目标连接的 buffer 内容
+        try {
+            terminalArea.setText("");
+        } catch (Exception ignored) {}
+        if (conn.terminalBuffer.length() > 0) {
+            appendAnsiRaw(conn.terminalBuffer.toString());
+        }
+        // 更新状态栏
+        statusLabel.setText("\u25CF 已连接");
+        statusLabel.setForeground(C_RECV);
+        connInfoLabel.setText(conn.name + "  " + conn.username + "@" + conn.host + ":" + conn.port);
+        commandInput.setEnabled(true);
+        commandInput.setText("");
+        commandHistory.clear();
+        historyIndex = 0;
+        commandInput.requestFocusInWindow();
+        // 刷新目录浏览器（查询目标连接的工作目录）
+        refreshDirectoryBrowser(false);
+        connList.repaint();
     }
 
     /** 关闭选中连接 */
@@ -964,62 +1105,6 @@ public class SshPanel extends AbstractCommandPanel {
     }
 
     /** Tab 补全后从终端回显提取完成文本，延迟回填输入框 */
-    private void scheduleTabCompletion(String prefix) {
-        new javax.swing.Timer(180, ev -> {
-            ((javax.swing.Timer) ev.getSource()).stop();
-            try {
-                StyledDocument doc = terminalArea.getStyledDocument();
-                if (doc.getLength() == 0) return;
-                String full = doc.getText(0, doc.getLength());
-                // 取最后一个 "prompt 行" — 即最后一个以 prefix 开头或包含 prefix 的行
-                int lastNL = full.lastIndexOf('\n');
-                String lastLine = (lastNL >= 0) ? full.substring(lastNL + 1).trim() : full.trim();
-                // 如果最后一行不是补全结果，往前找
-                if (lastLine.isEmpty() || !lastLine.contains(prefix)) {
-                    // 往前扫描最近 8 行
-                    int scanEnd = lastNL >= 0 ? lastNL : full.length();
-                    String before = full.substring(0, scanEnd);
-                    String[] lines = before.split("\n");
-                    for (int i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
-                        String l = lines[i].trim();
-                        if (l.startsWith(prefix) && l.length() > prefix.length()) {
-                            lastLine = l;
-                            break;
-                        }
-                    }
-                }
-                // 提取以 prefix 开头的完整词
-                if (lastLine.startsWith(prefix) && lastLine.length() > prefix.length()) {
-                    // 取 prefix 之后没有空格的那段作为补全结果
-                    int end = prefix.length();
-                    while (end < lastLine.length() && !Character.isWhitespace(lastLine.charAt(end))) {
-                        end++;
-                    }
-                    String completed = lastLine.substring(0, end);
-                    commandInput.setText(completed);
-                }
-            } catch (BadLocationException ignored) {}
-        }).start();
-    }
-
-    /** 命令执行后延迟用 SFTP 拉取真实目录，变化则自动同步树上 */
-    private void schedulePwdVerify(int delayMs) {
-        new javax.swing.Timer(delayMs, ev -> {
-            ((javax.swing.Timer) ev.getSource()).stop();
-            SshConn conn;
-            synchronized (connLock) { conn = currentConn; }
-            if (conn != null && conn.connected && conn.session != null) {
-                Thread.startVirtualThread(() -> {
-                    String real = getSftpPwd(conn);
-                    if (real != null && !real.equals(cachedRemotePwd)) {
-                        cachedRemotePwd = real;
-                        refreshDirectoryBrowser(false);
-                    }
-                });
-            }
-        }).start();
-    }
-
     /** 切换终端原始模式（vim/nano 等交互程序用） */
     private void toggleRawMode() {
         rawMode = rawModeBtn.isSelected();
@@ -1114,11 +1199,12 @@ public class SshPanel extends AbstractCommandPanel {
     }
 
     private void exitRawMode() {
+        rawMode = false;
         if (rawModeKeyListener != null) {
             terminalArea.removeKeyListener(rawModeKeyListener);
             rawModeKeyListener = null;
         }
-        // 移除文档过滤器
+        // 移除文档过滤器（即使 rawMode 为 false 也确保清理）
         Document d = terminalArea.getDocument();
         if (d instanceof AbstractDocument) {
             ((AbstractDocument) d).setDocumentFilter(null);
@@ -1134,8 +1220,12 @@ public class SshPanel extends AbstractCommandPanel {
         terminalArea.setFocusTraversalKeys(KeyboardFocusManager.BACKWARD_TRAVERSAL_KEYS, null);
         commandInput.setEnabled(true);
         commandInput.setForeground(WHITE);
-        commandInput.putClientProperty("JTextField.placeholderText", "输入命令，按 Tab 发送到远程...");
+        commandInput.putClientProperty("JTextField.placeholderText", "输入命令，按 Tab 补全 / Enter 执行...");
         commandInput.requestFocusInWindow();
+        // 同步按钮状态，避免 toggle 事件触发递归（rawMode 已是 false，toggleRawMode 直接 return）
+        if (rawModeBtn.isSelected()) {
+            rawModeBtn.setSelected(false);
+        }
     }
 
     /** 将按键事件转换为发送到远程终端的字节序列 */
@@ -1207,50 +1297,57 @@ public class SshPanel extends AbstractCommandPanel {
 
     // ==================== 文件上传 / 下载 ====================
 
-    /**
-     * 获取远程 Shell 当前所在目录。
-     * 原理：通过 Shell 通道写 $PWD 到临时文件，再用 SFTP 下载回来读取，零歧义。
-     */
-    /** 通过 Shell 通道获取远程当前目录。
-     *  原理：写到 /dev/shm（内存文件系统），SFTP 读回后删除，命令极短仅在终端一闪而过。 */
-    private String getSftpPwd(SshConn conn) {
-        if (conn.toChannel == null || conn.session == null) return null;
-        String tmpName = "/dev/shm/.szh_cwd_" + UUID.randomUUID().toString().substring(0, 6);
-        ChannelSftp sftp = null;
+    /** 通过 exec 获取远程 $HOME——纯 exec 通道，完全绕过 SFTP */
+    private String getRemoteHome(ClientSession session) {
+        ChannelExec exec = null;
         try {
-            // 1. 通过 Shell 通道写 $PWD 到内存文件（命令极短）
-            conn.toChannel.write(("echo $PWD>" + tmpName + "\n").getBytes(StandardCharsets.UTF_8));
-            conn.toChannel.flush();
-
-            // 2. SFTP 读回
-            sftp = (ChannelSftp) conn.session.openChannel("sftp");
-            sftp.connect(3000);
-            long deadline = System.currentTimeMillis() + 2000;
-            boolean ready = false;
-            while (System.currentTimeMillis() < deadline) {
-                try { sftp.stat(tmpName); ready = true; break; }
-                catch (Exception ignored) { Thread.sleep(80); }
+            exec = session.createExecChannel("echo $HOME");
+            exec.open().verify(5000);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            InputStream in = exec.getInvertedOut();
+            byte[] buf = new byte[256];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                baos.write(buf, 0, n);
             }
-            if (!ready) return null;
-
-            java.nio.file.Path localTmp = java.nio.file.Files.createTempFile("szh_cwd_", ".txt");
-            sftp.get(tmpName, localTmp.toString());
-            String cwd = new String(java.nio.file.Files.readAllBytes(localTmp), StandardCharsets.UTF_8).trim();
-            try { java.nio.file.Files.deleteIfExists(localTmp); } catch (Exception ignored) {}
-            if (!cwd.isEmpty() && cwd.startsWith("/")) return cwd;
+            exec.close(true);
+            String home = baos.toString(StandardCharsets.UTF_8).trim();
+            if (home.startsWith("/")) return home;
         } catch (Exception ignored) {
         } finally {
-            if (sftp != null) {
-                try { sftp.rm(tmpName); } catch (Exception ignored) {}
-                try { sftp.disconnect(); } catch (Exception ignored) {}
-            }
+            if (exec != null && exec.isOpen()) try { exec.close(true); } catch (Exception ignored) {}
         }
         return null;
     }
 
-    /** 旧方法保留兼容 */
-    private String getRemotePwd(SshConn conn) {
-        return getSftpPwd(conn);
+    /** 通过交互式 shell 获取远程当前工作目录——写入临时文件，再用 SFTP 读回。
+     *  避免了 exec 通道 CWD ≠ 交互式 Shell CWD 的问题。 */
+    private String getRemotePwdViaShell(ClientSession session, OutputStream toChannel) {
+        try {
+            toChannel.write("pwd > /tmp/.ssh_panel_pwd\n".getBytes(StandardCharsets.UTF_8));
+            toChannel.flush();
+            // 等待 shell 执行 pwd 命令
+            Thread.sleep(500);
+            // 通过 SFTP 读取结果
+            SftpClient sftp = SftpClientFactory.instance().createSftpClient(session);
+            try {
+                try (InputStream in = sftp.read("/tmp/.ssh_panel_pwd")) {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    byte[] buf = new byte[512];
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        baos.write(buf, 0, n);
+                    }
+                    String pwd = baos.toString(StandardCharsets.UTF_8).trim();
+                    if (pwd.startsWith("/")) return pwd;
+                }
+            } finally {
+                try { sftp.close(); } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {
+            // exec/SFTP 失败，回退到缓存值
+        }
+        return null;
     }
 
     /** 上传文件到远程当前目录 */
@@ -1271,71 +1368,55 @@ public class SshPanel extends AbstractCommandPanel {
         if (files == null || files.length == 0) return;
 
         Thread.startVirtualThread(() -> {
-            // 在后台线程获取远程当前目录，不阻塞 EDT
-            String remoteDir = getRemotePwd(conn);
+            // 优先通过交互式 shell 执行 pwd 获取真实当前目录
+            String remoteDir = getRemotePwdViaShell(conn.session, conn.toChannel);
             if (remoteDir == null) {
-                appendTerminal("[无法获取远程目录，默认使用 /root]\n", C_WARN);
-                remoteDir = "/root";
+                // 回退到缓存值
+                remoteDir = cachedRemotePwd;
+            } else {
+                // 更新缓存
+                cachedRemotePwd = remoteDir;
             }
-            ChannelSftp sftp = null;
-            try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(5000);
+            if (remoteDir == null) {
+                // 最后兜底：用 $HOME
+                remoteDir = getRemoteHome(conn.session);
+                if (remoteDir != null) cachedRemotePwd = remoteDir;
+            }
+            if (remoteDir == null) {
+                appendTerminal("[无法获取远程目录，上传取消]\n", C_ERR);
+                return;
+            }
+            appendTerminal("[上传目标: " + remoteDir + "/]\n", C_SYS);
 
-                for (File file : files) {
-                    String remotePath = remoteDir + "/" + file.getName();
-                    appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
+            // 预检写权限
+            java.util.concurrent.atomic.AtomicReference<String> permErr = new java.util.concurrent.atomic.AtomicReference<>();
+            if (!checkWritePermission(conn.session, remoteDir, permErr)) {
+                appendTerminal("[无写权限: " + remoteDir + "/ — " + permErr.get() + "]\n", C_ERR);
+                appendTerminal("[提示: 执行 sudo chown szh " + remoteDir + " 或 cd 到有权限的目录]\n", C_WARN);
+                return;
+            }
 
-                    TransferProgressDialog dlg = new TransferProgressDialog(
-                        SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
+            for (File file : files) {
+                String remotePath = remoteDir + "/" + file.getName();
+                appendTerminal("[上传: " + file.getName() + " → " + remotePath + "]\n", C_SYS);
 
-                    try {
-                        sftp.put(file.getAbsolutePath(), remotePath,
-                            new SftpProgressMonitor() {
-                                private long total;
-                                @Override public void init(int op, String src, String dest, long max) {
-                                    total = max;
-                                    SwingUtilities.invokeLater(() -> dlg.setVisible(true));
-                                }
-                                @Override public boolean count(long count) {
-                                    dlg.setTarget(count, total);
-                                    return !dlg.cancelled;
-                                }
-                                @Override public void end() {
-                                    SwingUtilities.invokeLater(() -> {
-                                        dlg.setTarget(total, total);
-                                        dlg.markFinished();
-                                    });
-                                }
-                            }, ChannelSftp.OVERWRITE);
-
-                        if (dlg.cancelled) {
-                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
-                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
-                        } else {
-                            appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
-                        }
-                    } catch (Exception e) {
-                        // count() 返回 false 会触发 JSch 异常，end() 不会被调用
-                        if (dlg.cancelled) {
-                            try { sftp.rm(remotePath); } catch (Exception ignored) {}
-                            dlg.markFinished();
-                            appendTerminal("[已取消上传: " + file.getName() + "]\n", C_WARN);
-                        } else {
-                            dlg.markFinished();
-                            appendTerminal("[上传失败: " + e.getMessage() + "]\n", C_ERR);
-                        }
-                    }
+                TransferProgressDialog dlg = new TransferProgressDialog(
+                    SwingUtilities.getWindowAncestor(this), "上传 " + file.getName());
+                java.util.concurrent.atomic.AtomicReference<String> errRef = new java.util.concurrent.atomic.AtomicReference<>();
+                if (uploadViaSftp(conn.session, file, remotePath, dlg, errRef)) {
+                    dlg.markFinished();
+                    appendTerminal("[上传完成: " + file.getName() + "]\n", C_RECV);
+                } else {
+                    dlg.markFinished();
+                    String detail = errRef.get();
+                    appendTerminal("[上传失败: " + file.getName() + (detail != null ? " — " + detail : "") + "]\n", C_ERR);
                 }
-            } catch (Exception e) {
-                appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
-            } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
             }
+            refreshDirectoryBrowser(false);
         });
     }
 
-    /** 下载远程文件 */
+    /** 下载远程文件（SFTP Client） */
     private void downloadFile() {
         SshConn conn;
         synchronized (connLock) { conn = currentConn; }
@@ -1344,14 +1425,12 @@ public class SshPanel extends AbstractCommandPanel {
             return;
         }
 
-        // 输入远程文件路径（不阻塞 EDT 查 pwd，后面在后台线程补全）
         String remotePath = (String) JOptionPane.showInputDialog(this,
             "输入远程文件路径（绝对路径 或 相对于当前目录的路径）:",
             "下载文件", JOptionPane.PLAIN_MESSAGE, null, null, "");
         if (remotePath == null || remotePath.trim().isEmpty()) return;
         remotePath = remotePath.trim();
 
-        // 选择本地保存位置
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle("选择保存位置");
         chooser.setSelectedFile(new File(new File(remotePath).getName()));
@@ -1359,8 +1438,6 @@ public class SshPanel extends AbstractCommandPanel {
 
         File localFile = chooser.getSelectedFile();
         if (localFile == null) return;
-
-        // 确认覆盖
         if (localFile.exists()) {
             int ret = JOptionPane.showConfirmDialog(this,
                 "文件已存在，是否覆盖？\n" + localFile.getAbsolutePath(),
@@ -1370,50 +1447,49 @@ public class SshPanel extends AbstractCommandPanel {
 
         final String finalRemotePath = remotePath;
         Thread.startVirtualThread(() -> {
-            // 在后台线程获取远程当前目录，不阻塞 EDT
-            String remoteDir = getRemotePwd(conn);
+            // 优先通过交互式 shell 获取真实当前目录
+            String remoteDir = getRemotePwdViaShell(conn.session, conn.toChannel);
+            if (remoteDir == null) {
+                remoteDir = cachedRemotePwd;
+            } else {
+                cachedRemotePwd = remoteDir;
+            }
             String resolvedPath = finalRemotePath;
             if (!finalRemotePath.startsWith("/") && remoteDir != null) {
                 resolvedPath = remoteDir + "/" + finalRemotePath;
             }
-            ChannelSftp sftp = null;
+            SftpClient sftp = null;
             try {
-                sftp = (ChannelSftp) conn.session.openChannel("sftp");
-                sftp.connect(5000);
+                sftp = SftpClientFactory.instance().createSftpClient(conn.session);
+                long fileSize = sftp.stat(resolvedPath).getSize();
 
                 appendTerminal("[下载: " + resolvedPath + " → " + localFile.getAbsolutePath() + "]\n", C_SYS);
 
                 TransferProgressDialog dlg = new TransferProgressDialog(
                     SwingUtilities.getWindowAncestor(this), "下载 " + new File(finalRemotePath).getName());
+                dlg.setTarget(0, fileSize > 0 ? fileSize : 1);
+                SwingUtilities.invokeLater(() -> dlg.setVisible(true));
 
-                try {
-                    sftp.get(resolvedPath, localFile.getAbsolutePath(),
-                        new SftpProgressMonitor() {
-                            private long total;
-                            @Override public void init(int op, String src, String dest, long max) {
-                                total = max;
-                                SwingUtilities.invokeLater(() -> dlg.setVisible(true));
-                            }
-                            @Override public boolean count(long count) {
-                                dlg.setTarget(count, total);
-                                return !dlg.cancelled;
-                            }
-                            @Override public void end() {
-                                SwingUtilities.invokeLater(() -> {
-                                    dlg.setTarget(total, total);
-                                    dlg.markFinished();
-                                });
-                            }
-                        });
-
+                long total = fileSize;
+                try (InputStream in = sftp.read(resolvedPath);
+                     OutputStream out = new FileOutputStream(localFile)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    long read = 0;
+                    while ((n = in.read(buf)) != -1 && !dlg.cancelled) {
+                        out.write(buf, 0, n);
+                        read += n;
+                        dlg.setTarget(read, total);
+                    }
                     if (dlg.cancelled) {
                         try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
+                        dlg.markFinished();
                         appendTerminal("[已取消下载]\n", C_WARN);
                     } else {
+                        dlg.markFinished();
                         appendTerminal("[下载完成: " + localFile.getName() + "]\n", C_RECV);
                     }
                 } catch (Exception e) {
-                    // count() 返回 false 触发 JSch 异常，end() 不会被调用
                     if (dlg.cancelled) {
                         try { java.nio.file.Files.deleteIfExists(localFile.toPath()); } catch (Exception ignored) {}
                         dlg.markFinished();
@@ -1426,9 +1502,240 @@ public class SshPanel extends AbstractCommandPanel {
             } catch (Exception e) {
                 appendTerminal("[SFTP 连接失败: " + e.getMessage() + "]\n", C_ERR);
             } finally {
-                if (sftp != null) try { sftp.disconnect(); } catch (Exception ignored) {}
+                if (sftp != null) try { sftp.close(); } catch (Exception ignored) {}
             }
         });
+    }
+
+    // ==================== 上传（SFTP 优先，失败回退 exec + base64）====================
+
+    /**
+     * 上传文件：优先走 SFTP，失败回退 exec + base64。errRef 携带失败原因。
+     */
+    private boolean uploadViaSftp(ClientSession session, File file, String remotePath,
+                                   TransferProgressDialog dlg,
+                                   java.util.concurrent.atomic.AtomicReference<String> errRef) {
+        long fileSize = file.length();
+        final long displayTotal = fileSize > 0 ? fileSize : 1;
+        dlg.setTarget(0, displayTotal);
+        SwingUtilities.invokeLater(() -> {
+            if (!dlg.isVisible()) dlg.setVisible(true);
+        });
+
+        // ① 先尝试 SFTP
+        try {
+            SftpClient sftp = SftpClientFactory.instance().createSftpClient(session);
+            try (FileInputStream fis = new FileInputStream(file)) {
+                sftp.put(new ProgressInputStream(fis, fileSize, dlg), remotePath);
+            }
+            if (dlg.cancelled) {
+                try { sftp.remove(remotePath); } catch (Exception ignored) {}
+                errRef.set("用户取消");
+                return false;
+            }
+            sftp.close();
+            dlg.setTarget(fileSize, displayTotal);
+            return true;
+        } catch (Exception e) {
+            String sfpErr = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            if (sfpErr.toLowerCase().contains("permission denied")) {
+                errRef.set("权限不足 (SFTP)");
+            } else {
+                errRef.set("SFTP: " + sfpErr);
+            }
+        }
+
+        // ② 回退到 exec + base64（base64 编码避免二进制数据损坏 SSH 通道）
+        return uploadViaExecBase64(session, file, remotePath, fileSize, displayTotal, dlg, errRef);
+    }
+
+    private boolean uploadViaExecBase64(ClientSession session, File file, String remotePath,
+                                         long fileSize, long displayTotal, TransferProgressDialog dlg,
+                                         java.util.concurrent.atomic.AtomicReference<String> errRef) {
+        ChannelExec exec = null;
+        OutputStream base64Encoder = null;
+        Thread stderrReader = null;
+        java.io.ByteArrayOutputStream stderrBuf = new java.io.ByteArrayOutputStream();
+        try {
+            String escapedPath = remotePath.replace("'", "'\\''");
+
+            // 远端 base64 -d 解码并写入文件
+            exec = session.createExecChannel("base64 -d > '" + escapedPath + "'");
+            exec.open().verify(10000);
+
+            // 启动 stderr 读取线程，捕获权限错误等
+            final ChannelExec execRef = exec;
+            stderrReader = Thread.startVirtualThread(() -> {
+                try {
+                    java.io.InputStream errIn = execRef.getInvertedErr();
+                    byte[] b = new byte[256];
+                    int r;
+                    while ((r = errIn.read(b)) != -1) {
+                        stderrBuf.write(b, 0, r);
+                    }
+                } catch (Exception ignored) {}
+            });
+
+            // 流式 Base64 编码器 → exec stdin
+            base64Encoder = Base64.getEncoder().wrap(exec.getInvertedIn());
+
+            long sent = 0;
+            try (FileInputStream fis = new FileInputStream(file)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = fis.read(buf)) != -1 && !dlg.cancelled) {
+                    base64Encoder.write(buf, 0, n);
+                    sent += n;
+                    dlg.setTarget(sent, displayTotal);
+                }
+                base64Encoder.flush();
+            } catch (java.io.IOException e) {
+                // 写入失败通常是因为远端命令已退出（权限不足等）
+                stderrReader.join(2000);
+                String errText = stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8).trim();
+                if (!errText.isEmpty()) {
+                    errRef.set("Exec错误: " + errText);
+                } else if (e.getMessage() != null && e.getMessage().contains("closed")) {
+                    errRef.set("权限不足，远端命令立即退出");
+                } else {
+                    errRef.set("Exec写入失败: " + e.getMessage());
+                }
+                return false;
+            }
+
+            if (dlg.cancelled) {
+                errRef.set("用户取消");
+                return false;
+            }
+
+            // close 发送 final base64 padding + SSH_MSG_CHANNEL_EOF
+            base64Encoder.close();
+            base64Encoder = null;
+
+            exec.waitFor(EnumSet.of(ClientChannelEvent.CLOSED), 60000);
+            dlg.setTarget(fileSize, displayTotal);
+
+            // 等待 stderr reader 完成
+            stderrReader.join(2000);
+            String errText = stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8).trim();
+
+            if (!verifyRemoteFile(session, escapedPath, fileSize)) {
+                if (!errText.isEmpty()) {
+                    errRef.set("Exec写入失败: " + errText);
+                } else {
+                    errRef.set("远程文件校验失败");
+                }
+                return false;
+            }
+            return true;
+
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            if (msg.toLowerCase().contains("permission denied")) {
+                errRef.set("权限不足");
+            } else {
+                errRef.set("异常: " + msg);
+            }
+            return false;
+        } finally {
+            if (stderrReader != null && stderrReader.isAlive()) {
+                try { stderrReader.join(1000); } catch (InterruptedException ignored) {}
+            }
+            if (base64Encoder != null) try { base64Encoder.close(); } catch (Exception ignored) {}
+            if (exec != null && exec.isOpen()) try { exec.close(true); } catch (Exception ignored) {}
+        }
+    }
+
+    /** 通过 exec 校验远程文件是否写入成功 */
+    private static boolean verifyRemoteFile(ClientSession session, String remotePath, long expectedSize) {
+        try {
+            String safe = remotePath.replace("'", "'\\''");
+            ChannelExec verExec = session.createExecChannel(
+                "test -f '" + safe + "' && wc -c < '" + safe + "' || echo MISSING");
+            verExec.open().verify(5000);
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            InputStream stdout = verExec.getInvertedOut();
+            byte[] buf = new byte[256];
+            int n;
+            while ((n = stdout.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+            }
+            verExec.close(true);
+
+            String result = baos.toString(StandardCharsets.UTF_8).trim();
+            if ("MISSING".equals(result)) return false;
+            try {
+                return Long.parseLong(result) >= expectedSize;
+            } catch (NumberFormatException ex) {
+                return !result.isEmpty();
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 预检远程目录是否有写权限，无权限时 errRef 填入失败原因 */
+    private static boolean checkWritePermission(ClientSession session, String remoteDir,
+                                                java.util.concurrent.atomic.AtomicReference<String> errRef) {
+        ChannelExec exec = null;
+        try {
+            String safe = remoteDir.replace("'", "'\\''");
+            exec = session.createExecChannel("test -d '" + safe + "' && test -w '" + safe + "' || echo NO_PERM:" + safe);
+            exec.open().verify(5000);
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            InputStream stdout = exec.getInvertedOut();
+            byte[] buf = new byte[256];
+            int n;
+            while ((n = stdout.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+            }
+            exec.close(true);
+
+            String result = baos.toString(StandardCharsets.UTF_8).trim();
+            if (result.isEmpty()) return true; // 无输出 = test 全部通过
+            if (result.startsWith("NO_PERM:")) {
+                errRef.set("目录不可写（可能需 root 权限）");
+                return false;
+            }
+            errRef.set("目录不存在或不可访问: " + result);
+            return false;
+        } catch (Exception e) {
+            errRef.set("预检异常: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+            return false;
+        } finally {
+            if (exec != null && exec.isOpen()) try { exec.close(true); } catch (Exception ignored) {}
+        }
+    }
+
+    /** 带进度回调的输入流包装——拦截 read 并同步进度到 TransferProgressDialog */
+    private static class ProgressInputStream extends FilterInputStream {
+        private final long total;
+        private long readBytes;
+        private final TransferProgressDialog dlg;
+
+        ProgressInputStream(InputStream in, long total, TransferProgressDialog dlg) {
+            super(in);
+            this.total = total > 0 ? total : 1;
+            this.dlg = dlg;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (dlg.cancelled) return -1;
+            int b = super.read();
+            if (b != -1) { readBytes++; dlg.setTarget(readBytes, total); }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (dlg.cancelled) return -1;
+            int n = super.read(b, off, len);
+            if (n > 0) { readBytes += n; dlg.setTarget(readBytes, total); }
+            return n;
+        }
     }
 
     /** 传输进度对话框 — 带平滑追赶动画 */
@@ -1438,7 +1745,7 @@ public class SshPanel extends AbstractCommandPanel {
         final JButton cancelBtn;
         volatile boolean cancelled;
 
-        // 真实传输进度（由 JSch 回调线程写入，不经过 EDT）
+        // 真实传输进度（由上/下载线程写入，不经过 EDT）
         volatile long targetTransferred;
         volatile long targetTotal;
         volatile boolean transferFinished;
@@ -1493,15 +1800,20 @@ public class SshPanel extends AbstractCommandPanel {
             animateTimer.start();
         }
 
-        /** JSch 回调线程调用：仅更新目标值，极轻量 */
+        /** 上/下载线程调用：仅更新目标值，极轻量 */
         void setTarget(long transferred, long total) {
             this.targetTransferred = transferred;
             this.targetTotal = total;
         }
 
-        /** JSch end() 回调：标记传输完成，让动画最终走到 100% */
+        /** 传输完成或异常终止时调用，让动画最终走到 100% */
         void markFinished() {
             this.transferFinished = true;
+            // 防止 init() 未被调用导致 targetTotal=0 时 animateTick 提前 return 卡住
+            if (this.targetTotal <= 0) {
+                this.targetTotal = 1;
+                this.targetTransferred = 1;
+            }
         }
 
         /** 动画 tick（EDT 线程） */
@@ -1535,11 +1847,15 @@ public class SshPanel extends AbstractCommandPanel {
             // 速度统计（基于真实传输值）
             long now = System.currentTimeMillis();
             long dt = now - lastSpeedTime;
-            if (dt >= 1000) {
+            if (lastTargetCount > 0 && dt >= 500) {
                 long dc = targetTransferred - lastTargetCount;
-                double speedBps = dc * 1000.0 / dt;
+                double speedBps = dc * 1000.0 / Math.max(dt, 1);
                 speedLabel.setText("速度: " + formatSize((long) speedBps) + "/s  |  已用时: "
                     + formatDuration(now - startTime));
+                lastTargetCount = targetTransferred;
+                lastSpeedTime = now;
+            } else if (lastTargetCount == 0 && targetTransferred > 0) {
+                // 首个真实数据点：初始化速度基线，跳过首次速度展示（避免瞬态虚高）
                 lastTargetCount = targetTransferred;
                 lastSpeedTime = now;
             }
@@ -1605,71 +1921,87 @@ public class SshPanel extends AbstractCommandPanel {
 
     /** 追加 ANSI 转义文本，解析着色 + 终端控制码，过滤 OSC 序列 */
     private void appendAnsi(String text) {
-        if (terminalArea == null || text == null || text.isEmpty()) return;
+        if (text == null || text.isEmpty()) return;
+        SwingUtilities.invokeLater(() -> appendAnsiRaw(text));
+    }
+
+    /** 连接感知版：text 累积到 conn.terminalBuffer；仅在当前正查看该连接时才渲染 UI */
+    private void appendAnsiForConn(SshConn conn, String text) {
+        if (conn == null || text == null || text.isEmpty()) return;
+        conn.terminalBuffer.append(text);
         SwingUtilities.invokeLater(() -> {
-            rawAppending = true;
-            try {
-                StyledDocument doc = terminalArea.getStyledDocument();
-                int len = text.length();
-                int segStart = 0;
-                for (int i = 0; i < len; i++) {
-                    if (text.charAt(i) == '\033' && i + 1 < len) {
-                        char next = text.charAt(i + 1);
-                        if (next == '[') {
-                            // CSI 序列 \033[...X
-                            if (i > segStart) {
-                                insertStyled(doc, text.substring(segStart, i));
-                            }
-                            int end = i + 2;
-                            while (end < len && !isCsiTerminator(text.charAt(end))) end++;
-                            if (end < len) {
-                                String params = text.substring(i + 2, end);
-                                applyCsiSequence(doc, params, text.charAt(end));
-                                i = end;
-                                segStart = end + 1;
-                            } else {
-                                i = len;
-                            }
-                        } else if (next == ']') {
-                            // OSC 序列 \033]...\007 或 \033]...\033\\
-                            // 常见：\033]0;title\007 — 设终端标题，直接丢弃
-                            if (i > segStart) {
-                                insertStyled(doc, text.substring(segStart, i));
-                            }
-                            int end = i + 2;
-                            while (end < len) {
-                                char ec = text.charAt(end);
-                                if (ec == '\007' || (ec == '\033' && end + 1 < len && text.charAt(end + 1) == '\\')) {
-                                    break;
-                                }
-                                end++;
-                            }
-                            if (end < len) {
-                                if (text.charAt(end) == '\033') end++; // 跳过 \033\\ 中的 \
-                                i = end;
-                                segStart = end + 1;
-                            } else {
-                                i = len;
-                            }
-                        } else {
-                            // 其他双字符 ESC 序列：\033= \033> \033( \033) 等，直接跳过
-                            if (i > segStart) {
-                                insertStyled(doc, text.substring(segStart, i));
-                            }
-                            i++; // 跳过 ESC 后的那个字符
-                            segStart = i + 1;
+            synchronized (connLock) {
+                if (conn != currentConn) return;
+            }
+            appendAnsiRaw(text);
+        });
+    }
+
+    /** 直接在终端渲染 ANSI 文本（必须在 EDT 调用） */
+    private void appendAnsiRaw(String text) {
+        if (terminalArea == null) return;
+        rawAppending = true;
+        try {
+            StyledDocument doc = terminalArea.getStyledDocument();
+            int len = text.length();
+            int segStart = 0;
+            for (int i = 0; i < len; i++) {
+                if (text.charAt(i) == '\033' && i + 1 < len) {
+                    char next = text.charAt(i + 1);
+                    if (next == '[') {
+                        // CSI 序列 \033[...X
+                        if (i > segStart) {
+                            insertStyled(doc, text.substring(segStart, i));
                         }
+                        int end = i + 2;
+                        while (end < len && !isCsiTerminator(text.charAt(end))) end++;
+                        if (end < len) {
+                            String params = text.substring(i + 2, end);
+                            applyCsiSequence(doc, params, text.charAt(end));
+                            i = end;
+                            segStart = end + 1;
+                        } else {
+                            i = len;
+                        }
+                    } else if (next == ']') {
+                        // OSC 序列 \033]...\007 或 \033]...\033\\
+                        // 常见：\033]0;title\007 — 设终端标题，直接丢弃
+                        if (i > segStart) {
+                            insertStyled(doc, text.substring(segStart, i));
+                        }
+                        int end = i + 2;
+                        while (end < len) {
+                            char ec = text.charAt(end);
+                            if (ec == '\007' || (ec == '\033' && end + 1 < len && text.charAt(end + 1) == '\\')) {
+                                break;
+                            }
+                            end++;
+                        }
+                        if (end < len) {
+                            if (text.charAt(end) == '\033') end++; // 跳过 \033\\ 中的 \
+                            i = end;
+                            segStart = end + 1;
+                        } else {
+                            i = len;
+                        }
+                    } else {
+                        // 其他双字符 ESC 序列：\033= \033> \033( \033) 等，直接跳过
+                        if (i > segStart) {
+                            insertStyled(doc, text.substring(segStart, i));
+                        }
+                        i++; // 跳过 ESC 后的那个字符
+                        segStart = i + 1;
                     }
                 }
-                if (segStart < len) {
-                    insertStyled(doc, text.substring(segStart));
-                }
-                terminalArea.setCaretPosition(doc.getLength());
-            } catch (BadLocationException ignored) {
-            } finally {
-                rawAppending = false;
             }
-        });
+            if (segStart < len) {
+                insertStyled(doc, text.substring(segStart));
+            }
+            terminalArea.setCaretPosition(doc.getLength());
+        } catch (BadLocationException ignored) {
+        } finally {
+            rawAppending = false;
+        }
     }
 
     private boolean isCsiTerminator(char c) {
@@ -1845,88 +2177,58 @@ public class SshPanel extends AbstractCommandPanel {
             try {
                 appendTerminal("[正在连接 " + conn.name + " (" + conn.host + ":" + conn.port + ")...]\n", C_SYS);
 
-                JSch jsch = new JSch();
-                conn.jsch = jsch;
+                SshClient client = SshClient.setUpDefaultClient();
+                conn.client = client;
+                client.start();
 
-                // ---- 主机密钥仓库：存待校验密钥供 UserInfo 对话框使用 ----
-                final byte[][] pendingKey = new byte[1][];
-                final String[] pendingHost = new String[1];
-
-                jsch.setHostKeyRepository(new HostKeyRepository() {
-                    @Override
-                    public int check(String host, byte[] key) {
-                        String fp = computeFingerprint(key);
-                        String saved = knownHosts.get(host);
-                        if (saved != null && saved.equals(fp)) {
-                            return HostKeyRepository.OK;
-                        }
-                        if (saved != null) {
-                            return HostKeyRepository.CHANGED;
-                        }
-                        pendingKey[0] = key;
-                        pendingHost[0] = host;
-                        return HostKeyRepository.NOT_INCLUDED;
+                // ---- 主机密钥验证 ----
+                client.setServerKeyVerifier((cliSession, address, key) -> {
+                    String hostKey = conn.host + ":" + conn.port;
+                    String fp = computeFingerprintFromPublicKey(key);
+                    String saved = knownHosts.get(hostKey);
+                    if (saved != null && saved.equals(fp)) {
+                        return true; // 已信任
                     }
-
-                    @Override public void add(HostKey hk, UserInfo ui) {}
-                    @Override public HostKey[] getHostKey() { return new HostKey[0]; }
-                    @Override public HostKey[] getHostKey(String h, String t) { return new HostKey[0]; }
-                    @Override public void remove(String h, String t) {}
-                    @Override public void remove(String h, String t, byte[] k) {}
-                    @Override public String getKnownHostsRepositoryID() { return "CoreTools"; }
+                    // 弹出验证对话框
+                    String keyType = key.getAlgorithm();
+                    boolean[] result = {false, false}; // [accepted, savePermanently]
+                    try {
+                        SwingUtilities.invokeAndWait(() -> {
+                            HostKeyVerifyDialog dlg = new HostKeyVerifyDialog(
+                                SwingUtilities.getWindowAncestor(SshPanel.this),
+                                conn.host, conn.port, fp, keyType);
+                            dlg.setVisible(true);
+                            result[0] = dlg.accepted;
+                            result[1] = dlg.savePermanently;
+                        });
+                    } catch (Exception ex) {
+                        return false;
+                    }
+                    if (result[0] && result[1]) {
+                        knownHosts.put(hostKey, fp);
+                        saveKnownHosts();
+                    }
+                    return result[0];
                 });
 
-                // ---- 会话 ----
-                Session session = jsch.getSession(conn.username, conn.host, conn.port);
-                session.setPassword(conn.password);
-                session.setConfig("StrictHostKeyChecking", "ask");
-
-                session.setUserInfo(new UserInfo() {
-                    @Override public String getPassphrase() { return null; }
-                    @Override public String getPassword() { return null; }
-                    @Override public boolean promptPassword(String msg) { return false; }
-                    @Override public boolean promptPassphrase(String msg) { return false; }
-                    @Override public void showMessage(String msg) {}
-
-                    @Override
-                    public boolean promptYesNo(String msg) {
-                        byte[] key = pendingKey[0];
-                        String host = pendingHost[0] != null ? pendingHost[0] : (conn.host + ":" + conn.port);
-                        String fp = key != null ? computeFingerprint(key) : "SHA256:???";
-                        String keyType = key != null ? getKeyType(key) : "SSH";
-                        boolean[] box = {false, false};
-                        try {
-                            SwingUtilities.invokeAndWait(() -> {
-                                HostKeyVerifyDialog dlg = new HostKeyVerifyDialog(
-                                    SwingUtilities.getWindowAncestor(SshPanel.this),
-                                    conn.host, conn.port, fp, keyType);
-                                dlg.setVisible(true);
-                                box[0] = dlg.accepted;
-                                box[1] = dlg.savePermanently;
-                            });
-                        } catch (Exception ex) {
-                            return false;
-                        }
-                        if (box[0] && box[1]) {
-                            knownHosts.put(host, fp);
-                            saveKnownHosts();
-                        }
-                        return box[0];
-                    }
-                });
-
-                session.connect(8000);
+                // ---- 连接 + 认证 ----
+                ConnectFuture cf = client.connect(conn.username, conn.host, conn.port);
+                ClientSession session = cf.verify(8000).getSession();
+                session.addPasswordIdentity(conn.password);
+                session.auth().verify(8000);
 
                 // ---- Shell Channel ----
-                ChannelShell channel = (ChannelShell) session.openChannel("shell");
+                ChannelShell channel = session.createShellChannel();
                 channel.setPtyType("xterm-256color");
-                channel.setPtySize(160, 30, 800, 600);
+                channel.setPtyColumns(160);
+                channel.setPtyLines(30);
+                channel.setPtyWidth(800);
+                channel.setPtyHeight(600);
                 channel.setEnv("LANG", "zh_CN.UTF-8");
+                channel.open().verify(8000);
 
-                InputStream recvStream = channel.getInputStream();
-                OutputStream toChannelOs = channel.getOutputStream();
-
-                channel.connect(8000);
+                InputStream recvStream = channel.getInvertedOut();
+                OutputStream toChannelOs = channel.getInvertedIn();
 
                 conn.session = session;
                 conn.channel = channel;
@@ -1934,7 +2236,12 @@ public class SshPanel extends AbstractCommandPanel {
                 conn.connected = true;
 
                 SwingUtilities.invokeLater(() -> {
-                    synchronized (connLock) { currentConn = conn; }
+                    SshConn old;
+                    synchronized (connLock) {
+                        old = currentConn;
+                        if (old != null) old.pwdCache = cachedRemotePwd;
+                        currentConn = conn;
+                    }
                     updateUiConnected(conn);
                     connList.repaint();
                 });
@@ -1950,7 +2257,7 @@ public class SshPanel extends AbstractCommandPanel {
                         int len = recvStream.read(buf);
                         if (len == -1) break;
                         String text = new String(buf, 0, len, StandardCharsets.UTF_8);
-                        appendAnsi(text);
+                        appendAnsiForConn(conn, text);
                     }
                 } catch (IOException e) {
                     if (conn.connected) {
@@ -1965,6 +2272,17 @@ public class SshPanel extends AbstractCommandPanel {
                 closeConnectionInternal(conn);
             }
         });
+    }
+
+    /** 从 MINA SSHD PublicKey 计算 SHA256 指纹 */
+    private static String computeFingerprintFromPublicKey(java.security.PublicKey key) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(key.getEncoded());
+            return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(digest);
+        } catch (Exception e) {
+            return "SHA256:???";
+        }
     }
 
     private void closeConnection(SshConn conn) {
@@ -1982,22 +2300,39 @@ public class SshPanel extends AbstractCommandPanel {
         } catch (Exception ignored) {}
         try {
             if (conn.channel != null) {
-                conn.channel.disconnect();
+                conn.channel.close(true);
                 conn.channel = null;
             }
         } catch (Exception ignored) {}
         try {
             if (conn.session != null) {
-                conn.session.disconnect();
+                conn.session.close(true);
                 conn.session = null;
+            }
+        } catch (Exception ignored) {}
+        try {
+            if (conn.client != null) {
+                conn.client.stop();
+                conn.client = null;
             }
         } catch (Exception ignored) {}
 
         SwingUtilities.invokeLater(() -> {
             synchronized (connLock) {
-                if (currentConn == conn) currentConn = null;
+                if (currentConn == conn) {
+                    // 查找其他已连接的连接，自动切换
+                    SshConn other = null;
+                    for (SshConn c : connections) {
+                        if (c != conn && c.connected) { other = c; break; }
+                    }
+                    if (other != null) {
+                        switchToConnection(other);
+                    } else {
+                        currentConn = null;
+                        updateUiDisconnected();
+                    }
+                }
             }
-            updateUiDisconnected();
             connList.repaint();
         });
     }
@@ -2005,6 +2340,18 @@ public class SshPanel extends AbstractCommandPanel {
     // ==================== UI 状态 ====================
 
     private void updateUiConnected(SshConn conn) {
+        // 兜底：确保退出 RAW 模式（防止上次断开前残留 DocumentFilter/KeyListener）
+        exitRawMode();
+        // 清空旧连接的所有 UI 残留
+        terminalArea.setText("");
+        commandInput.setText("");
+        commandHistory.clear();
+        historyIndex = 0;
+        cachedRemotePwd = null;
+        dirPathLabel.setText("加载中...");
+        dirRootNode.removeAllChildren();
+        dirTreeModel.reload();
+
         statusLabel.setText("\u25CF 已连接");
         statusLabel.setForeground(C_RECV);
         connInfoLabel.setText(conn.name + "  " + conn.username + "@" + conn.host + ":" + conn.port);
@@ -2014,6 +2361,8 @@ public class SshPanel extends AbstractCommandPanel {
     }
 
     private void updateUiDisconnected() {
+        // 断开连接时强制退出 RAW 模式，清理 DocumentFilter 和 KeyListener
+        exitRawMode();
         statusLabel.setText("未连接");
         statusLabel.setForeground(C_WARN);
         connInfoLabel.setText("");

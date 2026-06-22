@@ -118,8 +118,10 @@ dependencies {
     // ---- 各个平台底层信息获取 ----
     implementation 'com.github.oshi:oshi-benchmark:7.3.1'
 
-    // ---- ssh连接 (JSch 新版，虚拟线程异步封装)
-    implementation 'com.github.mwiede:jsch:2.28.0'
+    // ---- ssh连接 (Apache MINA SSHD，原生支持 SCP 权限模型)
+    implementation 'org.apache.sshd:sshd-core:3.0.0-M4'
+    implementation 'org.apache.sshd:sshd-sftp:3.0.0-M4'
+    implementation 'org.apache.sshd:sshd-scp:3.0.0-M4'
 
     // ---- langchain4j
     implementation "dev.langchain4j:langchain4j-open-ai:${langchain4jVer}"
