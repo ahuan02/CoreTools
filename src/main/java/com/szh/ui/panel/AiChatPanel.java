@@ -1531,7 +1531,16 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         });
 
-        // 选中模型只切换，不弹窗
+        // 选中模型时清空历史对话记忆，避免新模型延续旧模型的上下文
+        combo.addItemListener(e -> {
+            if (e.getStateChange() == java.awt.event.ItemEvent.SELECTED) {
+                Object item = e.getItem();
+                if (item instanceof ModelConfig mc && !"请先添加模型".equals(mc.getAlias())) {
+                    chatMemory.clear();
+                    System.out.println("[AI Chat] 切换到模型: " + mc.comboLabel() + "，已清空对话记忆");
+                }
+            }
+        });
 
         refreshModelSelector();
         return combo;

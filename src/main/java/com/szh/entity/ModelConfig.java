@@ -43,4 +43,19 @@ public class ModelConfig {
     public String toString() {
         return comboLabel();
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ModelConfig that)) return false;
+        return alias.equals(that.alias)
+            && apiKey.equals(that.apiKey)
+            && apiUrl.equals(that.apiUrl)
+            && modelName.equals(that.modelName);
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Objects.hash(alias, apiKey, apiUrl, modelName);
+    }
 }
