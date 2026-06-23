@@ -12,6 +12,8 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.JTextComponent;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.awt.image.BufferedImage;
@@ -28,6 +30,10 @@ public class MainFrame extends JFrame {
     private String currentThemeClassName;
     private JTabbedPane tabbedPane;
 
+    // 系统托盘
+    private TrayIcon trayIcon;
+    private boolean traySupported;
+
     public MainFrame() {
         initTheme();
         initGlobalFont();
@@ -35,7 +41,8 @@ public class MainFrame extends JFrame {
         setJMenuBar(createMenuBar());
 
         setTitle("CoreTools");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // 关闭时缩小到系统托盘而非退出
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
         int initW = (int) (screenSize.width * 0.5);
         int initH = (int) (screenSize.height * 0.5);
@@ -46,6 +53,9 @@ public class MainFrame extends JFrame {
         // loadConfig 放在 setSize 之后，以便用保存的窗口尺寸覆盖默认值
         loadConfig();
 
+        // 注册全局 MessageDialog（ElementPlus 风格消息弹出框）
+        MessageDialog.getInstance().registerOwner(this);
+
         // 窗口 resize 时即时重新布局
         addComponentListener(new java.awt.event.ComponentAdapter() {
             @Override
@@ -55,15 +65,131 @@ public class MainFrame extends JFrame {
             }
         });
 
-        // 关闭时保存配置（含窗口尺寸和位置）
+        // 关闭时缩小到系统托盘
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                saveWindowBounds();
-                saveConfig();
+                if (traySupported) {
+                    minimizeToTray();
+                } else {
+                    saveWindowBounds();
+                    saveConfig();
+                    dispose();
+                    System.exit(0);
+                }
             }
+
         });
+
+        // 初始化系统托盘
+        setupSystemTray();
     }
+
+    // ==================== 系统托盘 ====================
+
+    /** 初始化系统托盘图标（用应用图标）和自定义右键弹出菜单 */
+    private void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            traySupported = false;
+            return;
+        }
+        try {
+            // 加载应用图标作为托盘图标
+            java.net.URL iconUrl = getClass().getResource("/icon.png");
+            Image trayImage;
+            if (iconUrl != null) {
+                BufferedImage appIcon = ImageIO.read(iconUrl);
+                // 缩放为合适托盘尺寸
+                int trayIconSize = SystemTray.getSystemTray().getTrayIconSize().width;
+                trayImage = appIcon.getScaledInstance(trayIconSize, trayIconSize, Image.SCALE_SMOOTH);
+            } else {
+                // 兜底：绘制一个简单图标
+                trayImage = createFallbackIcon(16);
+            }
+
+            // 构造原生弹出菜单（Windows 上唯一可靠的方式）
+            PopupMenu popup = new PopupMenu();
+
+            MenuItem openItem = new MenuItem("📂 打开界面");
+            openItem.addActionListener(e -> restoreFromTray());
+
+            MenuItem exitItem = new MenuItem("✕ 退出");
+            exitItem.addActionListener(e -> exitApplication());
+
+            popup.add(openItem);
+            popup.addSeparator();
+            popup.add(exitItem);
+
+            trayIcon = new TrayIcon(trayImage, "CoreTools", popup);
+            trayIcon.setImageAutoSize(true);
+
+            // 左键单击打开窗口
+            trayIcon.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (e.getButton() == MouseEvent.BUTTON1 && e.getClickCount() == 1) {
+                        restoreFromTray();
+                    }
+                }
+            });
+
+            SystemTray.getSystemTray().add(trayIcon);
+            traySupported = true;
+        } catch (Exception e) {
+            traySupported = false;
+            e.printStackTrace();
+        }
+    }
+
+    /** 兜底图标（应用图标加载失败时） */
+    private Image createFallbackIcon(int size) {
+        BufferedImage img = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2 = img.createGraphics();
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g2.setColor(new Color(0x66, 0x7E, 0xEA));
+        g2.fillOval(0, 0, size, size);
+        g2.setColor(Color.WHITE);
+        g2.setFont(new Font("Dialog", Font.BOLD, 9));
+        FontMetrics fm = g2.getFontMetrics();
+        String letter = "C";
+        g2.drawString(letter, (size - fm.stringWidth(letter)) / 2f,
+                (size - fm.getHeight()) / 2f + fm.getAscent());
+        g2.dispose();
+        return img;
+    }
+
+    /** 缩小到系统托盘 */
+    private void minimizeToTray() {
+        if (!traySupported || trayIcon == null) return;
+        setVisible(false);
+        // FlatLaf 最小化到托盘提示
+        if (SystemTray.isSupported()) {
+            trayIcon.displayMessage("CoreTools",
+                    "程序已最小化到系统托盘，右键点击可打开或退出。",
+                    TrayIcon.MessageType.INFO);
+        }
+    }
+
+    /** 从系统托盘恢复窗口 */
+    private void restoreFromTray() {
+        setVisible(true);
+        setExtendedState(JFrame.NORMAL);
+        toFront();
+        requestFocus();
+    }
+
+    /** 彻底退出程序 */
+    private void exitApplication() {
+        saveWindowBounds();
+        saveConfig();
+        if (trayIcon != null && SystemTray.isSupported()) {
+            SystemTray.getSystemTray().remove(trayIcon);
+        }
+        dispose();
+        System.exit(0);
+    }
+
+    // ==================== 全局字体 / 主题初始化 ====================
 
     private void initGlobalFont() {
         currentFontFamily = config.get("font.family", "Microsoft YaHei");
@@ -203,8 +329,26 @@ public class MainFrame extends JFrame {
         for (AbstractCommandPanel panel : panels.values()) {
             panel.loadConfig(config);
         }
+
+        // 如果有背景图，重新应用透明——背景在构造时已设置到 contentPane，
+        // 但当时面板还没创建，现在所有面板都有了，需要让它们透出背景
+        if (backgroundImage != null) {
+            makeAllTabsTransparent();
+        }
+
         tabbedPane.revalidate();
         tabbedPane.repaint();
+    }
+
+    /** 将 tabbedPane 及所有已加载的 tab 内容面板设为透明，透出背景图 */
+    private void makeAllTabsTransparent() {
+        tabbedPane.setOpaque(false);
+        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
+            Component tab = tabbedPane.getComponentAt(i);
+            if (tab != null) {
+                setComponentTreeOpaque(tab, false);
+            }
+        }
     }
 
     // ==================== Tab 滚轮切换 ====================
@@ -719,6 +863,69 @@ public class MainFrame extends JFrame {
         aboutItem.addActionListener(e -> showAboutDialog());
         aboutMenu.add(aboutItem);
         bar.add(aboutMenu);
+
+        // ---- 消息测试菜单 ----
+        JMenu msgTestMenu = new JMenu("消息测试");
+
+        JMenu typeMenu = new JMenu("类型测试（默认位置）");
+        JMenuItem testSuccess = new JMenuItem("✅ 成功消息");
+        testSuccess.addActionListener(e -> MessageDialog.success("操作执行成功！"));
+        typeMenu.add(testSuccess);
+
+        JMenuItem testInfo = new JMenuItem("ℹ️ 普通消息");
+        testInfo.addActionListener(e -> MessageDialog.info("这是一条普通信息提示。"));
+        typeMenu.add(testInfo);
+
+        JMenuItem testWarning = new JMenuItem("⚠️ 警告消息");
+        testWarning.addActionListener(e -> MessageDialog.warning("请注意：磁盘空间已不足 10%，建议及时清理。"));
+        typeMenu.add(testWarning);
+
+        JMenuItem testError = new JMenuItem("❌ 错误消息");
+        testError.addActionListener(e -> MessageDialog.error("操作失败：网络连接超时，请检查网络后重试。"));
+        typeMenu.add(testError);
+        msgTestMenu.add(typeMenu);
+
+        JMenu placementMenu = new JMenu("位置测试");
+        for (MessageDialog.Placement p : MessageDialog.Placement.values()) {
+            String label = switch (p) {
+                case TOP -> "顶部居中 ↑";
+                case TOP_LEFT -> "左上角 ↖";
+                case TOP_RIGHT -> "右上角 ↗";
+                case BOTTOM -> "底部居中 ↓";
+                case BOTTOM_LEFT -> "左下角 ↙";
+                case BOTTOM_RIGHT -> "右下角 ↘";
+                case CENTER -> "屏幕中央 ⊕";
+            };
+            JMenuItem item = new JMenuItem(label);
+            item.addActionListener(e -> {
+                MessageDialog.getInstance().show(
+                        "当前位置：" + p.name() + " —— 鼠标移入可暂停消失",
+                        MessageDialog.Type.INFO, null, 4000, p);
+            });
+            placementMenu.add(item);
+        }
+        msgTestMenu.add(placementMenu);
+
+        JMenuItem testHover = new JMenuItem("鼠标悬停测试（6 秒长消息）");
+        testHover.addActionListener(e ->
+                MessageDialog.getInstance().show(
+                        "鼠标移到我身上试试～ 我会等你移开后才消失 (6s)",
+                        MessageDialog.Type.WARNING, null, 6000));
+        msgTestMenu.add(testHover);
+
+        JMenuItem testStack = new JMenuItem("堆叠测试（连发 3 条）");
+        testStack.addActionListener(e -> {
+            MessageDialog.info("第 1 条 — 我会被顶上去");
+            Timer t = new Timer(200, ev -> MessageDialog.success("第 2 条 — 我在中间"));
+            t.setRepeats(false);
+            t.start();
+            Timer t2 = new Timer(400, ev -> MessageDialog.warning("第 3 条 — 我最后到"));
+            t2.setRepeats(false);
+            t2.start();
+        });
+        msgTestMenu.add(testStack);
+
+        bar.add(msgTestMenu);
 
         return bar;
     }

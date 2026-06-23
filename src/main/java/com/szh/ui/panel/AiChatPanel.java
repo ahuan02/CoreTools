@@ -32,6 +32,9 @@ import org.pushingpixels.radiance.animation.api.Timeline.TimelineState;
 import org.pushingpixels.radiance.animation.api.callback.TimelineCallback;
 
 import javax.imageio.ImageIO;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.SourceDataLine;
 import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
@@ -48,6 +51,7 @@ import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ShortBuffer;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.time.LocalTime;
@@ -437,24 +441,75 @@ public class AiChatPanel extends AbstractCommandPanel {
         boolean hasModels = modelConfigs != null && !modelConfigs.isEmpty();
 
         if (hasModels) {
-            // 已配置模型：显示品牌大字
-            placeholderLabel = new JLabel("CoreTools AI", SwingConstants.CENTER);
+            // 已配置模型：显示品牌大字（蓝紫渐变）
+            placeholderLabel = new JLabel("CoreTools AI", SwingConstants.CENTER) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    Font font = getFont();
+                    g2.setFont(font);
+                    FontMetrics fm = g2.getFontMetrics();
+                    String text = getText();
+                    int x = (getWidth() - fm.stringWidth(text)) / 2;
+                    int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
+                    GradientPaint gp = new GradientPaint(
+                            x, y, new Color(0x66, 0x7E, 0xEA),
+                            x + fm.stringWidth(text), y, new Color(0x76, 0x4B, 0xA2));
+                    g2.setPaint(gp);
+                    g2.drawString(text, x, y);
+                    g2.dispose();
+                }
+            };
             placeholderLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 42));
-            placeholderLabel.setForeground(new Color(0x3A3A3A)); // 浅白色大字
             placeholderLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
             chatMessagePanel.add(Box.createVerticalGlue());
             chatMessagePanel.add(placeholderLabel);
             chatMessagePanel.add(Box.createVerticalGlue());
         } else {
-            // 未配置模型：显示引导提示
-            placeholderLabel = new JLabel("AI 对话助手", SwingConstants.CENTER);
+            // 未配置模型：显示引导提示（蓝紫渐变）
+            placeholderLabel = new JLabel("AI 对话助手", SwingConstants.CENTER) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    Font font = getFont();
+                    g2.setFont(font);
+                    FontMetrics fm = g2.getFontMetrics();
+                    String text = getText();
+                    int x = (getWidth() - fm.stringWidth(text)) / 2;
+                    int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
+                    GradientPaint gp = new GradientPaint(
+                            x, y, new Color(0x66, 0x7E, 0xEA),
+                            x + fm.stringWidth(text), y, new Color(0x76, 0x4B, 0xA2));
+                    g2.setPaint(gp);
+                    g2.drawString(text, x, y);
+                    g2.dispose();
+                }
+            };
             placeholderLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 14));
-            placeholderLabel.setForeground(C_TIME);
             placeholderLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
-            JLabel subLabel = new JLabel("点击「＋ 添加模型」配置后即可使用", SwingConstants.CENTER);
+            JLabel subLabel = new JLabel("点击「＋ 添加模型」配置后即可使用", SwingConstants.CENTER) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    Font font = getFont();
+                    g2.setFont(font);
+                    FontMetrics fm = g2.getFontMetrics();
+                    String text = getText();
+                    int x = (getWidth() - fm.stringWidth(text)) / 2;
+                    int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
+                    GradientPaint gp = new GradientPaint(
+                            x, y, new Color(0x74, 0xEB, 0xD5),
+                            x + fm.stringWidth(text), y, new Color(0x9F, 0xAC, 0xE6));
+                    g2.setPaint(gp);
+                    g2.drawString(text, x, y);
+                    g2.dispose();
+                }
+            };
             subLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-            subLabel.setForeground(C_TIME);
             subLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
             chatMessagePanel.add(Box.createVerticalGlue());
@@ -848,11 +903,11 @@ public class AiChatPanel extends AbstractCommandPanel {
         String modelName = selectedModel.getModelName();
 
         // === Agnes 图片/视频生成路由 ===
-        if ("agnes-image-2.0-flash".equals(modelName)) {
+        if (modelName != null && modelName.startsWith("agnes-image")) {
             handleAgnesImageSend(text, selectedModel);
             return;
         }
-        if ("agnes-video-v2.0".equals(modelName)) {
+        if (modelName != null && modelName.startsWith("agnes-video")) {
             handleAgnesVideoSend(text, selectedModel);
             return;
         }
@@ -1677,6 +1732,10 @@ public class AiChatPanel extends AbstractCommandPanel {
             modelSelector.addItem(placeholder);
             modelSelector.setEnabled(false);
             if (editModelBtn != null) editModelBtn.setEnabled(false);
+            // 如果当前是占位状态（无聊天记录），刷新占位文字
+            if (placeholderLabel != null && placeholderLabel.getParent() != null) {
+                showPlaceholder();
+            }
         } else {
             modelSelector.setEnabled(true);
             if (editModelBtn != null) editModelBtn.setEnabled(true);
@@ -1700,10 +1759,11 @@ public class AiChatPanel extends AbstractCommandPanel {
         Object sel = modelSelector.getSelectedItem();
         if (!(sel instanceof ModelConfig mc)) return;
         if (mc.getModelName() == null || mc.getModelName().isEmpty()) return;
+        System.out.println("[模型编辑] 选中模型: alias=" + mc.getAlias() + " modelName=" + mc.getModelName());
         Window owner = SwingUtilities.getWindowAncestor(this);
         ModelConfigDialog dlg = new ModelConfigDialog(owner, mc);
         dlg.setVisible(true);
-        if (dlg.confirmed) {
+        if (dlg.confirmed || dlg.deleted) {
             refreshModelSelector();
         }
     }
@@ -1734,6 +1794,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         private final JTextField urlField    = createField(24, "https://api.openai.com/v1");
         private final JComboBox<String> nameCombo = createModelCombo();
         private boolean confirmed;
+        private boolean deleted;  // 删除模式标记
 
         // Agnes 扩展配置面板（根据选中模型动态显示/隐藏）
         private JPanel extraPanel;
@@ -1857,14 +1918,21 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             toggleAgnesPanel(); // 初始状态
 
-            // 按钮栏
-            JPanel btnBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+            // 按钮栏：左侧删除（仅编辑），右侧确定+取消
+            JPanel btnBar = new JPanel(new BorderLayout());
             btnBar.setOpaque(false);
 
+            if (editing != null) {
+                btnBar.add(createDeleteButton(editing), BorderLayout.WEST);
+            }
+
+            JPanel rightBtns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+            rightBtns.setOpaque(false);
             JButton btnOk     = createFilledButton("确定",   e -> onConfirm(editing));
             JButton btnCancel = createOutlinedButton("取消", C_TIME, e -> dispose());
-            btnBar.add(btnOk);
-            btnBar.add(btnCancel);
+            rightBtns.add(btnOk);
+            rightBtns.add(btnCancel);
+            btnBar.add(rightBtns, BorderLayout.EAST);
 
             getRootPane().setDefaultButton(btnOk);
             registerEscClose(btnCancel);
@@ -2213,10 +2281,10 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         /** 根据当前模型名切换显示对应的配置面板 */
         private void toggleAgnesPanel() {
-            String name = getCurrentModelName();
+            String name = getCurrentModelName().trim();
             extraPanel.removeAll();
 
-            if ("agnes-image-2.0-flash".equals(name)) {
+            if (name.startsWith("agnes-image")) {
                 // API 链接自动填充（服务类内置），设为只读
                 urlField.setText(com.szh.agnes.AgnesImageService.BASE_URL);
                 urlField.setEditable(false);
@@ -2233,7 +2301,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
                 extraPanel.add(imageConfigPanel, BorderLayout.CENTER);
                 extraPanel.setVisible(true);
-            } else if ("agnes-video-v2.0".equals(name)) {
+            } else if (name.startsWith("agnes-video")) {
                 // API 链接自动填充（服务类内置），设为只读
                 urlField.setText(com.szh.agnes.AgnesVideoService.BASE_URL);
                 urlField.setEditable(false);
@@ -2336,8 +2404,21 @@ public class AiChatPanel extends AbstractCommandPanel {
             if (editing != null) {
                 // 编辑模式：替换旧配置
                 int idx = modelConfigs.indexOf(editing);
+                if (idx < 0) {
+                    // equals 匹配失败（如 extraConfig 已变更），回退用 alias 查找
+                    for (int i = 0; i < modelConfigs.size(); i++) {
+                        if (modelConfigs.get(i).getAlias().equals(editing.getAlias())) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                }
                 if (idx >= 0) {
                     modelConfigs.set(idx, mc);
+                } else {
+                    // 仍然找不到，追加到末尾
+                    System.err.println("[模型编辑] 警告：无法定位旧配置 alias=" + editing.getAlias() + "，已追加");
+                    modelConfigs.add(mc);
                 }
             } else {
                 // 新增模式：别名已存在则更新，否则追加
@@ -2361,7 +2442,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         /** 保存 Agnes 扩展配置到 ModelConfig */
         private void saveAgnesExtraConfig(ModelConfig mc) {
             String name = mc.getModelName();
-            if ("agnes-image-2.0-flash".equals(name) && imgSizeCombo != null) {
+            if (name != null && name.startsWith("agnes-image") && imgSizeCombo != null) {
                 mc.putExtra("image.size", ((String) imgSizeCombo.getSelectedItem()).split(" ")[0]);
                 mc.putExtra("image.mode", (String) imgModeCombo.getSelectedItem());
                 if (!"文生图".equals(imgModeCombo.getSelectedItem())) {
@@ -2369,7 +2450,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 } else {
                     mc.getExtraConfig().remove("image.urls");
                 }
-            } else if ("agnes-video-v2.0".equals(name) && vidResCombo != null) {
+            } else if (name != null && name.startsWith("agnes-video") && vidResCombo != null) {
                 mc.putExtra("video.size", ((String) vidResCombo.getSelectedItem()).split(" ")[0]);
                 mc.putExtra("video.duration", (String) vidDurCombo.getSelectedItem());
                 mc.putExtra("video.fps", ((String) vidFpsCombo.getSelectedItem()).split(" ")[0]);
@@ -2470,6 +2551,33 @@ public class AiChatPanel extends AbstractCommandPanel {
         private int getSelectedFrameCount() {
             if (vidDurCombo == null) return 121;
             return parseDuration(vidDurCombo.getSelectedIndex());
+        }
+
+        /** 构建"删除模型"按钮（仅编辑模式显示在左下角） */
+        private JButton createDeleteButton(ModelConfig editing) {
+            JButton btn = new JButton("删除模型");
+            btn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 12));
+            btn.setForeground(new Color(0xFF, 0x6B, 0x6B));
+            btn.setBackground(C_BTN_BG);
+            btn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(0xFF, 0x6B, 0x6B, 0x80)),
+                    BorderFactory.createEmptyBorder(4, 12, 4, 12)));
+            btn.setFocusPainted(false);
+            btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            btn.addActionListener(e -> {
+                int option = JOptionPane.showConfirmDialog(
+                        ModelConfigDialog.this,
+                        "确定要删除模型「" + editing.getAlias() + "」吗？\n此操作会同步移除下拉列表和配置文件。",
+                        "确认删除",
+                        JOptionPane.YES_NO_OPTION,
+                        JOptionPane.WARNING_MESSAGE);
+                if (option == JOptionPane.YES_OPTION) {
+                    modelConfigs.remove(editing);
+                    deleted = true;
+                    dispose();
+                }
+            });
+            return btn;
         }
     }
 
@@ -2854,7 +2962,6 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
             });
             mediaPanel.add(label);
-            mediaPanel.add(Box.createVerticalStrut(4));
         }
 
         /** 把图片添加到媒体面板（独立绘制 + 右键菜单） */
@@ -2973,8 +3080,10 @@ public class AiChatPanel extends AbstractCommandPanel {
                 });
             }
 
+            imgPanel.putClientProperty("isMedia", "true");
+            imgPanel.putClientProperty("origW", source.getWidth());
+            imgPanel.putClientProperty("origH", source.getHeight());
             mediaPanel.add(imgPanel);
-            mediaPanel.add(Box.createVerticalStrut(8));
             revalidateAndRepaint();
             if (onRevalidate != null) onRevalidate.run();
         }
@@ -2985,8 +3094,10 @@ public class AiChatPanel extends AbstractCommandPanel {
             int contentW = getContentPaneWidth();
             if (contentW < 240) contentW = 240;
             ChatVideoPlayer player = new ChatVideoPlayer(videoUrl, contentW);
+            player.putClientProperty("isMedia", "true");
+            player.putClientProperty("origW", 16);
+            player.putClientProperty("origH", 9);
             mediaPanel.add(player);
-            mediaPanel.add(Box.createVerticalStrut(8));
             revalidateAndRepaint();
             if (onRevalidate != null) onRevalidate.run();
         }
@@ -2998,8 +3109,129 @@ public class AiChatPanel extends AbstractCommandPanel {
             errLabel.setForeground(new Color(0xFFA726));
             errLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
             mediaPanel.add(errLabel);
-            mediaPanel.add(Box.createVerticalStrut(4));
             revalidateAndRepaint();
+        }
+
+        // ==================== 媒体网格布局 ====================
+
+        /** 自定义网格布局：1张全宽，2张各半，3+每行最多3列等宽 */
+        private void doMediaGridLayout() {
+            Insets ins = mediaPanel.getInsets();
+            int totalW = mediaPanel.getWidth() - ins.left - ins.right;
+            if (totalW <= 0) return;
+
+            int gap = 6;
+
+            // 收集可见的媒体组件（图片/视频）
+            java.util.List<Component> mediaComps = new java.util.ArrayList<>();
+            for (Component c : mediaPanel.getComponents()) {
+                if (c.isVisible() && c instanceof JComponent jc
+                        && "true".equals(jc.getClientProperty("isMedia"))) {
+                    mediaComps.add(c);
+                }
+            }
+
+            int count = mediaComps.size();
+            int cols = count <= 1 ? 1 : count == 2 ? 2 : 3;
+
+            int y = ins.top;
+
+            if (count > 0) {
+                int cellW = (totalW - (cols - 1) * gap) / cols;
+                int x = ins.left, rowMaxH = 0, colIdx = 0;
+
+                for (Component c : mediaComps) {
+                    if (colIdx >= cols) {
+                        x = ins.left;
+                        y += rowMaxH + gap;
+                        rowMaxH = 0;
+                        colIdx = 0;
+                    }
+                    int cellH = calcMediaHeight(c, cellW);
+                    rowMaxH = Math.max(rowMaxH, cellH);
+                    c.setBounds(x, y, cellW, cellH);
+                    x += cellW + gap;
+                    colIdx++;
+                }
+                y += rowMaxH + gap;
+            }
+
+            // 非媒体组件放在网格下方，全宽排列
+            for (Component c : mediaPanel.getComponents()) {
+                if (!c.isVisible()) continue;
+                if (c instanceof JComponent jc && "true".equals(jc.getClientProperty("isMedia"))) continue;
+                if (c instanceof Box.Filler) continue; // 跳过遗留的间隔
+                Dimension pref = c.getPreferredSize();
+                c.setBounds(ins.left, y, totalW, pref.height);
+                y += pref.height + 2;
+            }
+        }
+
+        /** 根据原始宽高比计算媒体组件在给定列宽下的高度 */
+        private int calcMediaHeight(Component c, int cellW) {
+            if (c instanceof JComponent jc) {
+                Integer ow = (Integer) jc.getClientProperty("origW");
+                Integer oh = (Integer) jc.getClientProperty("origH");
+                if (ow != null && oh != null && ow > 0) {
+                    int h = (int) ((long) oh * cellW / ow);
+                    return Math.min(h, 600);
+                }
+            }
+            Dimension pref = c.getPreferredSize();
+            if (pref.width > 0 && cellW > 0) {
+                int h = (int) ((long) pref.height * cellW / pref.width);
+                return Math.min(h, 600);
+            }
+            return pref.height > 0 ? Math.min(pref.height, 600) : 200;
+        }
+
+        /** 计算网格的总 preferredSize（给 BoxLayout 父容器使用） */
+        private Dimension calcMediaGridPreferredSize() {
+            Insets ins = mediaPanel.getInsets();
+            int totalW = getContentPaneWidth();
+            if (totalW <= 0) totalW = 400;
+
+            int gap = 6;
+
+            // 收集可见的媒体组件
+            java.util.List<Component> mediaComps = new java.util.ArrayList<>();
+            for (Component c : mediaPanel.getComponents()) {
+                if (c.isVisible() && c instanceof JComponent jc
+                        && "true".equals(jc.getClientProperty("isMedia"))) {
+                    mediaComps.add(c);
+                }
+            }
+
+            int count = mediaComps.size();
+            int cols = count <= 1 ? 1 : count == 2 ? 2 : 3;
+            int totalH = ins.top;
+
+            if (count > 0) {
+                int cellW = (totalW - (cols - 1) * gap) / cols;
+                int rowMaxH = 0, colIdx = 0;
+                for (Component c : mediaComps) {
+                    if (colIdx >= cols) {
+                        totalH += rowMaxH + gap;
+                        rowMaxH = 0;
+                        colIdx = 0;
+                    }
+                    int cellH = calcMediaHeight(c, cellW);
+                    rowMaxH = Math.max(rowMaxH, cellH);
+                    colIdx++;
+                }
+                totalH += rowMaxH + gap;
+            }
+
+            // 非媒体组件高度
+            for (Component c : mediaPanel.getComponents()) {
+                if (!c.isVisible()) continue;
+                if (c instanceof JComponent jc && "true".equals(jc.getClientProperty("isMedia"))) continue;
+                if (c instanceof Box.Filler) continue;
+                totalH += c.getPreferredSize().height + 2;
+            }
+
+            totalH += ins.bottom;
+            return new Dimension(totalW, Math.max(totalH, 10));
         }
 
         /** 重新计算布局（内容尺寸变化后调用）。仅在可见时触发重绘，避免隐藏 Tab 时闪烁。 */
@@ -3077,9 +3309,13 @@ public class AiChatPanel extends AbstractCommandPanel {
             contentPane.setOpaque(false);
             contentPane.add(this.contentArea);
 
-            // 媒体面板（图片/视频容器）
-            this.mediaPanel = new JPanel();
-            this.mediaPanel.setLayout(new BoxLayout(this.mediaPanel, BoxLayout.Y_AXIS));
+            // 媒体面板（图片/视频容器）——自适应网格：1张全宽，2张各半，3+每行最多3列
+            this.mediaPanel = new JPanel(null) {
+                @Override
+                public void doLayout() { doMediaGridLayout(); }
+                @Override
+                public Dimension getPreferredSize() { return calcMediaGridPreferredSize(); }
+            };
             this.mediaPanel.setOpaque(false);
             this.mediaPanel.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0));
             contentPane.add(this.mediaPanel);
@@ -3576,6 +3812,12 @@ public class AiChatPanel extends AbstractCommandPanel {
         private volatile boolean seekRequested = false;  // 是否请求了 seek
         private javax.swing.Timer seekUpdateTimer;       // 定时刷新进度条
 
+        // 音频相关
+        private volatile int audioSampleRate = 44100;
+        private volatile int audioChannels = 2;
+        private volatile boolean hasAudio = false;
+        private SourceDataLine audioLine;
+
         ChatVideoPlayer(String videoUrl, int contentWidth) {
             this.videoUrl = videoUrl;
 
@@ -3922,18 +4164,20 @@ public class AiChatPanel extends AbstractCommandPanel {
             seekRequested = false;
             updatePlayPauseBtn();
 
-            // 使用本地文件（已预下载），没有则回退到 URL
-            String source = localVideoFile != null ? localVideoFile.getAbsolutePath() : videoUrl;
-            boolean isReplay = grabber != null; // 之前解过码说明是重播
+            // 使用本地文件（已预下载），没有则回退到 URL；验证本地文件确实存在
+            final String source;
+            if (localVideoFile != null && localVideoFile.exists() && localVideoFile.length() > 0) {
+                source = localVideoFile.getAbsolutePath();
+            } else {
+                source = videoUrl;
+            }
             final long targetSeekMs = seekToMs; // 捕获 seek 目标
             seekToMs = -1; // 消费掉
 
             grabThread = new Thread(() -> {
                 try {
-                    if (isReplay) {
-                        // 重播 / seek：释放旧 grabber，重新创建
-                        disposeGrabber();
-                    }
+                    disposeGrabber();
+                    closeAudioLine();
 
                     grabber = new FFmpegFrameGrabber(source);
                     grabber.start();
@@ -3955,12 +4199,23 @@ public class AiChatPanel extends AbstractCommandPanel {
                         totalDurationMs = (long) (totalFramesHint / videoFps * 1000);
                     }
 
+                    // 获取音频信息
+                    audioSampleRate = grabber.getSampleRate();
+                    audioChannels = grabber.getAudioChannels();
+                    hasAudio = (audioSampleRate > 0 && audioChannels > 0);
+                    if (audioSampleRate <= 0) audioSampleRate = 44100;
+                    if (audioChannels <= 0) audioChannels = 2;
+
                     // 处理 seek 跳转
                     int frameCount = 0;
                     if (targetSeekMs > 0 && targetSeekMs < totalDurationMs) {
                         grabber.setTimestamp(targetSeekMs * 1000); // 微秒
                         frameCount = (int) (targetSeekMs * videoFps / 1000);
                         currentPositionMs = targetSeekMs;
+                        // seek 后清空音频缓冲
+                        if (audioLine != null) {
+                            try { audioLine.flush(); } catch (Exception ignored) {}
+                        }
                     } else {
                         currentPositionMs = 0;
                     }
@@ -4004,45 +4259,50 @@ public class AiChatPanel extends AbstractCommandPanel {
                                     break;
                                 }
 
-                                if (frame.image == null) continue;
+                                // 处理视频帧
+                                if (frame.image != null) {
+                                    frameCount++;
+                                    currentPositionMs = (long) (frameCount / videoFps * 1000);
+                                    if (currentPositionMs > totalDurationMs) currentPositionMs = totalDurationMs;
 
-                                frameCount++;
-                                currentPositionMs = (long) (frameCount / videoFps * 1000);
-                                if (currentPositionMs > totalDurationMs) currentPositionMs = totalDurationMs;
-
-                                // 视频帧转换
-                                BufferedImage img;
-                                Mat mat = matConverter.convert(frame);
-                                if (mat != null) {
-                                    int cw = canvas.getWidth();
-                                    int ch = canvas.getHeight();
-                                    if (cw > 0 && ch > 0) {
-                                        Mat resizedMat = new Mat();
-                                        Start.resizeCv(mat, resizedMat, new Size(cw, ch));
-                                        Frame rf = matConverter.convert(resizedMat);
-                                        img = converter.convert(rf);
-                                        resizedMat.release();
+                                    // 视频帧转换
+                                    BufferedImage img;
+                                    Mat mat = matConverter.convert(frame);
+                                    if (mat != null) {
+                                        int cw = canvas.getWidth();
+                                        int ch = canvas.getHeight();
+                                        if (cw > 0 && ch > 0) {
+                                            Mat resizedMat = new Mat();
+                                            Start.resizeCv(mat, resizedMat, new Size(cw, ch));
+                                            Frame rf = matConverter.convert(resizedMat);
+                                            img = converter.convert(rf);
+                                            resizedMat.release();
+                                        } else {
+                                            img = converter.convert(frame);
+                                        }
+                                        mat.release();
                                     } else {
                                         img = converter.convert(frame);
                                     }
-                                    mat.release();
-                                } else {
-                                    img = converter.convert(frame);
-                                }
 
-                                if (img != null) {
-                                    img = toScreenCompatible(img);
-                                    currentFrame = img;
-                                    throttleRepaint();
-                                }
+                                    if (img != null) {
+                                        img = toScreenCompatible(img);
+                                        currentFrame = img;
+                                        throttleRepaint();
+                                    }
 
-                                // 帧率控制
-                                long now = System.nanoTime();
-                                if (now < nextFrameNanos) {
-                                    long sleepMs = (nextFrameNanos - now) / 1_000_000;
-                                    if (sleepMs > 0) Thread.sleep(sleepMs);
+                                    // 帧率控制
+                                    long now = System.nanoTime();
+                                    if (now < nextFrameNanos) {
+                                        long sleepMs = (nextFrameNanos - now) / 1_000_000;
+                                        if (sleepMs > 0) Thread.sleep(sleepMs);
+                                    }
+                                    nextFrameNanos = Math.max(now, nextFrameNanos) + frameIntervalNanos;
+                                } else if (frame.samples != null) {
+                                    // 处理音频帧（内部延迟初始化音频设备）
+                                    writeAudioFrame(frame);
                                 }
-                                nextFrameNanos = Math.max(now, nextFrameNanos) + frameIntervalNanos;
+                                // 否则是 data/subtitle 帧等，直接跳过
                             } catch (InterruptedException ie) {
                                 // seek 等操作触发的中断 → 静默退出循环
                                 running = false;
@@ -4054,6 +4314,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                         try { matConverter.close(); } catch (Exception ignored) {}
                     }
                 } catch (Exception e) {
+                    System.err.println("[视频播放] 异常: " + e.getMessage());
+                    e.printStackTrace();
                     if (!seekRequested) {
                         // 非 seek 导致的异常才报错
                         SwingUtilities.invokeLater(() -> {
@@ -4068,6 +4330,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     }
                 } finally {
                     disposeGrabber();
+                    closeAudioLine();
                     if (!seekRequested) {
                         stopSeekUpdateTimer();
                     }
@@ -4078,6 +4341,60 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             // 启动进度条定时刷新
             startSeekUpdateTimer();
+        }
+
+        private volatile boolean audioInitAttempted = false; // 避免重复尝试初始化音频
+
+        /** 将音频帧写入 SourceDataLine 播放（延迟初始化音频设备，避免阻塞视频启动） */
+        private void writeAudioFrame(Frame frame) {
+            if (frame.samples == null || !hasAudio) return;
+            try {
+                // 延迟初始化音频：第一次遇到音频帧时才打开音频设备
+                if (audioLine == null && !audioInitAttempted) {
+                    audioInitAttempted = true;
+                    try {
+                        AudioFormat af = new AudioFormat(
+                                (float) audioSampleRate, 16, audioChannels, true, false);
+                        audioLine = AudioSystem.getSourceDataLine(af);
+                        audioLine.open(af, audioSampleRate * audioChannels * 2 / 10);
+                        audioLine.start();
+                    } catch (Exception e) {
+                        System.err.println("[音频] 初始化失败 (视频静音播放): " + e.getMessage());
+                        audioLine = null;
+                        return; // 初始化失败，跳过本帧
+                    }
+                }
+                if (audioLine == null) return;
+
+                for (int c = 0; c < frame.samples.length; c++) {
+                    java.nio.Buffer buf = frame.samples[c];
+                    if (!(buf instanceof ShortBuffer sb)) continue;
+                    int len = sb.remaining();
+                    if (len <= 0) continue;
+                    short[] data = new short[len];
+                    sb.get(data);
+                    byte[] byteData = new byte[len * 2];
+                    for (int i = 0; i < len; i++) {
+                        short s = data[i];
+                        byteData[i * 2] = (byte) (s & 0xFF);
+                        byteData[i * 2 + 1] = (byte) ((s >> 8) & 0xFF);
+                    }
+                    audioLine.write(byteData, 0, byteData.length);
+                }
+            } catch (Exception ignored) {
+                // 音频写入失败静默处理，不影响视频播放
+            }
+        }
+
+        /** 关闭音频输出线 */
+        private void closeAudioLine() {
+            if (audioLine != null) {
+                try { audioLine.stop(); } catch (Exception ignored) {}
+                try { audioLine.flush(); } catch (Exception ignored) {}
+                try { audioLine.close(); } catch (Exception ignored) {}
+                audioLine = null;
+            }
+            audioInitAttempted = false;
         }
 
         private void disposeGrabber() {
@@ -4151,13 +4468,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         /** 后台预下载视频到本地临时文件，并抓取首帧作为缩略图 */
         private void startPreload() {
             Thread.ofVirtual().start(() -> {
+                boolean downloadOk = false;
                 try {
-                    // 1. 下载视频到临时文件
+                    // === 阶段1：下载视频到临时文件 ===
                     HttpClient client = HttpClient.newBuilder()
                             .followRedirects(HttpClient.Redirect.NORMAL)
                             .build();
                     HttpRequest req = HttpRequest.newBuilder(URI.create(videoUrl))
-                            .timeout(java.time.Duration.ofSeconds(300))
+                            .timeout(java.time.Duration.ofSeconds(600))
                             .GET().build();
 
                     HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
@@ -4194,8 +4512,22 @@ public class AiChatPanel extends AbstractCommandPanel {
                             SwingUtilities.invokeLater(canvas::repaint);
                         }
                     }
+                    downloadOk = true;
+                } catch (Exception e) {
+                    // 下载阶段失败 → 清除文件引用，降级到在线播放
+                    System.err.println("[视频预加载] 下载失败: " + e.getMessage());
+                    localVideoFile = null;
+                    placeholderText = "下载失败，将在线播放";
+                    ready = true;
+                    SwingUtilities.invokeLater(() -> {
+                        statusLabel.setText("在线模式");
+                        canvas.repaint();
+                    });
+                    return;
+                }
 
-                    // 2. 初始化 grabber + 抓取首帧缩略图
+                // === 阶段2：FFmpeg 解析元数据 + 抓首帧缩略图（文件已下载好） ===
+                try {
                     placeholderText = "正在解析视频...";
                     downloadProgress = 1.0;
                     SwingUtilities.invokeLater(canvas::repaint);
@@ -4208,6 +4540,20 @@ public class AiChatPanel extends AbstractCommandPanel {
                     if (fps > 1 && fps < 200) videoFps = fps;
                     if (videoW <= 0) videoW = 640;
                     if (videoH <= 0) videoH = 360;
+
+                    // 获取总时长（用于进度条）
+                    long lenTime = grabber.getLengthInTime(); // 微秒
+                    totalDurationMs = lenTime > 0 ? lenTime / 1000 : 0;
+                    long totalFramesHint = grabber.getLengthInFrames();
+                    if (totalDurationMs <= 0 && totalFramesHint > 0 && videoFps > 0) {
+                        totalDurationMs = (long) (totalFramesHint / videoFps * 1000);
+                    }
+                    // 获取音频信息
+                    audioSampleRate = grabber.getSampleRate();
+                    audioChannels = grabber.getAudioChannels();
+                    hasAudio = (audioSampleRate > 0 && audioChannels > 0);
+                    if (audioSampleRate <= 0) audioSampleRate = 44100;
+                    if (audioChannels <= 0) audioChannels = 2;
 
                     // 抓第一帧
                     Frame firstFrame = grabber.grab();
@@ -4222,25 +4568,27 @@ public class AiChatPanel extends AbstractCommandPanel {
                     grabber.stop();
                     grabber.release();
                     grabber = null;
-
-                    // 3. 标记就绪
-                    ready = true;
-                    final String savedPath = localVideoFile.getAbsolutePath();
-                    SwingUtilities.invokeLater(() -> {
-                        savePathLabel.setText("[已保存] 文件已自动保存至: " + savedPath);
-                        savePathLabel.setToolTipText("单击打开文件夹");
-                        statusLabel.setText("就绪 - 点击播放");
-                        canvas.repaint();
-                    });
                 } catch (Exception e) {
-                    // 下载失败，降级到在线播放
-                    placeholderText = "下载失败，将在线播放";
-                    ready = true; // 允许点击播放（降级到 URL 模式）
-                    SwingUtilities.invokeLater(() -> {
-                        statusLabel.setText("在线模式");
-                        canvas.repaint();
-                    });
+                    // FFmpeg 解析失败不影响播放——文件本身是好的，播放时再重新打开
+                    System.err.println("[视频预加载] 元数据解析失败（不影响播放）: " + e.getMessage());
+                    if (grabber != null) {
+                        try { grabber.stop(); } catch (Exception ignored) {}
+                        try { grabber.release(); } catch (Exception ignored) {}
+                        grabber = null;
+                    }
                 }
+
+                // === 阶段3：标记就绪（文件已下载，可以用本地文件播放） ===
+                ready = true;
+                final long finalDuration = totalDurationMs;
+                final String savedPath = localVideoFile.getAbsolutePath();
+                SwingUtilities.invokeLater(() -> {
+                    savePathLabel.setText("[已保存] 文件已自动保存至: " + savedPath);
+                    savePathLabel.setToolTipText("单击打开文件夹");
+                    updateTimeLabel(totalTimeLabel, finalDuration);
+                    statusLabel.setText("就绪 - 点击播放");
+                    canvas.repaint();
+                });
             });
         }
 
@@ -4256,6 +4604,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 grabThread = null;
             }
             disposeGrabber();
+            closeAudioLine();
             currentFrame = null;
             currentPositionMs = 0;
             totalDurationMs = 0;

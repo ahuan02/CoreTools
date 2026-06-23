@@ -47,16 +47,20 @@ public class Start {
 
                 int cw = getWidth(), ch = getHeight();
                 if (cw > 0 && ch > 0) {
-                    // 主标题
+                    // 主标题（蓝紫渐变）
                     g2.setFont(new Font("Microsoft YaHei", Font.BOLD, 52));
-                    g2.setColor(new Color(0xDD, 0xDD, 0xDD, alpha[0]));
                     FontMetrics fmTitle = g2.getFontMetrics();
                     String title = "CoreTools";
-                    g2.drawString(title, (cw - fmTitle.stringWidth(title)) / 2, ch / 2 - 30);
+                    int titleX = (cw - fmTitle.stringWidth(title)) / 2;
+                    int titleY = ch / 2 - 30;
+                    GradientPaint titleGp = new GradientPaint(
+                            titleX, titleY, new Color(0x66, 0x7E, 0xEA, alpha[0]),
+                            titleX + fmTitle.stringWidth(title), titleY, new Color(0x76, 0x4B, 0xA2, alpha[0]));
+                    g2.setPaint(titleGp);
+                    g2.drawString(title, titleX, titleY);
 
-                    // 副标题：累加点（根据加载进度）+ 计数
+                    // 副标题：累加点（根据加载进度）+ 计数（青紫渐变）
                     g2.setFont(new Font("Microsoft YaHei", Font.PLAIN, 20));
-                    g2.setColor(new Color(0x99, 0x99, 0x99, alpha[0]));
                     FontMetrics fmSub = g2.getFontMetrics();
 
                     int n = loadedCount[0];
@@ -65,7 +69,13 @@ public class Start {
                     for (int i = 0; i < dotCount; i++) dots.append(i > 0 ? " ·" : "·");
 
                     String subText = "工具模块加载中 " + dots + "  " + n + "/" + totalTabs;
-                    g2.drawString(subText, (cw - fmSub.stringWidth(subText)) / 2, ch / 2 + 20);
+                    int subX = (cw - fmSub.stringWidth(subText)) / 2;
+                    int subY = ch / 2 + 20;
+                    GradientPaint subGp = new GradientPaint(
+                            subX, subY, new Color(0x74, 0xEB, 0xD5, alpha[0]),
+                            subX + fmSub.stringWidth(subText), subY, new Color(0x9F, 0xAC, 0xE6, alpha[0]));
+                    g2.setPaint(subGp);
+                    g2.drawString(subText, subX, subY);
                 }
 
                 g2.dispose();

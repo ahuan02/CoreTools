@@ -36,8 +36,8 @@ public class AgnesVideoService {
     public static final String POLL_ENDPOINT = "/agnesapi";
     public static final String DEFAULT_MODEL = "agnes-video-v2.0";
 
-    /** 创建任务超时 */
-    private static final Duration CREATE_TIMEOUT = Duration.ofSeconds(120);
+    /** 创建任务超时（复杂视频 API 可能响应较慢） */
+    private static final Duration CREATE_TIMEOUT = Duration.ofSeconds(300);
     /** 轮询请求超时 */
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(60);
     /** 默认轮询间隔（毫秒） */
