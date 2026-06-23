@@ -23,7 +23,7 @@ public class AgnesVideoRequest {
     private Integer height;
     /** 视频宽度，默认 1152 */
     private Integer width;
-    /** 视频帧数，≤441，满足 8n+1 */
+    /** 视频帧数，满足8n+1，上限取决于分辨率：1080p≤169 / 720p≤409 / 480p≤961 */
     private Integer numFrames;
     /** 视频 FPS，1–60 */
     private Double frameRate;

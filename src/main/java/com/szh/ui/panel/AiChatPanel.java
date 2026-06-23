@@ -1729,6 +1729,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         private JScrollPane imgUrlScroll;
         private JLabel vidUrlLabel;
         private JScrollPane vidUrlScroll;
+        private JLabel vidUrlHint;
 
         ModelConfigDialog(Window owner, ModelConfig editing) {
             super(owner, editing == null ? "添加模型" : "编辑模型", ModalityType.APPLICATION_MODAL);
@@ -1986,7 +1987,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             g.gridx = 1; g.weightx = 1;
             vidDurCombo = new JComboBox<>(new String[]{
                     "约 3 秒 (81帧@24fps)", "约 5 秒 (121帧@24fps)",
-                    "约 10 秒 (241帧@24fps)", "约 18 秒 (441帧@24fps)"
+                    "约 10 秒 (241帧@24fps)", "约 17 秒 (409帧@24fps)"
             });
             vidDurCombo.setFont(NetUtil.FONT_TEXT);
             vidDurCombo.setForeground(NetUtil.TEXT_COLOR);
@@ -2047,18 +2048,27 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidUrlScroll.setPreferredSize(new Dimension(300, 45));
             p.add(vidUrlScroll, g);
 
+            // 图片URL输入提示
+            g.gridx = 1; g.gridy = 5; g.weightx = 1;
+            vidUrlHint = new JLabel("提示：每行填写一个URL，关键帧动画/多图视频至少需要2张");
+            vidUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            vidUrlHint.setForeground(new Color(180, 180, 180));
+            p.add(vidUrlHint, g);
+
             vidModeCombo.addActionListener(e -> {
                 boolean show = !"文生视频".equals(vidModeCombo.getSelectedItem());
                 vidUrlLabel.setVisible(show);
                 vidUrlScroll.setVisible(show);
+                vidUrlHint.setVisible(show);
                 p.revalidate(); p.repaint();
                 pack();
             });
             vidUrlLabel.setVisible(false);
             vidUrlScroll.setVisible(false);
+            vidUrlHint.setVisible(false);
 
             // Seed
-            g.gridx = 0; g.gridy = 5; g.weightx = 0;
+            g.gridx = 0; g.gridy = 6; g.weightx = 0;
             JLabel seedLbl = new JLabel("Seed：");
             seedLbl.setFont(NetUtil.FONT_TEXT); seedLbl.setForeground(NetUtil.TEXT_COLOR);
             p.add(seedLbl, g);
@@ -2526,9 +2536,13 @@ public class AiChatPanel extends AbstractCommandPanel {
         private void loadImageAsync(String imageUrl) {
             Thread.ofVirtual().start(() -> {
                 try {
-                    BufferedImage img = downloadImage(imageUrl);
-                    if (img != null) {
-                        SwingUtilities.invokeLater(() -> addImageToPanel(img, imageUrl));
+                    LoadedImage loaded = downloadImage(imageUrl);
+                    if (loaded != null && loaded.image != null) {
+                        SwingUtilities.invokeLater(() -> {
+                            // 显示保存路径
+                            addSavedPathLabel(loaded.localPath);
+                            addImageToPanel(loaded.image, imageUrl);
+                        });
                     }
                 } catch (Exception e) {
                     SwingUtilities.invokeLater(() -> addMediaError("图片加载失败: " + imageUrl, e));
@@ -2536,8 +2550,23 @@ public class AiChatPanel extends AbstractCommandPanel {
             });
         }
 
-        /** 下载图片（支持 HTTP/HTTPS URL） */
-        private static BufferedImage downloadImage(String url) throws IOException, InterruptedException {
+        /** 下载图片到本地 agnes_img/ 目录，返回图片 + 本地路径 */
+        private static LoadedImage downloadImage(String url) throws IOException, InterruptedException {
+            java.io.File imgDir = getImgDir();
+
+            // 推断扩展名
+            String ext = ".png";
+            String path = url;
+            int qIdx = path.indexOf('?');
+            if (qIdx > 0) path = path.substring(0, qIdx);
+            int dotIdx = path.lastIndexOf('.');
+            if (dotIdx > 0) {
+                String e = path.substring(dotIdx).toLowerCase();
+                if (e.matches("\\.[a-z]{3,4}")) ext = e;
+            }
+
+            java.io.File localFile = new java.io.File(imgDir, "agnes_img_" + System.currentTimeMillis() + ext);
+
             HttpClient client = HttpClient.newBuilder()
                     .connectTimeout(Duration.ofSeconds(10))
                     .followRedirects(HttpClient.Redirect.NORMAL)
@@ -2548,9 +2577,50 @@ public class AiChatPanel extends AbstractCommandPanel {
                     .build();
             HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
             if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode());
-            try (InputStream in = resp.body()) {
-                return ImageIO.read(in);
+
+            // 先写入本地文件，再从本地文件读取
+            try (InputStream in = resp.body();
+                 java.io.FileOutputStream fos = new java.io.FileOutputStream(localFile)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    fos.write(buf, 0, n);
+                }
             }
+
+            BufferedImage img = ImageIO.read(localFile);
+            if (img == null) throw new IOException("无法解析图片: " + url);
+            return new LoadedImage(img, localFile.getAbsolutePath());
+        }
+
+        /** 下载结果：图片 + 本地保存路径 */
+        private static class LoadedImage {
+            final BufferedImage image;
+            final String localPath;
+            LoadedImage(BufferedImage image, String localPath) {
+                this.image = image;
+                this.localPath = localPath;
+            }
+        }
+
+        /** 在媒体面板中添加"已保存至 xxx"的提示标签 */
+        private void addSavedPathLabel(String localPath) {
+            if (mediaPanel == null) return;
+            JLabel label = new JLabel("📁 文件已自动保存至: " + localPath);
+            label.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+            label.setForeground(new Color(0x888888));
+            label.setToolTipText("单击打开文件夹");
+            label.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            label.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    try {
+                        Desktop.getDesktop().open(new java.io.File(localPath).getParentFile());
+                    } catch (Exception ignored) {}
+                }
+            });
+            mediaPanel.add(label);
+            mediaPanel.add(Box.createVerticalStrut(4));
         }
 
         /** 把图片添加到媒体面板（独立绘制 + 右键菜单） */
@@ -2894,21 +2964,114 @@ public class AiChatPanel extends AbstractCommandPanel {
 
     // ==================== 文本气泡内容面板（自定义绘制，替代 RSyntaxTextArea） ====================
 
-    /** 聊天消息文本内容面板，纯 Graphics2D 绘制，无嵌套文本域 */
+    /** 聊天消息文本内容面板，纯 Graphics2D 绘制，支持鼠标选中文本并复制 */
     private static class TextBubbleContent extends JPanel {
         private static final int PADDING = 6;
+        private static final Color SEL_BG = new Color(0x4A6FA5);       // 选中背景
+        private static final Color SEL_TEXT = new Color(0xFFFFFF);      // 选中文字色
 
         private final StringBuilder buffer = new StringBuilder();
         private Color textColor = new Color(0xEAEAEA);
         private int lineHeight;
         private List<String> wrappedLines = new ArrayList<>();
+        private List<Integer> lineOffsets = new ArrayList<>();  // 每行在 buffer 中的起始位置
         private int targetWidth = 400;
+
+        // 文本选中
+        private int selStart = -1, selEnd = -1;
+        private final JPopupMenu popupMenu;
 
         TextBubbleContent(String initialText) {
             setOpaque(false);
             buffer.append(initialText);
             setFont(NetUtil.FONT_TEXT);
             updateMetrics();
+            setFocusable(true);
+            requestFocusInWindow();
+
+            // 右键菜单
+            popupMenu = new JPopupMenu();
+            JMenuItem copyItem = new JMenuItem("复制");
+            copyItem.addActionListener(e -> copySelection());
+            popupMenu.add(copyItem);
+            JMenuItem selectAllItem = new JMenuItem("全选");
+            selectAllItem.addActionListener(e -> selectAll());
+            popupMenu.add(selectAllItem);
+            setComponentPopupMenu(popupMenu);
+
+            // 鼠标选中
+            MouseAdapter selMouse = new MouseAdapter() {
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    if (SwingUtilities.isLeftMouseButton(e)) {
+                        requestFocusInWindow();
+                        selStart = selEnd = charAtPoint(e.getPoint());
+                        repaint();
+                    }
+                }
+                @Override
+                public void mouseDragged(MouseEvent e) {
+                    if (SwingUtilities.isLeftMouseButton(e)) {
+                        selEnd = charAtPoint(e.getPoint());
+                        repaint();
+                    }
+                }
+            };
+            addMouseListener(selMouse);
+            addMouseMotionListener(selMouse);
+
+            // Ctrl+C / Ctrl+A
+            getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_C, InputEvent.CTRL_DOWN_MASK), "copy");
+            getActionMap().put("copy", new AbstractAction() {
+                @Override
+                public void actionPerformed(ActionEvent e) { copySelection(); }
+            });
+            getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_A, InputEvent.CTRL_DOWN_MASK), "selectAll");
+            getActionMap().put("selectAll", new AbstractAction() {
+                @Override
+                public void actionPerformed(ActionEvent e) { selectAll(); }
+            });
+        }
+
+        private void selectAll() {
+            selStart = 0;
+            selEnd = buffer.length();
+            repaint();
+        }
+
+        private void copySelection() {
+            if (selStart < 0 || selEnd < 0 || selStart == selEnd) return;
+            int s = Math.min(selStart, selEnd);
+            int e = Math.max(selStart, selEnd);
+            if (e > buffer.length()) e = buffer.length();
+            String selected = buffer.substring(s, e);
+            Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(selected), null);
+        }
+
+        /** 根据鼠标坐标计算缓冲区字符偏移 */
+        private int charAtPoint(Point p) {
+            int lineIdx = (p.y - PADDING) / lineHeight;
+            if (lineIdx < 0) lineIdx = 0;
+            if (lineIdx >= wrappedLines.size()) lineIdx = wrappedLines.size() - 1;
+            if (lineIdx < 0) return 0;
+
+            String line = wrappedLines.get(lineIdx);
+            int baseOffset = lineOffsets.get(lineIdx);
+            FontMetrics fm = getFontMetrics(getFont());
+            int x = p.x - PADDING;
+
+            // 二分查找字符位置
+            int lo = 0, hi = line.length();
+            while (lo < hi) {
+                int mid = (lo + hi + 1) / 2;
+                if (fm.stringWidth(line.substring(0, mid)) <= x) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return baseOffset + lo;
         }
 
         private void updateMetrics() {
@@ -2927,6 +3090,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         void setText(String text) {
             buffer.setLength(0);
             buffer.append(text);
+            selStart = selEnd = -1;
             rewrap();
             repaint();
         }
@@ -2939,11 +3103,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         void clear() {
             buffer.setLength(0);
             wrappedLines.clear();
+            lineOffsets.clear();
+            selStart = selEnd = -1;
             repaint();
         }
 
         private void rewrap() {
             wrappedLines.clear();
+            lineOffsets.clear();
             if (buffer.length() == 0) return;
 
             FontMetrics fm = getFontMetrics(getFont());
@@ -2952,18 +3119,23 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             String text = buffer.toString();
             StringBuilder lineBuf = new StringBuilder();
+            int lineStartOffset = 0;
 
             for (int i = 0; i < text.length(); i++) {
                 char ch = text.charAt(i);
                 if (ch == '\n') {
                     wrappedLines.add(lineBuf.toString());
+                    lineOffsets.add(lineStartOffset);
                     lineBuf.setLength(0);
+                    lineStartOffset = i + 1;
                 } else {
                     String tentative = lineBuf.toString() + ch;
                     if (fm.stringWidth(tentative) <= maxW) {
                         lineBuf.append(ch);
                     } else {
                         wrappedLines.add(lineBuf.toString());
+                        lineOffsets.add(lineStartOffset);
+                        lineStartOffset = i;
                         lineBuf.setLength(0);
                         lineBuf.append(ch);
                     }
@@ -2971,9 +3143,11 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
             if (lineBuf.length() > 0) {
                 wrappedLines.add(lineBuf.toString());
+                lineOffsets.add(lineStartOffset);
             }
             if (wrappedLines.isEmpty()) {
                 wrappedLines.add("");
+                lineOffsets.add(0);
             }
         }
 
@@ -3006,21 +3180,82 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         @Override
         protected void paintComponent(Graphics g) {
-            // 不画背景，让气泡渐变直接透出，只绘制文字
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-            g2.setColor(textColor);
             g2.setFont(getFont());
             FontMetrics fm = g2.getFontMetrics();
             int y = fm.getAscent() + PADDING;
 
-            for (String line : wrappedLines) {
-                g2.drawString(line, PADDING, y);
+            // 判断有效的选中范围
+            int s = Math.min(selStart, selEnd);
+            int e = Math.max(selStart, selEnd);
+            boolean hasSelection = s >= 0 && e > s && e <= buffer.length();
+
+            for (int li = 0; li < wrappedLines.size(); li++) {
+                String line = wrappedLines.get(li);
+                int baseOff = lineOffsets.get(li);
+                int lineStartOff = baseOff;
+                int lineEndOff = baseOff + line.length();
+
+                if (hasSelection && s < lineEndOff && e > lineStartOff) {
+                    // 该行有选中部分
+                    int selInLineStart = Math.max(s, lineStartOff) - lineStartOff;
+                    int selInLineEnd = Math.min(e, lineEndOff) - lineStartOff;
+
+                    // 选中前部分
+                    if (selInLineStart > 0) {
+                        String before = line.substring(0, selInLineStart);
+                        int beforeW = fm.stringWidth(before);
+                        g2.setColor(textColor);
+                        g2.drawString(before, PADDING, y);
+                        // 选中部分
+                        String selected = line.substring(selInLineStart, selInLineEnd);
+                        int selW = fm.stringWidth(selected);
+                        g2.setColor(SEL_BG);
+                        g2.fillRect(PADDING + beforeW, y - fm.getAscent(), selW, lineHeight);
+                        g2.setColor(SEL_TEXT);
+                        g2.drawString(selected, PADDING + beforeW, y);
+                        // 选中后部分
+                        if (selInLineEnd < line.length()) {
+                            g2.setColor(textColor);
+                            g2.drawString(line.substring(selInLineEnd), PADDING + beforeW + selW, y);
+                        }
+                    } else {
+                        // 从行首开始选中
+                        String selected = line.substring(selInLineStart, selInLineEnd);
+                        int selW = fm.stringWidth(selected);
+                        g2.setColor(SEL_BG);
+                        g2.fillRect(PADDING, y - fm.getAscent(), selW, lineHeight);
+                        g2.setColor(SEL_TEXT);
+                        g2.drawString(selected, PADDING, y);
+                        if (selInLineEnd < line.length()) {
+                            g2.setColor(textColor);
+                            g2.drawString(line.substring(selInLineEnd), PADDING + selW, y);
+                        }
+                    }
+                } else {
+                    // 无选中，正常绘制
+                    g2.setColor(textColor);
+                    g2.drawString(line, PADDING, y);
+                }
                 y += lineHeight;
             }
 
             g2.dispose();
         }
+    }
+
+    // ==================== 媒体文件本地缓存目录 ====================
+    private static java.io.File getImgDir() {
+        java.io.File dir = new java.io.File(System.getProperty("user.dir"), "agnes_img");
+        if (!dir.exists()) dir.mkdirs();
+        return dir;
+    }
+
+    private static java.io.File getVideoDir() {
+        java.io.File dir = new java.io.File(System.getProperty("user.dir"), "agnes_video");
+        if (!dir.exists()) dir.mkdirs();
+        return dir;
     }
 
     // ==================== 嵌入式视频播放器（FFmpegFrameGrabber） ====================
@@ -3039,13 +3274,20 @@ public class AiChatPanel extends AbstractCommandPanel {
         private final JPanel canvas;
         private final JButton playPauseBtn;
         private final JLabel statusLabel;
+        private final JLabel savePathLabel;
+
+        // 预下载相关
+        private java.io.File localVideoFile;
+        private volatile String placeholderText = "正在下载视频...";
+        private volatile double downloadProgress = 0.0; // 0.0 ~ 1.0
+        private volatile boolean ready = false;    // 下载完成、grabber 已初始化
 
         private FFmpegFrameGrabber grabber;
         private Thread grabThread;
         private volatile boolean running = false;
         private volatile boolean playing = false;
         private volatile boolean videoEnded = false;
-        private BufferedImage currentFrame;
+        private BufferedImage currentFrame;    // 当前帧（播放时）/ 首帧缩略图
         private BufferedImage compatImage;
         private int compatW = -1, compatH = -1;
         private long lastRepaintNanos;
@@ -3072,27 +3314,90 @@ public class AiChatPanel extends AbstractCommandPanel {
                 @Override
                 protected void paintComponent(Graphics g) {
                     super.paintComponent(g);
-                    BufferedImage img = currentFrame;
-                    if (img != null) {
-                        int cw = getWidth(), ch = getHeight();
-                        // 填满画布宽度，保持比例
-                        int dw = cw;
-                        int dh = (int) ((long) videoH * cw / videoW);
-                        if (dh > ch) { dh = ch; dw = (int) ((long) videoW * ch / videoH); }
-                        int dx = (cw - dw) / 2, dy = (ch - dh) / 2;
-                        g.drawImage(img, dx, dy, dw, dh, null);
+                    Graphics2D g2 = (Graphics2D) g;
+                    int cw = getWidth(), ch = getHeight();
+
+                    // 计算视频显示区域
+                    int dw = cw;
+                    int dh = (int) ((long) videoH * cw / videoW);
+                    if (dh > ch) { dh = ch; dw = (int) ((long) videoW * ch / videoH); }
+                    int dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+
+                    if (ready) {
+                        // 已就绪：画缩略图或当前帧
+                        BufferedImage img = currentFrame;
+                        if (img != null) {
+                            g2.drawImage(img, dx, dy, dw, dh, null);
+                        }
+                        // 未播放时绘制播放按钮叠加层
+                        if (!running && !videoEnded) {
+                            g2.setColor(new Color(0, 0, 0, 120));
+                            g2.fillRect(dx, dy, dw, dh);
+                            int r = Math.min(dw, dh) / 5;
+                            int cx = dx + dw / 2, cy = dy + dh / 2;
+                            g2.setColor(new Color(255, 255, 255, 200));
+                            g2.setStroke(new java.awt.BasicStroke(3));
+                            g2.drawOval(cx - r, cy - r, r * 2, r * 2);
+                            // 播放三角形
+                            int[] xp = {cx - r / 3, cx + r * 2 / 3, cx - r / 3};
+                            int[] yp = {cy - r / 2, cy, cy + r / 2};
+                            g2.fillPolygon(xp, yp, 3);
+                        } else if (videoEnded && img != null) {
+                            // 播放完毕遮罩 + 重播按钮
+                            g2.setColor(new Color(0, 0, 0, 100));
+                            g2.fillRect(dx, dy, dw, dh);
+                            int r = Math.min(dw, dh) / 5;
+                            int cx = dx + dw / 2, cy = dy + dh / 2;
+                            g2.setColor(new Color(255, 255, 255, 180));
+                            g2.setStroke(new java.awt.BasicStroke(3));
+                            g2.drawOval(cx - r, cy - r, r * 2, r * 2);
+                            // 重播三角形
+                            int[] xp = {cx - r / 3, cx + r * 2 / 3, cx - r / 3};
+                            int[] yp = {cy - r / 2, cy, cy + r / 2};
+                            g2.fillPolygon(xp, yp, 3);
+                        }
                     } else {
-                        g.setColor(new Color(0xAAAAAA));
-                        g.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
-                        FontMetrics fm = g.getFontMetrics();
-                        String text = videoEnded ? "播放完毕" : "加载中...";
-                        g.drawString(text,
-                                (getWidth() - fm.stringWidth(text)) / 2,
-                                getHeight() / 2);
+                        // 下载中：深色背景 + 进度条
+                        g2.setColor(new Color(0x222222));
+                        g2.fillRect(dx, dy, dw, dh);
+                        g2.setColor(new Color(0xAAAAAA));
+                        g2.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+                        FontMetrics fm = g2.getFontMetrics();
+                        String text = placeholderText;
+                        g2.drawString(text,
+                                (cw - fm.stringWidth(text)) / 2,
+                                ch / 2 - 16);
+
+                        // 进度条
+                        int barW = dw * 2 / 3;
+                        int barX = dx + (dw - barW) / 2;
+                        int barY = ch / 2 + 6;
+                        int barH = 6;
+                        g2.setColor(new Color(0x555555));
+                        g2.fillRoundRect(barX, barY, barW, barH, 4, 4);
+                        g2.setColor(C_PRIMARY);
+                        int fillW = (int) (barW * downloadProgress);
+                        if (fillW > 0) g2.fillRoundRect(barX, barY, fillW, barH, 4, 4);
                     }
                 }
             };
             canvas.setOpaque(false);
+
+            // 点击画布播放/暂停
+            canvas.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (!ready || SwingUtilities.isRightMouseButton(e)) return;
+                    if (running && !videoEnded) {
+                        playing = !playing;
+                        updatePlayPauseBtn();
+                    } else if (videoEnded) {
+                        startVideo();
+                    } else {
+                        startVideo();
+                    }
+                }
+            });
 
             // 右键菜单
             JPopupMenu videoPopup = new JPopupMenu();
@@ -3144,6 +3449,25 @@ public class AiChatPanel extends AbstractCommandPanel {
             canvas.setComponentPopupMenu(videoPopup);
             canvas.setToolTipText("右键菜单 | 单击播放/暂停");
 
+            // 保存路径提示标签（预下载完成后显示）
+            savePathLabel = new JLabel();
+            savePathLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+            savePathLabel.setForeground(new Color(0x888888));
+            savePathLabel.setOpaque(false);
+            savePathLabel.setBorder(BorderFactory.createEmptyBorder(2, 0, 4, 0));
+            savePathLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            savePathLabel.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (localVideoFile != null) {
+                        try {
+                            Desktop.getDesktop().open(localVideoFile.getParentFile());
+                        } catch (Exception ignored) {}
+                    }
+                }
+            });
+            add(savePathLabel, BorderLayout.NORTH);
+
             add(canvas, BorderLayout.CENTER);
 
             // ---- 底部控制栏 ----
@@ -3161,6 +3485,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             playPauseBtn.setFocusable(false);
             playPauseBtn.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 8));
             playPauseBtn.addActionListener(e -> {
+                if (!ready) return; // 还没下载完，不响应
                 if (running && !videoEnded) {
                     playing = !playing;
                     updatePlayPauseBtn();
@@ -3190,6 +3515,9 @@ public class AiChatPanel extends AbstractCommandPanel {
             setPreferredSize(new Dimension(dispW, dispH + 36));
             setMaximumSize(new Dimension(Integer.MAX_VALUE, dispH + 36));
             setMinimumSize(new Dimension(240, 200));
+
+            // 后台预下载视频，抓取首帧缩略图
+            startPreload();
         }
 
         private void updatePlayPauseBtn() {
@@ -3204,11 +3532,18 @@ public class AiChatPanel extends AbstractCommandPanel {
             videoEnded = false;
             updatePlayPauseBtn();
 
+            // 使用本地文件（已预下载），没有则回退到 URL
+            String source = localVideoFile != null ? localVideoFile.getAbsolutePath() : videoUrl;
+            boolean isReplay = grabber != null; // 之前解过码说明是重播
+
             grabThread = new Thread(() -> {
                 try {
-                    Thread.sleep(100); // 给 UI 一点时间更新
+                    if (isReplay) {
+                        // 重播：释放旧 grabber，重新创建
+                        disposeGrabber();
+                    }
 
-                    grabber = new FFmpegFrameGrabber(videoUrl);
+                    grabber = new FFmpegFrameGrabber(source);
                     grabber.start();
 
                     // 获取视频信息
@@ -3237,9 +3572,10 @@ public class AiChatPanel extends AbstractCommandPanel {
 
                             Frame frame = grabber.grab();
                             if (frame == null) {
-                                // 视频结束，循环重播
+                                // 视频结束
                                 videoEnded = true;
                                 playing = false;
+                                running = false;
                                 SwingUtilities.invokeLater(() -> {
                                     updatePlayPauseBtn();
                                     canvas.repaint();
@@ -3293,7 +3629,9 @@ public class AiChatPanel extends AbstractCommandPanel {
                         statusLabel.setForeground(new Color(0xFF6B6B));
                         running = false;
                         playing = false;
+                        videoEnded = true;
                         updatePlayPauseBtn();
+                        canvas.repaint();
                     });
                 } finally {
                     disposeGrabber();
@@ -3311,6 +3649,102 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         }
 
+        /** 后台预下载视频到本地临时文件，并抓取首帧作为缩略图 */
+        private void startPreload() {
+            Thread.ofVirtual().start(() -> {
+                try {
+                    // 1. 下载视频到临时文件
+                    HttpClient client = HttpClient.newBuilder()
+                            .followRedirects(HttpClient.Redirect.NORMAL)
+                            .build();
+                    HttpRequest req = HttpRequest.newBuilder(URI.create(videoUrl))
+                            .timeout(java.time.Duration.ofSeconds(300))
+                            .GET().build();
+
+                    HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
+                    if (resp.statusCode() != 200) {
+                        throw new IOException("HTTP " + resp.statusCode());
+                    }
+
+                    // 确定文件扩展名
+                    String ext = ".mp4";
+                    String path = videoUrl;
+                    int qIdx = path.indexOf('?');
+                    if (qIdx > 0) path = path.substring(0, qIdx);
+                    int dotIdx = path.lastIndexOf('.');
+                    if (dotIdx > 0) ext = path.substring(dotIdx);
+
+                    java.io.File downloadDir = getVideoDir();
+                    localVideoFile = new java.io.File(downloadDir, "agnes_video_" + System.currentTimeMillis() + ext);
+
+                    long contentLen = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
+                    try (InputStream in = resp.body();
+                         java.io.FileOutputStream fos = new java.io.FileOutputStream(localVideoFile)) {
+                        byte[] buf = new byte[8192];
+                        long total = 0;
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            fos.write(buf, 0, n);
+                            total += n;
+                            if (contentLen > 0) {
+                                downloadProgress = (double) total / contentLen;
+                                placeholderText = String.format("正在下载视频... %.0f%%", downloadProgress * 100);
+                            } else {
+                                placeholderText = "正在下载视频... " + (total / 1024) + " KB";
+                            }
+                            SwingUtilities.invokeLater(canvas::repaint);
+                        }
+                    }
+
+                    // 2. 初始化 grabber + 抓取首帧缩略图
+                    placeholderText = "正在解析视频...";
+                    downloadProgress = 1.0;
+                    SwingUtilities.invokeLater(canvas::repaint);
+
+                    grabber = new FFmpegFrameGrabber(localVideoFile);
+                    grabber.start();
+                    videoW = grabber.getImageWidth();
+                    videoH = grabber.getImageHeight();
+                    double fps = grabber.getFrameRate();
+                    if (fps > 1 && fps < 200) videoFps = fps;
+                    if (videoW <= 0) videoW = 640;
+                    if (videoH <= 0) videoH = 360;
+
+                    // 抓第一帧
+                    Frame firstFrame = grabber.grab();
+                    if (firstFrame != null && firstFrame.image != null) {
+                        Java2DFrameConverter converter = new Java2DFrameConverter();
+                        BufferedImage thumb = converter.convert(firstFrame);
+                        converter.close();
+                        if (thumb != null) {
+                            currentFrame = toScreenCompatible(thumb);
+                        }
+                    }
+                    grabber.stop();
+                    grabber.release();
+                    grabber = null;
+
+                    // 3. 标记就绪
+                    ready = true;
+                    final String savedPath = localVideoFile.getAbsolutePath();
+                    SwingUtilities.invokeLater(() -> {
+                        savePathLabel.setText("📁 文件已自动保存至: " + savedPath);
+                        savePathLabel.setToolTipText("单击打开文件夹");
+                        statusLabel.setText("就绪 - 点击播放");
+                        canvas.repaint();
+                    });
+                } catch (Exception e) {
+                    // 下载失败，降级到在线播放
+                    placeholderText = "下载失败，将在线播放";
+                    ready = true; // 允许点击播放（降级到 URL 模式）
+                    SwingUtilities.invokeLater(() -> {
+                        statusLabel.setText("在线模式");
+                        canvas.repaint();
+                    });
+                }
+            });
+        }
+
         /** 停止播放 */
         void stopVideo() {
             running = false;
@@ -3321,6 +3755,11 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
             disposeGrabber();
             currentFrame = null;
+            // 清理临时文件
+            if (localVideoFile != null) {
+                try { localVideoFile.delete(); } catch (Exception ignored) {}
+                localVideoFile = null;
+            }
             SwingUtilities.invokeLater(() -> {
                 updatePlayPauseBtn();
                 canvas.repaint();
@@ -3438,7 +3877,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             if (dur.contains("3 秒")) return new int[]{81, 24};
             if (dur.contains("5 秒")) return new int[]{121, 24};
             if (dur.contains("10 秒")) return new int[]{241, 24};
-            if (dur.contains("18 秒")) return new int[]{441, 24};
+            if (dur.contains("17 秒")) return new int[]{409, 24};
         }
         return new int[]{121, 24};
     }
@@ -3524,6 +3963,15 @@ public class AiChatPanel extends AbstractCommandPanel {
         if (!"文生视频".equals(mode) && (imageUrls == null || imageUrls.isEmpty())) {
             JOptionPane.showMessageDialog(this,
                     "图生视频/多图视频/关键帧动画需要提供图片 URL\n请在模型配置中填写或输入消息中包含图片 URL",
+                    "提示", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        // 关键帧动画和多图视频至少需要 2 张图片
+        if (("关键帧动画".equals(mode) || "多图视频".equals(mode))
+                && (imageUrls == null || imageUrls.size() < 2)) {
+            JOptionPane.showMessageDialog(this,
+                    "关键帧动画/多图视频至少需要 2 张图片\n当前只有 " + (imageUrls != null ? imageUrls.size() : 0) + " 张，请补充图片 URL",
                     "提示", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -3627,7 +4075,15 @@ public class AiChatPanel extends AbstractCommandPanel {
 
                         // 图片添加到气泡的媒体面板
                         try {
+                            // 先保存到本地 agnes_img/ 目录
+                            java.io.File imgDir = getImgDir();
+                            java.io.File saveFile = new java.io.File(imgDir, "agnes_img_" + System.currentTimeMillis() + ".png");
+                            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(saveFile)) {
+                                fos.write(imageBytes);
+                            }
+
                             BufferedImage img = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(imageBytes));
+                            genBubble.addSavedPathLabel(saveFile.getAbsolutePath());
                             genBubble.addImageToPanel(img, mode + " 生成: " + prompt);
                             // 更新 wrapper 高度
                             int newH = genBubble.getPreferredSize().height + 4;
@@ -3705,7 +4161,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             case 0 -> new int[]{81, 24};   // 约 3 秒
             case 1 -> new int[]{121, 24};  // 约 5 秒
             case 2 -> new int[]{241, 24};  // 约 10 秒
-            case 3 -> new int[]{441, 24};  // 约 18 秒
+            case 3 -> new int[]{409, 24};  // 约 17 秒 (720p上限)
             default -> new int[]{121, 24};
         };
     }
@@ -3733,10 +4189,23 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
+    /** 根据分辨率返回API允许的最大帧数（满足8n+1约束） */
+    private static int getMaxVideoFrames(int width, int height) {
+        int pixels = width * height;
+        if (pixels >= 1280 * 720) return 169;  // 1080p级别
+        if (pixels >= 640 * 480) return 409;   // 720p级别
+        return 961;                              // 480p级别
+    }
+
     /** 执行视频生成并在对话中展示结果 */
     private void executeVideoGeneration(String mode, String prompt,
                                          int width, int height, int numFrames, double fps,
                                          Integer seed, List<String> imageUrls) {
+        // 根据分辨率裁剪帧数上限（API对不同分辨率有帧数限制）
+        int maxFrames = getMaxVideoFrames(width, height);
+        if (numFrames > maxFrames) {
+            numFrames = maxFrames;
+        }
         AgnesVideoService service = getOrCreateVideoService();
         if (service == null) {
             addErrorMessage("Agnes API Key 未配置", LocalTime.now().format(TF));
@@ -3786,6 +4255,7 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         // 异步创建并轮询
         String aiTimeFinal = aiTime;
+        int finalNumFrames = numFrames;
         service.createAndWaitAsync(req,
                 5000, // 5 秒轮询
                 30 * 60 * 1000, // 最长 30 分钟
@@ -3795,7 +4265,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                             + " (" + progress.progress + "%)"
                             + "\n\nPrompt：" + prompt
                             + "\n分辨率：" + width + "x" + height
-                            + "\n帧数：" + numFrames + " @ " + fps + "fps";
+                            + "\n帧数：" + finalNumFrames + " @ " + fps + "fps";
                     genBubble.contentArea.setText(progressText);
                     genBubble.recalcContentSize();
                     genBubble.revalidateAndRepaint();
