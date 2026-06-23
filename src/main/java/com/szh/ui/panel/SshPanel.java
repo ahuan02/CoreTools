@@ -2187,11 +2187,10 @@ public class SshPanel extends AbstractCommandPanel {
                 SshClient client = SshClient.setUpDefaultClient();
                 conn.client = client;
 
-                // 设置客户端级超时（防止防火墙静默丢包导致无限等待），单位：毫秒
+                // 设置连接/认证超时（防止防火墙静默丢包导致无限等待），单位：毫秒
+                // 不设空闲/读超时——交互式终端长时间无操作是正常的
                 client.getProperties().put("io-connect-timeout", 10000L);
                 client.getProperties().put("auth-timeout", 10000L);
-                client.getProperties().put("idle-timeout", 30000L);
-                client.getProperties().put("nio2-read-timeout", 15000L);
 
                 client.start();
 

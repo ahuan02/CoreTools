@@ -37,15 +37,18 @@ public class AgnesVideoService {
     public static final String DEFAULT_MODEL = "agnes-video-v2.0";
 
     /** 创建任务超时 */
-    private static final Duration CREATE_TIMEOUT = Duration.ofSeconds(60);
+    private static final Duration CREATE_TIMEOUT = Duration.ofSeconds(120);
     /** 轮询请求超时 */
-    private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration POLL_TIMEOUT = Duration.ofSeconds(60);
     /** 默认轮询间隔（毫秒） */
     private static final long DEFAULT_POLL_INTERVAL_MS = 5000;
     /** 默认最大等待时间 */
     private static final long DEFAULT_MAX_WAIT_MS = 30 * 60 * 1000; // 30 分钟
     /** 视频下载超时 */
-    private static final Duration DOWNLOAD_TIMEOUT = Duration.ofSeconds(300);
+    private static final Duration DOWNLOAD_TIMEOUT = Duration.ofSeconds(600);
+
+    /** 网络瞬时错误最大重试次数 */
+    private static final int MAX_RETRIES = 2;
 
     private final HttpClient httpClient;
     private final String apiKey;
@@ -63,7 +66,8 @@ public class AgnesVideoService {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl != null && !baseUrl.isBlank() ? baseUrl : BASE_URL;
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
+                .version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(45))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
     }
@@ -86,13 +90,14 @@ public class AgnesVideoService {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .build();
 
-        HttpResponse<String> httpResp = httpClient.send(httpReq, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> httpResp = sendWithRetry(httpReq);
 
         int status = httpResp.statusCode();
         String body = httpResp.body();
 
         if (status != 200) {
-            throw new AgnesImageService.AgnesApiException("创建视频任务失败，HTTP " + status + ": " + body, status);
+            throw new AgnesImageService.AgnesApiException(
+                    "创建视频任务失败：" + parseApiErrorBody(body, status), status);
         }
 
         AgnesVideoTaskResponse resp = AgnesVideoTaskResponse.fromJson(body);
@@ -133,7 +138,7 @@ public class AgnesVideoService {
                 .GET()
                 .build();
 
-        HttpResponse<String> httpResp = httpClient.send(httpReq, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> httpResp = sendWithRetry(httpReq);
 
         int status = httpResp.statusCode();
         String body = httpResp.body();
@@ -146,6 +151,50 @@ public class AgnesVideoService {
         }
 
         return AgnesVideoTaskResponse.fromJson(body);
+    }
+
+    /** 带重试的 send（String 响应） */
+    private HttpResponse<String> sendWithRetry(HttpRequest request) throws Exception {
+        Exception lastEx = null;
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            } catch (java.io.IOException e) {
+                lastEx = e;
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (attempt < MAX_RETRIES && (msg.contains("reset") || msg.contains("header parser") || msg.contains("RST_STREAM"))) {
+                    long delay = (long) Math.pow(2, attempt + 1) * 1000;
+                    System.out.println("[AgnesVideo] 网络瞬时错误，将在 " + (delay / 1000) + " 秒后重试 ("
+                            + (attempt + 1) + "/" + MAX_RETRIES + "): " + msg);
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastEx;
+    }
+
+    /** 带重试的 send（byte[] 响应，用于下载） */
+    private HttpResponse<byte[]> sendWithRetryBytes(HttpRequest request) throws Exception {
+        Exception lastEx = null;
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            } catch (java.io.IOException e) {
+                lastEx = e;
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (attempt < MAX_RETRIES && (msg.contains("reset") || msg.contains("header parser") || msg.contains("RST_STREAM"))) {
+                    long delay = (long) Math.pow(2, attempt + 1) * 1000;
+                    System.out.println("[AgnesVideo] 下载网络瞬时错误，将在 " + (delay / 1000) + " 秒后重试 ("
+                            + (attempt + 1) + "/" + MAX_RETRIES + "): " + msg);
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastEx;
     }
 
     // ==================== 轮询等待完成 ====================
@@ -191,8 +240,15 @@ public class AgnesVideoService {
             }
 
             if (result.isFailed()) {
+                String errDetail = result.getError();
+                if (errDetail == null || errDetail.isBlank()) {
+                    errDetail = "未知错误";
+                    if (result.getRawJson() != null) {
+                        errDetail += " | 响应: " + result.getRawJson();
+                    }
+                }
                 throw new AgnesImageService.AgnesApiException(
-                        "视频生成失败: " + (result.getError() != null ? result.getError() : "未知错误"),
+                        "视频生成失败: " + errDetail,
                         0);
             }
         }
@@ -292,8 +348,15 @@ public class AgnesVideoService {
                     }
 
                     if (result.isFailed()) {
+                        String errDetail = result.getError();
+                        if (errDetail == null || errDetail.isBlank()) {
+                            errDetail = "未知错误";
+                            if (result.getRawJson() != null) {
+                                errDetail += " | 响应: " + result.getRawJson();
+                            }
+                        }
                         throw new AgnesImageService.AgnesApiException(
-                                "视频生成失败: " + (result.getError() != null ? result.getError() : "未知错误"),
+                                "视频生成失败: " + errDetail,
                                 0);
                     }
                 }
@@ -321,7 +384,7 @@ public class AgnesVideoService {
                 .timeout(DOWNLOAD_TIMEOUT)
                 .GET()
                 .build();
-        HttpResponse<byte[]> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        HttpResponse<byte[]> resp = sendWithRetryBytes(req);
         if (resp.statusCode() != 200) {
             throw new AgnesImageService.AgnesApiException(
                     "下载视频失败，HTTP " + resp.statusCode(), resp.statusCode());
@@ -493,5 +556,76 @@ public class AgnesVideoService {
             return "ProgressInfo{progress=" + progress + ", status='" + getStatusText() + '\'' +
                     ", size='" + size + "', seconds='" + seconds + "'}";
         }
+    }
+
+    // ==================== API 错误解析 ====================
+
+    /**
+     * 解析 Agnes API 错误 JSON，返回用户可读的错误消息
+     */
+    static String parseApiErrorBody(String body, int httpStatus) {
+        String code = null;
+        String message = null;
+
+        // 简单 JSON 解析（避免额外依赖）
+        if (body != null) {
+            // 提取 "code" 字段
+            int codeIdx = body.indexOf("\"code\"");
+            if (codeIdx >= 0) {
+                int valStart = body.indexOf('"', body.indexOf(':', codeIdx) + 1);
+                if (valStart >= 0) {
+                    int valEnd = body.indexOf('"', valStart + 1);
+                    if (valEnd > valStart) {
+                        code = body.substring(valStart + 1, valEnd);
+                    }
+                }
+            }
+            // 提取 "message" 字段
+            int msgIdx = body.indexOf("\"message\"");
+            if (msgIdx >= 0) {
+                int valStart = body.indexOf('"', body.indexOf(':', msgIdx) + 1);
+                if (valStart >= 0) {
+                    int valEnd = body.indexOf('"', valStart + 1);
+                    if (valEnd > valStart) {
+                        message = body.substring(valStart + 1, valEnd);
+                    }
+                }
+            }
+        }
+
+        // 翻译已知错误码
+        String translated = translateErrorCode(code, message);
+
+        if (translated != null && !translated.isBlank()) {
+            return translated;
+        }
+        if (message != null && !message.isBlank()) {
+            return message;
+        }
+        // 兜底
+        String shortBody = body != null && body.length() > 200 ? body.substring(0, 200) + "..." : body;
+        return "HTTP " + httpStatus + (shortBody != null ? " - " + shortBody : "");
+    }
+
+    private static String translateErrorCode(String code, String apiMessage) {
+        if (code == null) return null;
+        return switch (code) {
+            case "content_policy_violation" ->
+                    "内容违反安全策略，请修改提示词后重试。\n" +
+                    (apiMessage != null ? "（原始信息：" + apiMessage + "）" : "");
+            case "invalid_request" ->
+                    "请求参数无效，请检查各项输入是否正确";
+            case "rate_limit_exceeded" ->
+                    "请求频率过高，请稍后再试";
+            case "auth_error", "unauthorized" ->
+                    "API 密钥无效或已过期，请检查密钥配置";
+            case "model_not_found" ->
+                    "指定的模型不可用";
+            case "server_error" ->
+                    "服务器内部错误，请稍后重试";
+            case "image_invalid" ->
+                    "提供的图片无效或无法访问，请检查图片 URL 是否公网可访问";
+            default -> null;
+        };
     }
 }

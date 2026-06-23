@@ -39,6 +39,8 @@ public class AgnesVideoTaskResponse {
     private String remixedFromVideoId;
     /** 错误信息（status 为 failed 时可用） */
     private String error;
+    /** 原始 JSON 响应（调试用） */
+    private String rawJson;
 
     // ==================== 构造器 ====================
 
@@ -51,6 +53,7 @@ public class AgnesVideoTaskResponse {
      */
     public static AgnesVideoTaskResponse fromJson(String json) {
         AgnesVideoTaskResponse resp = new AgnesVideoTaskResponse();
+        resp.rawJson = json;
         if (json == null || json.isBlank()) return resp;
 
         resp.id = extractJsonString(json, "\"id\"");
@@ -62,7 +65,7 @@ public class AgnesVideoTaskResponse {
         resp.seconds = extractJsonString(json, "\"seconds\"");
         resp.size = extractJsonString(json, "\"size\"");
         resp.remixedFromVideoId = extractJsonString(json, "\"remixed_from_video_id\"");
-        resp.error = extractJsonString(json, "\"error\"");
+        resp.error = extractErrorField(json);
 
         // 数字字段
         resp.progress = extractJsonInt(json, "\"progress\"");
@@ -126,6 +129,86 @@ public class AgnesVideoTaskResponse {
     }
 
     // ==================== JSON 辅助方法 ====================
+
+    /**
+     * 解析 error 字段，支持两种格式：
+     * <ul>
+     *   <li>字符串：{@code "error":"something went wrong"}</li>
+     *   <li>对象：{@code "error":{"code":"500","message":"Internal generation failed"}}</li>
+     * </ul>
+     */
+    private static String extractErrorField(String json) {
+        int keyIdx = json.indexOf("\"error\"");
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.indexOf(':', keyIdx);
+        if (colonIdx < 0) return null;
+
+        int valStart = colonIdx + 1;
+        while (valStart < json.length() && (json.charAt(valStart) == ' ' || json.charAt(valStart) == '\n')) {
+            valStart++;
+        }
+        if (valStart >= json.length()) return null;
+
+        char firstChar = json.charAt(valStart);
+
+        if (firstChar == '"') {
+            // 格式1: "error":"string message"
+            return extractQuotedString(json, valStart + 1);
+        } else if (firstChar == '{') {
+            // 格式2: "error":{...} 嵌套对象 — 找到对象边界后内部解析
+            int objEnd = findMatchingBrace(json, valStart);
+            if (objEnd < 0) return null;
+            String errorObj = json.substring(valStart, objEnd + 1);
+            String code = extractJsonString(errorObj, "\"code\"");
+            String message = extractJsonString(errorObj, "\"message\"");
+            if (code != null && message != null) {
+                return "[code=" + code + "] " + message;
+            } else if (message != null) {
+                return message;
+            } else if (code != null) {
+                return "[code=" + code + "]";
+            }
+            // 都不存在，返回完整 error 对象字符串
+            return errorObj;
+        }
+        return null;
+    }
+
+    /** 找到与 start 位置的 { 匹配的 } 的下标 */
+    private static int findMatchingBrace(String s, int start) {
+        if (start >= s.length() || s.charAt(start) != '{') return -1;
+        int depth = 0;
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1; // 不匹配
+    }
+
+    /** 提取双引号包裹的字符串（从引号后的第一个字符开始） */
+    private static String extractQuotedString(String json, int start) {
+        if (start >= json.length()) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\') {
+                i++;
+                if (i < json.length()) {
+                    sb.append(json.charAt(i));
+                }
+            } else if (c == '"') {
+                return sb.toString();
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
 
     private static String extractJsonString(String json, String key) {
         int keyIdx = json.indexOf(key);
@@ -235,6 +318,7 @@ public class AgnesVideoTaskResponse {
     public String getSize()            { return size; }
     public String getRemixedFromVideoId() { return remixedFromVideoId; }
     public String getError()           { return error; }
+    public String getRawJson()         { return rawJson; }
 
     public void setId(String id)                    { this.id = id; }
     public void setTaskId(String taskId)            { this.taskId = taskId; }
@@ -251,12 +335,18 @@ public class AgnesVideoTaskResponse {
 
     @Override
     public String toString() {
-        return "AgnesVideoTaskResponse{" +
-                "videoId='" + videoId + '\'' +
-                ", status='" + status + '\'' +
-                ", progress=" + progress +
-                ", videoUrl='" + (remixedFromVideoId != null ? remixedFromVideoId : "null") + '\'' +
-                ", error='" + error + '\'' +
-                '}';
+        StringBuilder sb = new StringBuilder("AgnesVideoTaskResponse{");
+        sb.append("videoId='").append(videoId).append('\'');
+        sb.append(", status='").append(status).append('\'');
+        sb.append(", progress=").append(progress);
+        sb.append(", videoUrl='").append(remixedFromVideoId != null ? remixedFromVideoId : "null").append('\'');
+        sb.append(", error='").append(error).append('\'');
+        if (rawJson != null && rawJson.length() < 500) {
+            sb.append(", rawJson=").append(rawJson);
+        } else if (rawJson != null) {
+            sb.append(", rawJson=").append(rawJson.substring(0, 500)).append("...(truncated)");
+        }
+        sb.append('}');
+        return sb.toString();
     }
 }

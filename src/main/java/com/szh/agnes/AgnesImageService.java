@@ -30,8 +30,11 @@ public class AgnesImageService {
     public static final String ENDPOINT = "/v1/images/generations";
     public static final String DEFAULT_MODEL = "agnes-image-2.0-flash";
 
-    /** 默认超时：图片生成可能耗时数秒到数十秒，建议 120s */
-    private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(120);
+    /** 默认超时：图片生成可能耗时数秒到数十秒，建议 180s */
+    private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(180);
+
+    /** 网络瞬时错误最大重试次数 */
+    private static final int MAX_RETRIES = 2;
 
     private final HttpClient httpClient;
     private final String apiKey;
@@ -49,7 +52,8 @@ public class AgnesImageService {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl != null && !baseUrl.isBlank() ? baseUrl : BASE_URL;
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
+                .version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(45))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
     }
@@ -71,13 +75,61 @@ public class AgnesImageService {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .build();
 
-        HttpResponse<String> httpResp = httpClient.send(httpReq, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> httpResp = sendWithRetry(httpReq);
+        return parseResponse(httpResp);
+    }
 
+    /** 带重试的 send：处理 Connection reset / header parser 等瞬时网络错误 */
+    private HttpResponse<String> sendWithRetry(HttpRequest request) throws Exception {
+        Exception lastEx = null;
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            } catch (java.io.IOException e) {
+                lastEx = e;
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (attempt < MAX_RETRIES && (msg.contains("reset") || msg.contains("header parser") || msg.contains("RST_STREAM"))) {
+                    long delay = (long) Math.pow(2, attempt + 1) * 1000; // 2s, 4s
+                    System.out.println("[AgnesImage] 网络瞬时错误，将在 " + (delay / 1000) + " 秒后重试 ("
+                            + (attempt + 1) + "/" + MAX_RETRIES + "): " + msg);
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastEx;
+    }
+
+    /** 带重试的 send（byte[] 响应，用于下载） */
+    private HttpResponse<byte[]> sendWithRetryBytes(HttpRequest request) throws Exception {
+        Exception lastEx = null;
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            } catch (java.io.IOException e) {
+                lastEx = e;
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (attempt < MAX_RETRIES && (msg.contains("reset") || msg.contains("header parser") || msg.contains("RST_STREAM"))) {
+                    long delay = (long) Math.pow(2, attempt + 1) * 1000;
+                    System.out.println("[AgnesImage] 下载网络瞬时错误，将在 " + (delay / 1000) + " 秒后重试 ("
+                            + (attempt + 1) + "/" + MAX_RETRIES + "): " + msg);
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastEx;
+    }
+
+    private AgnesImageResponse parseResponse(HttpResponse<String> httpResp) throws Exception {
         int status = httpResp.statusCode();
         String body = httpResp.body();
 
         if (status != 200) {
-            throw new AgnesApiException("API 返回 " + status + ": " + body, status);
+            throw new AgnesApiException("API 调用失败：" +
+                    AgnesVideoService.parseApiErrorBody(body, status), status);
         }
 
         AgnesImageResponse resp = AgnesImageResponse.fromJson(body);
@@ -213,7 +265,7 @@ public class AgnesImageService {
                     .timeout(Duration.ofSeconds(60))
                     .GET()
                     .build();
-            HttpResponse<byte[]> imgResp = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            HttpResponse<byte[]> imgResp = sendWithRetryBytes(req);
             if (imgResp.statusCode() == 200) {
                 return imgResp.body();
             }
@@ -243,18 +295,34 @@ public class AgnesImageService {
      */
     public static byte[] downloadImage(String imageUrl) throws Exception {
         HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
+                .connectTimeout(Duration.ofSeconds(15))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
         HttpRequest req = HttpRequest.newBuilder(URI.create(imageUrl))
-                .timeout(Duration.ofSeconds(60))
+                .timeout(Duration.ofSeconds(120))
                 .GET()
                 .build();
-        HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
-        if (resp.statusCode() != 200) {
-            throw new AgnesApiException("下载图片失败，HTTP " + resp.statusCode(), resp.statusCode());
+
+        Exception lastEx = null;
+        for (int attempt = 0; attempt <= 2; attempt++) {
+            try {
+                HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+                if (resp.statusCode() != 200) {
+                    throw new AgnesApiException("下载图片失败，HTTP " + resp.statusCode(), resp.statusCode());
+                }
+                return resp.body();
+            } catch (java.io.IOException e) {
+                lastEx = e;
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (attempt < 2 && (msg.contains("reset") || msg.contains("header parser") || msg.contains("RST_STREAM"))) {
+                    long delay = (long) Math.pow(2, attempt + 1) * 1000;
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
         }
-        return resp.body();
+        throw lastEx;
     }
 
     // ==================== 异常类 ====================

@@ -103,11 +103,12 @@ public class MainFrame extends JFrame {
         applyTextColor();
     }
 
+    /** 初始化框架外壳：建 Tab 容器，不加载面板内容（面板延迟加载以加速启动） */
     private void initUI() {
         JPanel root = new JPanel(new BorderLayout(0, 0));
         root.setBorder(new EmptyBorder(0, 0, 0, 0));
 
-        // Tab 页
+        // Tab 页容器
         tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setTabLayoutPolicy(JTabbedPane.WRAP_TAB_LAYOUT);
         // FlatLaf: 均分 Tab 宽度填满整行
@@ -122,91 +123,68 @@ public class MainFrame extends JFrame {
         });
         enableSmoothTabScrolling(tabbedPane);
 
-        // AI 对话 Tab
-        AiChatPanel aiChatPanel = new AiChatPanel();
-        addTab(tabbedPane, "AI 对话", aiChatPanel);
+        root.add(tabbedPane, BorderLayout.CENTER);
+        setContentPane(root);
+    }
 
-        // 系统监控 Tab
-        SystemMonitorPanel sysMonitorPanel = new SystemMonitorPanel();
-        addTab(tabbedPane, "系统监控", sysMonitorPanel);
+    /** 总共 22 个面板，供外部 SwingWorker 分批加载 */
+    public int getTotalTabs() {
+        return 22;
+    }
 
+    /** 按标题切换到指定 Tab（供子面板跨面板跳转） */
+    public void switchToTab(String title) {
+        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
+            if (title.equals(tabbedPane.getTitleAt(i))) {
+                tabbedPane.setSelectedIndex(i);
+                return;
+            }
+        }
+    }
 
-        // 串口调试 Tab
-        SerialPanel serialPanel = new SerialPanel();
-        addTab(tabbedPane, "串口调试", serialPanel);
+    /** 后台线程调用：创建第 index 个面板（不触 UI），返回面板名称 */
+    public String createPanel(int index) {
+        switch (index) {
+            case 0:  panels.put("AI 对话", new AiChatPanel());        break;
+            case 1:  panels.put("系统监控", new SystemMonitorPanel());  break;
+            case 2:  panels.put("串口调试", new SerialPanel());         break;
+            case 3:  panels.put("HTTP", new HttpPanel());             break;
+            case 4:  panels.put("UDP", new UdpPanel());               break;
+            case 5:  panels.put("TCP", new TcpPanel());               break;
+            case 6:  panels.put("WebSocket", new WebSocketPanel());   break;
+            case 7:  panels.put("Telnet", new TelnetPanel());         break;
+            case 8:  panels.put("视频流", videoStreamPanel = new VideoStreamPanel()); break;
+            case 9:  panels.put("数据编码转换", new DataConvertPanel()); break;
+            case 10: panels.put("Ping/DNS", new NetDiagnosePanel());  break;
+            case 11: panels.put("网络扫描", new ScanPanel());          break;
+            case 12: panels.put("日志查看", new LogViewerPanel());     break;
+            case 13: panels.put("Hex查看", new HexViewerPanel());     break;
+            case 14: panels.put("文件处理", new BatchFilePanel());     break;
+            case 15: panels.put("数据库", new DatabasePanel());        break;
+            case 16: panels.put("Redis", new RedisPanel());           break;
+            case 17: panels.put("SSH", new SshPanel());              break;
+            case 18: panels.put("MQTT", new MqttPanel());            break;
+            case 19: panels.put("gRPC", new GrpcPanel());            break;
+            case 20: panels.put("二维码", new QrCodePanel());          break;
+            case 21: panels.put("隧道穿透", new NgrokPanel());         break;
+            default: return null;
+        }
+        // 返回最后 put 的名字（Map 保证插入顺序，切合 index）
+        int i = 0;
+        for (String key : panels.keySet()) if (i++ == index) return key;
+        return null;
+    }
 
-        // HTTP 请求 Tab
-        HttpPanel httpPanel = new HttpPanel();
-        addTab(tabbedPane, "HTTP", httpPanel);
+    /** EDT 调用：将已创建的面板加入 TabbedPane */
+    public void addPanelToUI(String name) {
+        AbstractCommandPanel panel = panels.get(name);
+        if (panel != null) {
+            tabbedPane.addTab(name, panel);
+        }
+    }
 
-        // UDP Tab
-        UdpPanel udpPanel = new UdpPanel();
-        addTab(tabbedPane, "UDP", udpPanel);
-
-        // TCP Tab
-        TcpPanel tcpPanel = new TcpPanel();
-        addTab(tabbedPane, "TCP", tcpPanel);
-
-        // WebSocket Tab
-        WebSocketPanel wsPanel = new WebSocketPanel();
-        addTab(tabbedPane, "WebSocket", wsPanel);
-
-        // Telnet Tab
-        TelnetPanel telnetPanel = new TelnetPanel();
-        addTab(tabbedPane, "Telnet", telnetPanel);
-
-        // 视频流 Tab（内置发送/响应日志）
-        videoStreamPanel = new VideoStreamPanel();
-        addTab(tabbedPane, "视频流", videoStreamPanel);
-
-        // 数据编码转换 Tab
-        DataConvertPanel convertPanel = new DataConvertPanel();
-        addTab(tabbedPane, "数据编码转换", convertPanel);
-
-        // 网络诊断 Tab
-        NetDiagnosePanel diagPanel = new NetDiagnosePanel();
-        addTab(tabbedPane, "Ping/DNS", diagPanel);
-
-        // 扫描 Tab
-        ScanPanel scanPanel = new ScanPanel();
-        addTab(tabbedPane, "网络扫描", scanPanel);
-
-        // 日志查看 Tab
-        LogViewerPanel logViewerPanel = new LogViewerPanel();
-        addTab(tabbedPane, "日志查看", logViewerPanel);
-
-        // 十六进制查看 Tab
-        HexViewerPanel hexViewerPanel = new HexViewerPanel();
-        addTab(tabbedPane, "Hex查看", hexViewerPanel);
-
-        // 文件批量处理 Tab
-        BatchFilePanel batchFilePanel = new BatchFilePanel();
-        addTab(tabbedPane, "文件处理", batchFilePanel);
-
-        // 数据库客户端 Tab
-        DatabasePanel dbPanel = new DatabasePanel();
-        addTab(tabbedPane, "数据库", dbPanel);
-
-        // Redis 客户端 Tab
-        RedisPanel redisPanel = new RedisPanel();
-        addTab(tabbedPane, "Redis", redisPanel);
-
-        // SSH Tab
-        SshPanel sshPanel = new SshPanel();
-        addTab(tabbedPane, "SSH", sshPanel);
-
-        // MQTT Tab
-        MqttPanel mqttPanel = new MqttPanel();
-        addTab(tabbedPane, "MQTT", mqttPanel);
-
-        // gRPC Tab
-        GrpcPanel grpcPanel = new GrpcPanel();
-        addTab(tabbedPane, "gRPC", grpcPanel);
-
-        // 二维码 Tab
-        QrCodePanel qrCodePanel = new QrCodePanel();
-        addTab(tabbedPane, "二维码", qrCodePanel);
-
+    /** 所有面板加载完成后的收尾工作 */
+    public void onAllTabsLoaded() {
         // 监听 tab 切换：控制系统监控面板的启停
         tabbedPane.addChangeListener(e -> {
             Component selected = tabbedPane.getSelectedComponent();
@@ -221,14 +199,12 @@ public class MainFrame extends JFrame {
             }
         });
 
-        root.add(tabbedPane, BorderLayout.CENTER);
-
-        setContentPane(root);
-    }
-
-    private void addTab(JTabbedPane tabbedPane, String title, AbstractCommandPanel panel) {
-        panels.put(title, panel);
-        tabbedPane.addTab(title, panel);
+        // 加载各面板保存的配置
+        for (AbstractCommandPanel panel : panels.values()) {
+            panel.loadConfig(config);
+        }
+        tabbedPane.revalidate();
+        tabbedPane.repaint();
     }
 
     // ==================== Tab 滚轮切换 ====================
@@ -1154,6 +1130,7 @@ public class MainFrame extends JFrame {
                 + "<tr><td style='padding:2px 8px;text-align:left;'>Eclipse Paho MQTT</td><td style='padding:2px 8px;color:#666;'>EPL 2.0</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>gRPC / Protobuf</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
                 + "<tr><td style='padding:2px 8px;text-align:left;'>ZXing</td><td style='padding:2px 8px;color:#666;'>Apache 2.0</td></tr>"
+                + "<tr><td style='padding:2px 8px;text-align:left;'>Bore (内网穿透)</td><td style='padding:2px 8px;color:#666;'>MIT</td></tr>"
                 + "</table>"
                 + "<p style='margin-top:10px;font-size:12px;color:#999;'>"
                 + "感谢以上开源项目的贡献</p>"

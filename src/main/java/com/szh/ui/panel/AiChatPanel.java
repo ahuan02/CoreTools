@@ -8,6 +8,7 @@ import com.szh.agnes.entity.AgnesImageRequest;
 import com.szh.agnes.entity.AgnesVideoRequest;
 import com.szh.entity.ModelConfig;
 import com.szh.manager.ConfigManager;
+import com.szh.ui.MainFrame;
 import com.szh.utils.AiUtils;
 import com.szh.utils.NetUtil;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
@@ -39,6 +40,7 @@ import javax.swing.undo.UndoManager;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -46,13 +48,12 @@ import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -368,12 +369,17 @@ public class AiChatPanel extends AbstractCommandPanel {
         scrollToBottomBtn = createScrollToBottomFloatingButton();
         chatLayeredPane.add(scrollToBottomBtn, JLayeredPane.PALETTE_LAYER);
 
-        // 窗口缩放时重设 scrollPane 尺寸并定位按钮
+        // 窗口缩放时重设 scrollPane 尺寸、定位按钮，并重新布局消息气泡
         chatLayeredPane.addComponentListener(new ComponentAdapter() {
             @Override
             public void componentResized(ComponentEvent e) {
                 chatScrollPane.setBounds(0, 0, chatLayeredPane.getWidth(), chatLayeredPane.getHeight());
                 positionScrollToBottomButton();
+                // 视口宽度变化时，让所有消息气泡重新计算尺寸（图片/视频面板动态适配新宽度）
+                SwingUtilities.invokeLater(() -> {
+                    chatMessagePanel.revalidate();
+                    chatMessagePanel.repaint();
+                });
             }
         });
 
@@ -1097,9 +1103,11 @@ public class AiChatPanel extends AbstractCommandPanel {
     private void finishStreaming() {
         SwingUtilities.invokeLater(() -> {
             if (streamingBubble != null) {
-                streamingBubble.onRevalidate = null;
-                // 流式结束后加载媒体内容（图片/视频）
+                // 流式结束后加载媒体内容（图片/视频），加载完成后再清理回调
                 streamingBubble.loadPendingMedia();
+                streamingBubble.onRevalidate = null;
+                // 媒体加载后更新 wrapper maxHeight
+                streamingBubble.revalidateAndRepaint();
             }
             streamingBubble = null;
             streamingWrapper = null;
@@ -1656,6 +1664,12 @@ public class AiChatPanel extends AbstractCommandPanel {
     /** 刷新模型下拉选择器内容 */
     private void refreshModelSelector() {
         if (modelSelector == null) return;
+        // 记住当前选中的模型别名，刷新后恢复选中
+        String currentAlias = null;
+        if (modelSelector.getSelectedItem() instanceof ModelConfig mc
+                && !"请先添加模型".equals(mc.getAlias())) {
+            currentAlias = mc.getAlias();
+        }
         modelSelector.removeAllItems();
         if (modelConfigs.isEmpty()) {
             // 没有模型时：显示提示文字并禁用下拉选择器 + 编辑按钮
@@ -1666,11 +1680,16 @@ public class AiChatPanel extends AbstractCommandPanel {
         } else {
             modelSelector.setEnabled(true);
             if (editModelBtn != null) editModelBtn.setEnabled(true);
-            for (ModelConfig mc : modelConfigs) {
+            int restoreIdx = -1;
+            for (int i = 0; i < modelConfigs.size(); i++) {
+                ModelConfig mc = modelConfigs.get(i);
                 modelSelector.addItem(mc);
+                if (currentAlias != null && mc.getAlias().equals(currentAlias)) {
+                    restoreIdx = i;
+                }
             }
-            // 默认选中第一个
-            modelSelector.setSelectedIndex(0);
+            // 恢复之前的选中项，找不到则默认选第一个
+            modelSelector.setSelectedIndex(restoreIdx >= 0 ? restoreIdx : 0);
         }
         modelSelector.repaint();
     }
@@ -1727,8 +1746,11 @@ public class AiChatPanel extends AbstractCommandPanel {
         private JTextArea vidUrlArea;
         private JLabel imgUrlLabel;
         private JScrollPane imgUrlScroll;
+        private JLabel imgUrlHint;
         private JLabel vidUrlLabel;
         private JScrollPane vidUrlScroll;
+        private JButton vidPickBtn;
+        private JButton tunnelHintBtn;
         private JLabel vidUrlHint;
 
         ModelConfigDialog(Window owner, ModelConfig editing) {
@@ -1932,21 +1954,53 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
             imgUrlArea.setLineWrap(true);
             imgUrlArea.setWrapStyleWord(true);
-            imgUrlArea.setToolTipText("每行一个URL（图生图/多图合成时需要）");
+            imgUrlArea.setToolTipText("每行一个URL或本地图片路径（图生图/多图合成时需要）");
             imgUrlScroll = new JScrollPane(imgUrlArea);
             imgUrlScroll.setPreferredSize(new Dimension(300, 45));
             p.add(imgUrlScroll, g);
+
+            // 选择本地图片按钮
+            g.gridx = 2; g.gridy = 2; g.weightx = 0;
+            JButton imgPickBtn = new JButton("选择图片");
+            imgPickBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            imgPickBtn.setForeground(C_PRIMARY);
+            imgPickBtn.setBackground(C_BTN_BG);
+            imgPickBtn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY),
+                    BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+            imgPickBtn.setFocusPainted(false);
+            imgPickBtn.addActionListener(e -> pickLocalImages(imgUrlArea));
+            p.add(imgPickBtn, g);
+
+            // 图片URL输入提示（点击可跳转到隧道穿透面板）
+            g.gridx = 0; g.gridy = 3; g.gridwidth = 3; g.weightx = 1;
+            imgUrlHint = new JLabel("<html><u>本地图片需公网链接，点击此处设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，图生图需1张，多图合成需2张+</html>");
+            imgUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            imgUrlHint.setForeground(new Color(255, 145, 0));
+            imgUrlHint.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            imgUrlHint.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    navigateToTunnelTab();
+                }
+            });
+            p.add(imgUrlHint, g);
+            g.gridwidth = 1; // 恢复
 
             // 模式切换
             imgModeCombo.addActionListener(e -> {
                 boolean show = !"文生图".equals(imgModeCombo.getSelectedItem());
                 imgUrlLabel.setVisible(show);
                 imgUrlScroll.setVisible(show);
+                imgPickBtn.setVisible(show);
+                imgUrlHint.setVisible(show);
                 p.revalidate(); p.repaint();
                 pack();
             });
             imgUrlLabel.setVisible(false);
             imgUrlScroll.setVisible(false);
+            imgPickBtn.setVisible(false);
+            imgUrlHint.setVisible(false);
 
             return p;
         }
@@ -1979,15 +2033,14 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidResCombo.setBackground(C_FIELD_BG);
             p.add(vidResCombo, g);
 
-            // 时长
+            // 时长（显示帧数，实际时长由下方标签动态计算）
             g.gridx = 0; g.gridy = 1; g.weightx = 0;
-            JLabel durLbl = new JLabel("时长：");
+            JLabel durLbl = new JLabel("帧数：");
             durLbl.setFont(NetUtil.FONT_TEXT); durLbl.setForeground(NetUtil.TEXT_COLOR);
             p.add(durLbl, g);
             g.gridx = 1; g.weightx = 1;
             vidDurCombo = new JComboBox<>(new String[]{
-                    "约 3 秒 (81帧@24fps)", "约 5 秒 (121帧@24fps)",
-                    "约 10 秒 (241帧@24fps)", "约 17 秒 (409帧@24fps)"
+                    "81 帧", "121 帧", "241 帧", "409 帧"
             });
             vidDurCombo.setFont(NetUtil.FONT_TEXT);
             vidDurCombo.setForeground(NetUtil.TEXT_COLOR);
@@ -2003,7 +2056,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             g.gridx = 1; g.weightx = 1;
             int screenHz = getScreenRefreshRate();
             java.util.List<String> fpsOpts = new java.util.ArrayList<>();
-            for (int f : new int[]{10, 15, 24, 30, 60, 120, 144, 240}) {
+            for (int f : new int[]{1, 2, 5, 8, 10, 15, 16, 24, 30, 60, 120, 144, 240}) {
                 if (f <= screenHz) fpsOpts.add(f + " fps");
             }
             String screenHzStr = screenHz + " fps";
@@ -2016,8 +2069,35 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidFpsCombo.setBackground(C_FIELD_BG);
             p.add(vidFpsCombo, g);
 
-            // 模式
+            // 动态实际时长标签
             g.gridx = 0; g.gridy = 3; g.weightx = 0;
+            JLabel realDurTitleLbl = new JLabel("实际时长：");
+            realDurTitleLbl.setFont(NetUtil.FONT_TEXT); realDurTitleLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(realDurTitleLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            JLabel realDurLbl = new JLabel();
+            realDurLbl.setFont(NetUtil.FONT_TEXT.deriveFont(Font.PLAIN, 10f));
+            realDurLbl.setForeground(new Color(0xAAAAAA));
+            p.add(realDurLbl, g);
+
+            // 帧率/帧数变化时重新计算实际时长
+            Runnable updateRealDuration = () -> {
+                int frames = getSelectedFrameCount();
+                double curFps = parseFps((String) vidFpsCombo.getSelectedItem());
+                double sec = frames / curFps;
+                if (sec < 60) {
+                    realDurLbl.setText(String.format("≈ %.1f 秒 (%d帧 ÷ %.0ffps)", sec, frames, curFps));
+                } else {
+                    realDurLbl.setText(String.format("≈ %d分%.0f秒 (%d帧 ÷ %.0ffps)",
+                            (int) (sec / 60), sec % 60, frames, curFps));
+                }
+            };
+            vidDurCombo.addActionListener(e -> updateRealDuration.run());
+            vidFpsCombo.addActionListener(e -> updateRealDuration.run());
+            updateRealDuration.run();
+
+            // 模式
+            g.gridx = 0; g.gridy = 4; g.weightx = 0;
             JLabel vmdLbl = new JLabel("模式：");
             vmdLbl.setFont(NetUtil.FONT_TEXT); vmdLbl.setForeground(NetUtil.TEXT_COLOR);
             p.add(vmdLbl, g);
@@ -2031,7 +2111,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             p.add(vidModeCombo, g);
 
             // 输入图片URL
-            g.gridx = 0; g.gridy = 4; g.weightx = 0;
+            g.gridx = 0; g.gridy = 5; g.weightx = 0;
             vidUrlLabel = new JLabel("图片URL：");
             vidUrlLabel.setFont(NetUtil.FONT_TEXT); vidUrlLabel.setForeground(NetUtil.TEXT_COLOR);
             p.add(vidUrlLabel, g);
@@ -2043,32 +2123,70 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidUrlArea.setCaretColor(NetUtil.TEXT_COLOR);
             vidUrlArea.setLineWrap(true);
             vidUrlArea.setWrapStyleWord(true);
-            vidUrlArea.setToolTipText("每行一个URL（图生视频/多图视频/关键帧动画时需要）");
+            vidUrlArea.setToolTipText("每行一个URL或本地图片路径（图生视频/多图视频/关键帧动画时需要）");
             vidUrlScroll = new JScrollPane(vidUrlArea);
             vidUrlScroll.setPreferredSize(new Dimension(300, 45));
             p.add(vidUrlScroll, g);
 
-            // 图片URL输入提示
-            g.gridx = 1; g.gridy = 5; g.weightx = 1;
-            vidUrlHint = new JLabel("提示：每行填写一个URL，关键帧动画/多图视频至少需要2张");
+            // 选择本地图片按钮
+            g.gridx = 2; g.gridy = 5; g.weightx = 0;
+            vidPickBtn = new JButton("选择图片");
+            vidPickBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            vidPickBtn.setForeground(C_PRIMARY);
+            vidPickBtn.setBackground(C_BTN_BG);
+            vidPickBtn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY),
+                    BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+            vidPickBtn.setFocusPainted(false);
+            vidPickBtn.addActionListener(e -> pickLocalImages(vidUrlArea));
+            p.add(vidPickBtn, g);
+
+            // 隧道穿透提示按钮（点击直接跳转）
+            g.gridx = 3; g.gridy = 5; g.weightx = 0;
+            tunnelHintBtn = new JButton("网络穿透");
+            tunnelHintBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            tunnelHintBtn.setForeground(new Color(255, 145, 0));
+            tunnelHintBtn.setBackground(C_BTN_BG);
+            tunnelHintBtn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(255, 145, 0)),
+                    BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+            tunnelHintBtn.setFocusPainted(false);
+            tunnelHintBtn.setToolTipText("本地图片需公网链接，点击前往隧道穿透面板");
+            tunnelHintBtn.addActionListener(e -> navigateToTunnelTab());
+            p.add(tunnelHintBtn, g);
+
+            // 图片URL输入提示（点击可跳转到隧道穿透面板）
+            g.gridx = 1; g.gridy = 6; g.weightx = 1;
+            vidUrlHint = new JLabel("<html><u>本地图片需公网链接，点击设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，关键帧动画/多图视频至少2张</html>");
             vidUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
-            vidUrlHint.setForeground(new Color(180, 180, 180));
+            vidUrlHint.setForeground(new Color(255, 145, 0));
+            vidUrlHint.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            vidUrlHint.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    navigateToTunnelTab();
+                }
+            });
             p.add(vidUrlHint, g);
 
             vidModeCombo.addActionListener(e -> {
                 boolean show = !"文生视频".equals(vidModeCombo.getSelectedItem());
                 vidUrlLabel.setVisible(show);
                 vidUrlScroll.setVisible(show);
+                vidPickBtn.setVisible(show);
                 vidUrlHint.setVisible(show);
+                tunnelHintBtn.setVisible(show);
                 p.revalidate(); p.repaint();
                 pack();
             });
             vidUrlLabel.setVisible(false);
             vidUrlScroll.setVisible(false);
+            vidPickBtn.setVisible(false);
             vidUrlHint.setVisible(false);
+            tunnelHintBtn.setVisible(false);
 
             // Seed
-            g.gridx = 0; g.gridy = 6; g.weightx = 0;
+            g.gridx = 0; g.gridy = 7; g.weightx = 0;
             JLabel seedLbl = new JLabel("Seed：");
             seedLbl.setFont(NetUtil.FONT_TEXT); seedLbl.setForeground(NetUtil.TEXT_COLOR);
             p.add(seedLbl, g);
@@ -2125,7 +2243,15 @@ public class AiChatPanel extends AbstractCommandPanel {
                     Map<String, String> ext = editing.getExtraConfig();
                     if (ext != null) {
                         if (ext.containsKey("video.size")) setComboByPrefix(vidResCombo, ext.get("video.size"));
-                        if (ext.containsKey("video.duration")) vidDurCombo.setSelectedItem(ext.get("video.duration"));
+                        if (ext.containsKey("video.duration")) {
+                            String savedDur = ext.get("video.duration");
+                            // 新格式 "N 帧" 直接匹配，旧格式提取帧数后匹配
+                            if (!savedDur.contains("帧")) {
+                                // 旧格式如 "约 5 秒 (121帧@24fps)" → 提取帧数
+                                savedDur = parseVideoDuration(editing) + " 帧";
+                            }
+                            vidDurCombo.setSelectedItem(savedDur);
+                        }
                         if (ext.containsKey("video.fps")) setComboByPrefix(vidFpsCombo, ext.get("video.fps"));
                         if (ext.containsKey("video.mode")) vidModeCombo.setSelectedItem(ext.get("video.mode"));
                         if (ext.containsKey("video.urls")) vidUrlArea.setText(ext.get("video.urls"));
@@ -2143,6 +2269,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             extraPanel.revalidate();
             extraPanel.repaint();
             pack();
+            refreshTunnelStatus();
         }
 
         /** 通过前缀匹配选中 ComboBox 项 */
@@ -2264,6 +2391,85 @@ public class AiChatPanel extends AbstractCommandPanel {
             KeyStroke esc = KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0);
             getRootPane().registerKeyboardAction(
                 e -> cancelBtn.doClick(), esc, JComponent.WHEN_IN_FOCUSED_WINDOW);
+        }
+
+        /** 打开文件选择器，将选中的本地图片路径追加到文本域（发请求时才转 base64） */
+        private void pickLocalImages(JTextArea targetArea) {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setMultiSelectionEnabled(true);
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                    "图片文件 (jpg, png, gif, bmp, webp)", "jpg", "jpeg", "png", "gif", "bmp", "webp"));
+            if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+
+            File[] files = chooser.getSelectedFiles();
+            if (files == null || files.length == 0) return;
+
+            StringBuilder sb = new StringBuilder();
+            String existing = targetArea.getText().trim();
+            if (!existing.isEmpty()) sb.append(existing).append('\n');
+            for (File file : files) {
+                sb.append(file.getAbsolutePath()).append('\n');
+            }
+            targetArea.setText(sb.toString().trim());
+        }
+
+        /** 跳转到隧道穿透面板 */
+        private void navigateToTunnelTab() {
+            if (NgrokPanel.isRunning()) {
+                JOptionPane.showMessageDialog(this,
+                        "网络穿透已成功开启，本地图片可通过公网链接被 AI 服务器访问。",
+                        "穿透已开启", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            int choice = JOptionPane.showConfirmDialog(this,
+                    "本地图片需要通过公网链接才能被 AI 服务器访问。\n\n"
+                    + "是否前往 [隧道穿透] 面板设置内网穿透？",
+                    "需要公网链接", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (choice == JOptionPane.YES_OPTION) {
+                Window owner = getOwner();
+                if (owner instanceof MainFrame mf) {
+                    mf.switchToTab("隧道穿透");
+                }
+                dispose(); // 关闭配置对话框
+            }
+        }
+
+        /** 刷新隧道穿透状态：已开启则显示绿色文字 */
+        private void refreshTunnelStatus() {
+            boolean running = NgrokPanel.isRunning();
+            Color hintColor = running ? new Color(46, 204, 113) : new Color(255, 145, 0);
+
+            // 更新按钮
+            if (tunnelHintBtn != null) {
+                tunnelHintBtn.setText(running ? "穿透已成功开启" : "网络穿透");
+                tunnelHintBtn.setForeground(hintColor);
+                tunnelHintBtn.setBorder(BorderFactory.createCompoundBorder(
+                        BorderFactory.createLineBorder(hintColor),
+                        BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+                tunnelHintBtn.setToolTipText(running ? "穿透已开启，本地图片可公网访问" : "本地图片需公网链接，点击前往隧道穿透面板");
+            }
+
+            // 更新视频面板提示
+            if (vidUrlHint != null) {
+                vidUrlHint.setForeground(hintColor);
+                vidUrlHint.setText(running
+                        ? "<html>穿透已成功开启 &nbsp;|&nbsp; 每行一个URL，关键帧动画/多图视频至少2张</html>"
+                        : "<html><u>本地图片需公网链接，点击设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，关键帧动画/多图视频至少2张</html>");
+            }
+
+            // 更新图片面板提示
+            if (imgUrlHint != null) {
+                imgUrlHint.setForeground(hintColor);
+                imgUrlHint.setText(running
+                        ? "<html>穿透已成功开启 &nbsp;|&nbsp; 每行一个URL，图生图需1张，多图合成需2张+</html>"
+                        : "<html><u>本地图片需公网链接，点击此处设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，图生图需1张，多图合成需2张+</html>");
+            }
+        }
+
+        /** 从下拉框获取当前选中的帧数 */
+        private int getSelectedFrameCount() {
+            if (vidDurCombo == null) return 121;
+            return parseDuration(vidDurCombo.getSelectedIndex());
         }
     }
 
@@ -2541,7 +2747,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                         SwingUtilities.invokeLater(() -> {
                             // 显示保存路径
                             addSavedPathLabel(loaded.localPath);
-                            addImageToPanel(loaded.image, imageUrl);
+                            addImageToPanel(loaded.image, imageUrl, new java.io.File(loaded.localPath));
                         });
                     }
                 } catch (Exception e) {
@@ -2603,10 +2809,38 @@ public class AiChatPanel extends AbstractCommandPanel {
             }
         }
 
+        /** 从媒体面板中删除一个媒体组件及其关联的保存标签和间隔 */
+        private void removeMediaComponent(JComponent comp) {
+            if (mediaPanel == null) return;
+            // 找到目标组件的位置
+            int idx = -1;
+            for (int i = 0; i < mediaPanel.getComponentCount(); i++) {
+                if (mediaPanel.getComponent(i) == comp) { idx = i; break; }
+            }
+            if (idx < 0) return;
+
+            // 移除该组件
+            mediaPanel.remove(idx);
+            // 移除其前面的 strut（如果有）
+            if (idx - 1 >= 0 && idx - 1 < mediaPanel.getComponentCount()) {
+                Component before = mediaPanel.getComponent(idx - 1);
+                if (before instanceof Box.Filler) mediaPanel.remove(idx - 1);
+            }
+            // 移除再前面的保存路径标签（如果有）
+            if (idx - 1 >= 0 && idx - 1 < mediaPanel.getComponentCount()) {
+                Component lbl = mediaPanel.getComponent(idx - 1);
+                if (lbl instanceof JLabel jl && jl.getText().startsWith("[已保存]"))
+                    mediaPanel.remove(lbl);
+            }
+
+            revalidateAndRepaint();
+            if (onRevalidate != null) onRevalidate.run();
+        }
+
         /** 在媒体面板中添加"已保存至 xxx"的提示标签 */
         private void addSavedPathLabel(String localPath) {
             if (mediaPanel == null) return;
-            JLabel label = new JLabel("📁 文件已自动保存至: " + localPath);
+            JLabel label = new JLabel("[已保存] 文件已自动保存至: " + localPath);
             label.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
             label.setForeground(new Color(0x888888));
             label.setToolTipText("单击打开文件夹");
@@ -2624,22 +2858,27 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
 
         /** 把图片添加到媒体面板（独立绘制 + 右键菜单） */
-        void addImageToPanel(BufferedImage img, String sourceUrl) {
+        void addImageToPanel(BufferedImage img, String sourceUrl, java.io.File savedFile) {
             if (img == null || mediaPanel == null) return;
 
-            // 计算可用宽度：ChatBubble 内部 contentPane 宽度
-            int availW = getContentPaneWidth();
-            if (availW < 200) availW = 400;
-            int imgRatio = img.getWidth() > 0 ? img.getWidth() : 1;
-            int displayW = availW - 4;
-            if (displayW > imgRatio) displayW = imgRatio;
-            int displayH = (int) ((long) img.getHeight() * displayW / imgRatio);
-            if (displayH > 600) { displayW = (int) ((long) displayW * 600 / displayH); displayH = 600; }
-
             final BufferedImage source = img;
-            final int fDisplayW = displayW, fDisplayH = displayH;
 
             JPanel imgPanel = new JPanel() {
+                @Override
+                public Dimension getPreferredSize() {
+                    int availW = getContentPaneWidth();
+                    if (availW < 200) availW = 400;
+                    int dispW = availW - 4;
+                    if (dispW > source.getWidth()) dispW = source.getWidth();
+                    int dispH = (int) ((long) source.getHeight() * dispW / source.getWidth());
+                    if (dispH > 600) { dispW = (int) ((long) dispW * 600 / dispH); dispH = 600; }
+                    return new Dimension(availW, dispH + 8);
+                }
+                @Override
+                public Dimension getMaximumSize() {
+                    Dimension pref = getPreferredSize();
+                    return new Dimension(Integer.MAX_VALUE, pref.height);
+                }
                 @Override
                 protected void paintComponent(Graphics g) {
                     super.paintComponent(g);
@@ -2661,8 +2900,6 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
             };
             imgPanel.setOpaque(false);
-            imgPanel.setPreferredSize(new Dimension(availW, displayH + 8));
-            imgPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, displayH + 8));
 
             // 右键菜单
             boolean hasValidUrl = sourceUrl != null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"));
@@ -2703,6 +2940,25 @@ public class AiChatPanel extends AbstractCommandPanel {
                 popup.add(openItem);
             }
 
+            // 删除资源
+            if (savedFile != null) {
+                popup.addSeparator();
+                JMenuItem deleteItem = new JMenuItem("删除资源");
+                deleteItem.setForeground(new Color(0xFF5252));
+                deleteItem.addActionListener(e -> {
+                    int confirm = JOptionPane.showConfirmDialog(imgPanel,
+                            "确定要删除此图片资源吗？\n文件: " + savedFile.getAbsolutePath(),
+                            "确认删除", JOptionPane.YES_NO_OPTION);
+                    if (confirm == JOptionPane.YES_OPTION) {
+                        // 删除本地文件
+                        try { savedFile.delete(); } catch (Exception ignored) {}
+                        // 从气泡中移除图片和对应的保存标签
+                        removeMediaComponent(imgPanel);
+                    }
+                });
+                popup.add(deleteItem);
+            }
+
             imgPanel.setComponentPopupMenu(popup);
             if (hasValidUrl) {
                 imgPanel.setToolTipText("右键菜单 | 单击浏览器打开");
@@ -2738,7 +2994,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         /** 媒体加载失败提示 */
         void addMediaError(String msg, Exception e) {
             if (mediaPanel == null) return;
-            JLabel errLabel = new JLabel("⚠ " + msg);
+            JLabel errLabel = new JLabel("[!] " + msg);
             errLabel.setForeground(new Color(0xFFA726));
             errLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
             mediaPanel.add(errLabel);
@@ -2751,6 +3007,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             if (!isShowing()) return;
             revalidate();
             repaint();
+            // 自动更新父级 wrapper 的 maxHeight，防止媒体内容被裁剪
+            updateParentWrapperMaxHeight();
             Container p = getParent();
             while (p != null) {
                 if (p instanceof JComponent jc) {
@@ -2758,6 +3016,18 @@ public class AiChatPanel extends AbstractCommandPanel {
                     jc.repaint();
                 }
                 p = p.getParent();
+            }
+        }
+
+        /** 更新外层 wrapper 的 maxHeight 以匹配当前气泡高度，防止 BoxLayout 产生间隙或裁剪内容 */
+        private void updateParentWrapperMaxHeight() {
+            Container alignPanel = getParent();
+            if (alignPanel == null) return;
+            Container wrapper = alignPanel.getParent();
+            if (wrapper instanceof JPanel wp && wp.getLayout() instanceof BorderLayout) {
+                int newH = getPreferredSize().height + 4;
+                wp.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH));
+                wp.revalidate();
             }
         }
 
@@ -3296,12 +3566,18 @@ public class AiChatPanel extends AbstractCommandPanel {
         // 视频尺寸
         private int videoW = 640, videoH = 360;
 
+        // 进度条相关
+        private final JSlider seekSlider;
+        private final JLabel currentTimeLabel;
+        private final JLabel totalTimeLabel;
+        private volatile long totalDurationMs = 0;      // 视频总时长（毫秒）
+        private volatile long currentPositionMs = 0;     // 当前播放位置（毫秒）
+        private volatile long seekToMs = -1;             // seek 目标位置，-1 表示无 seek 请求
+        private volatile boolean seekRequested = false;  // 是否请求了 seek
+        private javax.swing.Timer seekUpdateTimer;       // 定时刷新进度条
+
         ChatVideoPlayer(String videoUrl, int contentWidth) {
             this.videoUrl = videoUrl;
-            int dispW = contentWidth > 0 ? contentWidth : 400;
-            // 16:9 默认比例
-            int dispH = dispW * 9 / 16;
-            if (dispH > 400) { dispH = 400; dispW = dispH * 16 / 9; }
 
             setLayout(new BorderLayout());
             setOpaque(false);
@@ -3383,6 +3659,23 @@ public class AiChatPanel extends AbstractCommandPanel {
             };
             canvas.setOpaque(false);
 
+            // 保存路径提示标签（预下载完成后显示，提前初始化避免 final 字段未赋值）
+            savePathLabel = new JLabel();
+            savePathLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+            savePathLabel.setForeground(new Color(0x888888));
+            savePathLabel.setOpaque(false);
+            savePathLabel.setBorder(BorderFactory.createEmptyBorder(2, 0, 4, 0));
+            savePathLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            savePathLabel.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (localVideoFile != null) {
+                        try { Desktop.getDesktop().open(localVideoFile.getParentFile()); } catch (Exception ignored) {}
+                    }
+                }
+            });
+            add(savePathLabel, BorderLayout.NORTH);
+
             // 点击画布播放/暂停
             canvas.addMouseListener(new MouseAdapter() {
                 @Override
@@ -3446,29 +3739,84 @@ public class AiChatPanel extends AbstractCommandPanel {
             });
             videoPopup.add(openBrowser);
 
+            // 删除资源
+            videoPopup.addSeparator();
+            JMenuItem deleteItem = new JMenuItem("删除资源");
+            deleteItem.setForeground(new Color(0xFF5252));
+            deleteItem.addActionListener(e -> {
+                int confirm = JOptionPane.showConfirmDialog(this,
+                        "确定要删除此视频资源吗？",
+                        "确认删除", JOptionPane.YES_NO_OPTION);
+                if (confirm == JOptionPane.YES_OPTION) {
+                    stopVideo();  // 停止播放 + 删除临时文件
+                    // 额外确保本地文件被删除（stopVideo 里处理了 localVideoFile）
+                    savePathLabel.setText("");
+                    savePathLabel.setToolTipText(null);
+                    // 从父容器中移除整个视频播放器
+                    SwingUtilities.invokeLater(() -> {
+                        Container parent = getParent();
+                        if (parent != null) {
+                            parent.remove(ChatVideoPlayer.this);
+                            parent.revalidate();
+                            parent.repaint();
+                            // 触发 ChatBubble 的重新布局
+                            Container bubble = SwingUtilities.getAncestorOfClass(ChatBubble.class, parent);
+                            if (bubble instanceof ChatBubble cb) {
+                                cb.revalidate();
+                                cb.repaint();
+                                if (cb.onRevalidate != null) cb.onRevalidate.run();
+                            }
+                        }
+                    });
+                }
+            });
+            videoPopup.add(deleteItem);
+
             canvas.setComponentPopupMenu(videoPopup);
             canvas.setToolTipText("右键菜单 | 单击播放/暂停");
 
-            // 保存路径提示标签（预下载完成后显示）
-            savePathLabel = new JLabel();
-            savePathLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
-            savePathLabel.setForeground(new Color(0x888888));
-            savePathLabel.setOpaque(false);
-            savePathLabel.setBorder(BorderFactory.createEmptyBorder(2, 0, 4, 0));
-            savePathLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            savePathLabel.addMouseListener(new MouseAdapter() {
+            add(savePathLabel, BorderLayout.NORTH);
+
+
+            add(canvas, BorderLayout.CENTER);
+
+            // ---- 进度条面板（滑块 + 时间标签） ----
+            JPanel seekPanel = new JPanel(new BorderLayout(6, 0));
+            seekPanel.setBackground(C_CONTROL_BG);
+            seekPanel.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
+
+            // 当前时间标签
+            currentTimeLabel = new JLabel("00:00");
+            currentTimeLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
+            currentTimeLabel.setForeground(new Color(0xAAAAAA));
+            currentTimeLabel.setPreferredSize(new Dimension(36, 20));
+            seekPanel.add(currentTimeLabel, BorderLayout.WEST);
+
+            // 进度条滑块
+            seekSlider = new JSlider(0, 1000, 0);
+            seekSlider.setOpaque(false);
+            seekSlider.setFocusable(false);
+            seekSlider.setPreferredSize(new Dimension(100, 24));
+            // 用户拖动/点击进度条松手时 → 跳转到对应位置并自动开始播放
+            seekSlider.addMouseListener(new MouseAdapter() {
                 @Override
-                public void mouseClicked(MouseEvent e) {
-                    if (localVideoFile != null) {
-                        try {
-                            Desktop.getDesktop().open(localVideoFile.getParentFile());
-                        } catch (Exception ignored) {}
+                public void mouseReleased(MouseEvent e) {
+                    if (!ready || totalDurationMs <= 0) return;
+                    // mouseReleased 时滑块值已被 UI delegate 更新为正确位置
+                    long targetMs = totalDurationMs * seekSlider.getValue() / 1000;
+                    if (targetMs >= 0) {
+                        seekTo(targetMs);
                     }
                 }
             });
-            add(savePathLabel, BorderLayout.NORTH);
+            seekPanel.add(seekSlider, BorderLayout.CENTER);
 
-            add(canvas, BorderLayout.CENTER);
+            // 总时长标签
+            totalTimeLabel = new JLabel("00:00");
+            totalTimeLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
+            totalTimeLabel.setForeground(new Color(0xAAAAAA));
+            totalTimeLabel.setPreferredSize(new Dimension(36, 20));
+            seekPanel.add(totalTimeLabel, BorderLayout.EAST);
 
             // ---- 底部控制栏 ----
             JPanel controlBar = new JPanel(new BorderLayout(6, 0));
@@ -3510,14 +3858,55 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             controlBar.add(leftCtrls, BorderLayout.WEST);
 
-            add(controlBar, BorderLayout.SOUTH);
-
-            setPreferredSize(new Dimension(dispW, dispH + 36));
-            setMaximumSize(new Dimension(Integer.MAX_VALUE, dispH + 36));
-            setMinimumSize(new Dimension(240, 200));
+            // 底部面板：进度条 + 控制栏
+            JPanel bottomPanel = new JPanel();
+            bottomPanel.setLayout(new BoxLayout(bottomPanel, BoxLayout.Y_AXIS));
+            bottomPanel.setOpaque(false);
+            bottomPanel.add(seekPanel);
+            bottomPanel.add(controlBar);
+            add(bottomPanel, BorderLayout.SOUTH);
 
             // 后台预下载视频，抓取首帧缩略图
             startPreload();
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            int viewportW = findViewportWidth();
+            int maxW = (int) (viewportW * 0.75) - 28;
+            if (maxW < 240) maxW = 240;
+
+            int h;
+            if (videoW > 0 && videoH > 0) {
+                h = maxW * videoH / videoW;
+            } else {
+                h = maxW * 9 / 16;  // 16:9 默认
+            }
+            if (h > 400) h = 400;
+            if (h < 120) h = 120;
+            return new Dimension(maxW, h + 60);
+        }
+
+        @Override
+        public Dimension getMaximumSize() {
+            Dimension pref = getPreferredSize();
+            return new Dimension(Integer.MAX_VALUE, pref.height);
+        }
+
+        @Override
+        public Dimension getMinimumSize() {
+            return new Dimension(240, 230);
+        }
+
+        /** 从组件层级中逆向查找 JViewport 宽度 */
+        private int findViewportWidth() {
+            Container p = getParent();
+            while (p != null) {
+                if (p instanceof JViewport vp) return vp.getWidth();
+                if (p.getParent() instanceof JViewport vp) return vp.getWidth();
+                p = p.getParent();
+            }
+            return 500;
         }
 
         private void updatePlayPauseBtn() {
@@ -3530,16 +3919,19 @@ public class AiChatPanel extends AbstractCommandPanel {
             running = true;
             playing = true;
             videoEnded = false;
+            seekRequested = false;
             updatePlayPauseBtn();
 
             // 使用本地文件（已预下载），没有则回退到 URL
             String source = localVideoFile != null ? localVideoFile.getAbsolutePath() : videoUrl;
             boolean isReplay = grabber != null; // 之前解过码说明是重播
+            final long targetSeekMs = seekToMs; // 捕获 seek 目标
+            seekToMs = -1; // 消费掉
 
             grabThread = new Thread(() -> {
                 try {
                     if (isReplay) {
-                        // 重播：释放旧 grabber，重新创建
+                        // 重播 / seek：释放旧 grabber，重新创建
                         disposeGrabber();
                     }
 
@@ -3555,6 +3947,31 @@ public class AiChatPanel extends AbstractCommandPanel {
                     if (videoW <= 0) videoW = 640;
                     if (videoH <= 0) videoH = 360;
 
+                    // 获取总时长和总帧数（用于进度条）
+                    long lenTime = grabber.getLengthInTime(); // 微秒
+                    totalDurationMs = lenTime > 0 ? lenTime / 1000 : 0;
+                    long totalFramesHint = grabber.getLengthInFrames();
+                    if (totalDurationMs <= 0 && totalFramesHint > 0 && videoFps > 0) {
+                        totalDurationMs = (long) (totalFramesHint / videoFps * 1000);
+                    }
+
+                    // 处理 seek 跳转
+                    int frameCount = 0;
+                    if (targetSeekMs > 0 && targetSeekMs < totalDurationMs) {
+                        grabber.setTimestamp(targetSeekMs * 1000); // 微秒
+                        frameCount = (int) (targetSeekMs * videoFps / 1000);
+                        currentPositionMs = targetSeekMs;
+                    } else {
+                        currentPositionMs = 0;
+                    }
+
+                    SwingUtilities.invokeLater(() -> {
+                        seekSlider.setValue(currentPositionMs > 0 && totalDurationMs > 0
+                                ? (int) (currentPositionMs * 1000 / totalDurationMs) : 0);
+                        updateTimeLabel(currentTimeLabel, currentPositionMs);
+                        updateTimeLabel(totalTimeLabel, totalDurationMs);
+                    });
+
                     long frameIntervalNanos = (long) (1_000_000_000L / videoFps);
                     long nextFrameNanos = System.nanoTime();
 
@@ -3563,82 +3980,104 @@ public class AiChatPanel extends AbstractCommandPanel {
 
                     try {
                         while (running) {
-                            // 暂停等待
-                            if (!playing) {
-                                Thread.sleep(30);
-                                nextFrameNanos = System.nanoTime();
-                                continue;
-                            }
+                            try {
+                                // 暂停等待
+                                if (!playing) {
+                                    Thread.sleep(30);
+                                    nextFrameNanos = System.nanoTime();
+                                    continue;
+                                }
 
-                            Frame frame = grabber.grab();
-                            if (frame == null) {
-                                // 视频结束
-                                videoEnded = true;
-                                playing = false;
-                                running = false;
-                                SwingUtilities.invokeLater(() -> {
-                                    updatePlayPauseBtn();
-                                    canvas.repaint();
-                                });
-                                break;
-                            }
+                                Frame frame = grabber.grab();
+                                if (frame == null) {
+                                    // 视频结束
+                                    videoEnded = true;
+                                    playing = false;
+                                    running = false;
+                                    currentPositionMs = totalDurationMs;
+                                    SwingUtilities.invokeLater(() -> {
+                                        seekSlider.setValue(1000);
+                                        updateTimeLabel(currentTimeLabel, totalDurationMs);
+                                        updatePlayPauseBtn();
+                                        canvas.repaint();
+                                    });
+                                    break;
+                                }
 
-                            if (frame.image == null) continue;
+                                if (frame.image == null) continue;
 
-                            // 视频帧转换
-                            BufferedImage img;
-                            Mat mat = matConverter.convert(frame);
-                            if (mat != null) {
-                                int cw = canvas.getWidth();
-                                int ch = canvas.getHeight();
-                                if (cw > 0 && ch > 0) {
-                                    Mat resizedMat = new Mat();
-                                    Start.resizeCv(mat, resizedMat, new Size(cw, ch));
-                                    Frame rf = matConverter.convert(resizedMat);
-                                    img = converter.convert(rf);
-                                    resizedMat.release();
+                                frameCount++;
+                                currentPositionMs = (long) (frameCount / videoFps * 1000);
+                                if (currentPositionMs > totalDurationMs) currentPositionMs = totalDurationMs;
+
+                                // 视频帧转换
+                                BufferedImage img;
+                                Mat mat = matConverter.convert(frame);
+                                if (mat != null) {
+                                    int cw = canvas.getWidth();
+                                    int ch = canvas.getHeight();
+                                    if (cw > 0 && ch > 0) {
+                                        Mat resizedMat = new Mat();
+                                        Start.resizeCv(mat, resizedMat, new Size(cw, ch));
+                                        Frame rf = matConverter.convert(resizedMat);
+                                        img = converter.convert(rf);
+                                        resizedMat.release();
+                                    } else {
+                                        img = converter.convert(frame);
+                                    }
+                                    mat.release();
                                 } else {
                                     img = converter.convert(frame);
                                 }
-                                mat.release();
-                            } else {
-                                img = converter.convert(frame);
-                            }
 
-                            if (img != null) {
-                                img = toScreenCompatible(img);
-                                currentFrame = img;
-                                throttleRepaint();
-                            }
+                                if (img != null) {
+                                    img = toScreenCompatible(img);
+                                    currentFrame = img;
+                                    throttleRepaint();
+                                }
 
-                            // 帧率控制
-                            long now = System.nanoTime();
-                            if (now < nextFrameNanos) {
-                                long sleepMs = (nextFrameNanos - now) / 1_000_000;
-                                if (sleepMs > 0) Thread.sleep(sleepMs);
+                                // 帧率控制
+                                long now = System.nanoTime();
+                                if (now < nextFrameNanos) {
+                                    long sleepMs = (nextFrameNanos - now) / 1_000_000;
+                                    if (sleepMs > 0) Thread.sleep(sleepMs);
+                                }
+                                nextFrameNanos = Math.max(now, nextFrameNanos) + frameIntervalNanos;
+                            } catch (InterruptedException ie) {
+                                // seek 等操作触发的中断 → 静默退出循环
+                                running = false;
+                                break;
                             }
-                            nextFrameNanos = Math.max(now, nextFrameNanos) + frameIntervalNanos;
                         }
                     } finally {
                         try { converter.close(); } catch (Exception ignored) {}
                         try { matConverter.close(); } catch (Exception ignored) {}
                     }
                 } catch (Exception e) {
-                    SwingUtilities.invokeLater(() -> {
-                        statusLabel.setText("播放失败: " + e.getMessage());
-                        statusLabel.setForeground(new Color(0xFF6B6B));
-                        running = false;
-                        playing = false;
-                        videoEnded = true;
-                        updatePlayPauseBtn();
-                        canvas.repaint();
-                    });
+                    if (!seekRequested) {
+                        // 非 seek 导致的异常才报错
+                        SwingUtilities.invokeLater(() -> {
+                            statusLabel.setText("播放失败: " + e.getMessage());
+                            statusLabel.setForeground(new Color(0xFF6B6B));
+                            running = false;
+                            playing = false;
+                            videoEnded = true;
+                            updatePlayPauseBtn();
+                            canvas.repaint();
+                        });
+                    }
                 } finally {
                     disposeGrabber();
+                    if (!seekRequested) {
+                        stopSeekUpdateTimer();
+                    }
                 }
             }, "chat-video-player");
             grabThread.setDaemon(true);
             grabThread.start();
+
+            // 启动进度条定时刷新
+            startSeekUpdateTimer();
         }
 
         private void disposeGrabber() {
@@ -3647,6 +4086,66 @@ public class AiChatPanel extends AbstractCommandPanel {
                 try { grabber.release(); } catch (Exception ignored) {}
                 grabber = null;
             }
+        }
+
+        /** 跳转到指定位置（毫秒） */
+        private void seekTo(long targetMs) {
+            if (!ready || totalDurationMs <= 0) return;
+            seekToMs = Math.max(0, Math.min(targetMs, totalDurationMs));
+            seekRequested = true;
+
+            // 停止当前播放，让旧线程感知并退出
+            running = false;
+            playing = false;
+            Thread oldThread = grabThread;
+            grabThread = null;
+            if (oldThread != null) {
+                oldThread.interrupt();
+            }
+            // 不在这里 dispose grabber，让旧线程的 finally 块自行清理
+
+            // 等待旧线程退出后重新开始
+            Thread.ofVirtual().start(() -> {
+                if (oldThread != null) {
+                    try { oldThread.join(3000); } catch (InterruptedException ignored) {}
+                }
+                // 旧线程已退出，清理可能残留的 grabber，然后重新开始
+                disposeGrabber();
+                SwingUtilities.invokeLater(this::startVideo);
+            });
+        }
+
+        /** 启动进度条定时刷新（~250ms 间隔） */
+        private void startSeekUpdateTimer() {
+            stopSeekUpdateTimer();
+            seekUpdateTimer = new javax.swing.Timer(250, e -> {
+                if (running && !seekRequested && totalDurationMs > 0) {
+                    int sliderVal = (int) (currentPositionMs * 1000 / totalDurationMs);
+                    if (sliderVal >= 0 && sliderVal <= 1000) {
+                        seekSlider.setValue(sliderVal);
+                    }
+                    updateTimeLabel(currentTimeLabel, currentPositionMs);
+                    updateTimeLabel(totalTimeLabel, totalDurationMs);
+                }
+            });
+            seekUpdateTimer.start();
+        }
+
+        /** 停止进度条定时刷新 */
+        private void stopSeekUpdateTimer() {
+            if (seekUpdateTimer != null) {
+                seekUpdateTimer.stop();
+                seekUpdateTimer = null;
+            }
+        }
+
+        /** 格式化毫秒 → "mm:ss" */
+        private static void updateTimeLabel(JLabel label, long ms) {
+            if (ms < 0) ms = 0;
+            long totalSec = ms / 1000;
+            long min = totalSec / 60;
+            long sec = totalSec % 60;
+            label.setText(String.format("%02d:%02d", min, sec));
         }
 
         /** 后台预下载视频到本地临时文件，并抓取首帧作为缩略图 */
@@ -3728,7 +4227,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     ready = true;
                     final String savedPath = localVideoFile.getAbsolutePath();
                     SwingUtilities.invokeLater(() -> {
-                        savePathLabel.setText("📁 文件已自动保存至: " + savedPath);
+                        savePathLabel.setText("[已保存] 文件已自动保存至: " + savedPath);
                         savePathLabel.setToolTipText("单击打开文件夹");
                         statusLabel.setText("就绪 - 点击播放");
                         canvas.repaint();
@@ -3749,18 +4248,26 @@ public class AiChatPanel extends AbstractCommandPanel {
         void stopVideo() {
             running = false;
             playing = false;
+            seekRequested = false;
+            seekToMs = -1;
+            stopSeekUpdateTimer();
             if (grabThread != null) {
                 grabThread.interrupt();
                 grabThread = null;
             }
             disposeGrabber();
             currentFrame = null;
+            currentPositionMs = 0;
+            totalDurationMs = 0;
             // 清理临时文件
             if (localVideoFile != null) {
                 try { localVideoFile.delete(); } catch (Exception ignored) {}
                 localVideoFile = null;
             }
             SwingUtilities.invokeLater(() -> {
+                seekSlider.setValue(0);
+                updateTimeLabel(currentTimeLabel, 0);
+                updateTimeLabel(totalTimeLabel, 0);
                 updatePlayPauseBtn();
                 canvas.repaint();
             });
@@ -3871,15 +4378,20 @@ public class AiChatPanel extends AbstractCommandPanel {
         return new int[]{1152, 768};
     }
 
-    private int[] parseVideoDuration(ModelConfig mc) {
+    /** 解析视频时长配置（帧数），兼容新旧格式 */
+    private int parseVideoDuration(ModelConfig mc) {
         String dur = mc.getExtra("video.duration");
-        if (dur != null) {
-            if (dur.contains("3 秒")) return new int[]{81, 24};
-            if (dur.contains("5 秒")) return new int[]{121, 24};
-            if (dur.contains("10 秒")) return new int[]{241, 24};
-            if (dur.contains("17 秒")) return new int[]{409, 24};
+        if (dur == null) return 121;
+        // 新格式: "81 帧", "121 帧", "241 帧", "409 帧"
+        if (dur.contains("帧")) {
+            try { return Integer.parseInt(dur.replace("帧", "").trim()); } catch (NumberFormatException ignored) {}
         }
-        return new int[]{121, 24};
+        // 旧格式: "约 3 秒 (81帧@24fps)" 等
+        if (dur.contains("3 秒")) return 81;
+        if (dur.contains("5 秒")) return 121;
+        if (dur.contains("10 秒")) return 241;
+        if (dur.contains("17 秒")) return 409;
+        return 121;
     }
 
     private double parseVideoFps(ModelConfig mc) {
@@ -3949,7 +4461,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         if (key == null) return;
 
         int[] wh = parseVideoResolution(mc);
-        int[] fd = parseVideoDuration(mc);
+        int numFrames = parseVideoDuration(mc);
         double fps = parseVideoFps(mc);
         String mode = parseVideoMode(mc);
         Integer seed = parseVideoSeed(mc);
@@ -3978,7 +4490,7 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         inputArea.setText("");
         if (inputUndoManager != null) inputUndoManager.discardAllEdits();
-        executeVideoGeneration(mode, prompt, wh[0], wh[1], fd[0], fps, seed, imageUrls);
+        executeVideoGeneration(mode, prompt, wh[0], wh[1], numFrames, fps, seed, imageUrls);
     }
 
     /** 解析 Agnes API Key：优先用模型配置中的 Key，其次用缓存的 agnesApiKey，都没有则弹框 */
@@ -4016,6 +4528,67 @@ public class AiChatPanel extends AbstractCommandPanel {
             urls.add(m.group());
         }
         return urls.isEmpty() ? null : urls;
+    }
+
+    // ==================== 本地文件 → HTTP URL（委托给 NgrokPanel 的文件服务器） ====================
+
+    /** 将本地文件通过 NgrokPanel 的文件服务器暴露为 HTTP URL */
+    private static String serveLocalFileViaHttp(File file) {
+        return NgrokPanel.registerFile(file);
+    }
+
+    /** 获取文件服务器的基础 URL（优先使用隧道公网地址） */
+    private static String getTempFileServerBaseUrl() {
+        return NgrokPanel.getFileServerBaseUrl();
+    }
+
+    // ==================== URL 解析 ====================
+
+    /**
+     * 将混合的 URL / 本地路径列表解析为最终可用的 URL 列表。
+     * HTTP/HTTPS/data: URL 原样保留。
+     * 本地文件路径：图片API转 base64 data URI，视频API通过临时HTTP服务器暴露。
+     */
+    private List<String> resolveImageUrls(List<String> urls, boolean forVideo) {
+        if (urls == null) return null;
+        List<String> resolved = new ArrayList<>();
+        for (String raw : urls) {
+            String url = raw.trim();
+            if (url.isEmpty()) continue;
+            if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:")) {
+                resolved.add(url);
+                continue;
+            }
+            // 假设是本地文件路径
+            File f = new File(url);
+            if (f.isFile()) {
+                try {
+                    if (forVideo) {
+                        // 视频 API 不支持 base64 data URI，通过临时 HTTP 服务器暴露
+                        String httpUrl = serveLocalFileViaHttp(f);
+                        if (httpUrl != null) {
+                            resolved.add(httpUrl);
+                        }
+                    } else {
+                        byte[] bytes = Files.readAllBytes(f.toPath());
+                        String b64 = Base64.getEncoder().encodeToString(bytes);
+                        String name = f.getName().toLowerCase();
+                        String mime = "image/";
+                        if (name.endsWith(".png")) mime += "png";
+                        else if (name.endsWith(".gif")) mime += "gif";
+                        else if (name.endsWith(".bmp")) mime += "bmp";
+                        else if (name.endsWith(".webp")) mime += "webp";
+                        else mime += "jpeg";
+                        resolved.add("data:" + mime + ";base64," + b64);
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException("无法读取本地图片: " + f.getName(), e);
+                }
+            } else {
+                resolved.add(url); // 兜底：保持原样
+            }
+        }
+        return resolved.isEmpty() ? null : resolved;
     }
 
     /** 获取或创建图片生成服务 */
@@ -4061,12 +4634,30 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatMessagePanel.repaint();
         scrollToBottom();
 
-        // 异步生成
-        AgnesImageRequest req = buildImageRequest(mode, prompt, size, imageUrls);
-        service.generateImageBytesAsync(req,
-                imageBytes -> {
+        // 计时器：每秒更新气泡中的耗时
+        final long imgStartTime = System.currentTimeMillis();
+        javax.swing.Timer imgTimer = new javax.swing.Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - imgStartTime) / 1000;
+            genBubble.contentArea.setText("正在生成图片... (已耗时: " + elapsed + "秒)");
+            genBubble.recalcContentSize();
+            genBubble.revalidateAndRepaint();
+            int newH0 = genBubble.getPreferredSize().height + 4;
+            wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH0));
+            wrapper.revalidate();
+            wrapper.repaint();
+        });
+        imgTimer.start();
+
+        // 在后台虚拟线程解析本地图片并发送请求（IO密集，适合虚拟线程）
+        Thread.startVirtualThread(() -> {
+            try {
+                List<String> resolved = resolveImageUrls(imageUrls, false);
+                AgnesImageRequest req = buildImageRequest(mode, prompt, size, resolved);
+                service.generateImageBytesAsync(req,
+                        imageBytes -> {
                     // 成功：将生成的图片显示在气泡中
                     SwingUtilities.invokeLater(() -> {
+                        imgTimer.stop();
                         // 更新气泡内容
                         genBubble.contentArea.setText("[成功] 图片生成完成！\n\nPrompt：" + prompt
                                 + "\n尺寸：" + size + "\n模式：" + mode);
@@ -4084,7 +4675,7 @@ public class AiChatPanel extends AbstractCommandPanel {
 
                             BufferedImage img = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(imageBytes));
                             genBubble.addSavedPathLabel(saveFile.getAbsolutePath());
-                            genBubble.addImageToPanel(img, mode + " 生成: " + prompt);
+                            genBubble.addImageToPanel(img, mode + " 生成: " + prompt, saveFile);
                             // 更新 wrapper 高度
                             int newH = genBubble.getPreferredSize().height + 4;
                             wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH));
@@ -4102,7 +4693,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                 error -> {
                     // 失败：显示错误
                     SwingUtilities.invokeLater(() -> {
-                        genBubble.contentArea.setText("[失败] 图片生成失败\n\n" + error.getMessage());
+                        imgTimer.stop();
+                        genBubble.contentArea.setText("[失败] 图片生成失败\n\n" + formatApiError(error));
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
                         chatMessagePanel.revalidate();
@@ -4111,6 +4703,18 @@ public class AiChatPanel extends AbstractCommandPanel {
                     });
                 }
         );
+            } catch (Exception ex) {
+                SwingUtilities.invokeLater(() -> {
+                    imgTimer.stop();
+                    genBubble.contentArea.setText("[失败] 读取本地图片失败\n\n" + formatApiError(ex));
+                    genBubble.recalcContentSize();
+                    genBubble.revalidateAndRepaint();
+                    chatMessagePanel.revalidate();
+                    chatMessagePanel.repaint();
+                    scrollToBottom();
+                });
+            }
+        });
     }
 
     /** 构建图片生成请求 */
@@ -4155,14 +4759,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         return new int[]{1152, 768};
     }
 
-    /** 解析时长预设，返回 [numFrames, frameRate] — 注意帧率单独解析所以这里只取帧数 */
-    private int[] parseDuration(int idx) {
+    /** 根据时长下拉框索引返回帧数 */
+    private int parseDuration(int idx) {
         return switch (idx) {
-            case 0 -> new int[]{81, 24};   // 约 3 秒
-            case 1 -> new int[]{121, 24};  // 约 5 秒
-            case 2 -> new int[]{241, 24};  // 约 10 秒
-            case 3 -> new int[]{409, 24};  // 约 17 秒 (720p上限)
-            default -> new int[]{121, 24};
+            case 0 -> 81;   // 约 3 秒 @24fps
+            case 1 -> 121;  // 约 5 秒 @24fps
+            case 2 -> 241;  // 约 10 秒 @24fps
+            case 3 -> 409;  // 约 17 秒 @24fps
+            default -> 121;
         };
     }
 
@@ -4176,6 +4780,14 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
+    /** 格式化帧率显示（15.0 → "15"，24.0 → "24"） */
+    private static String formatFps(double fps) {
+        if (fps == Math.floor(fps)) {
+            return String.valueOf((int) fps);
+        }
+        return String.valueOf(fps);
+    }
+    
     /** 获取当前屏幕刷新率（Hz），获取失败返回 60 */
     private static int getScreenRefreshRate() {
         try {
@@ -4189,27 +4801,65 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
-    /** 根据分辨率返回API允许的最大帧数（满足8n+1约束） */
-    private static int getMaxVideoFrames(int width, int height) {
-        int pixels = width * height;
-        if (pixels >= 1280 * 720) return 169;  // 1080p级别
-        if (pixels >= 640 * 480) return 409;   // 720p级别
-        return 961;                              // 480p级别
-    }
 
     /** 执行视频生成并在对话中展示结果 */
     private void executeVideoGeneration(String mode, String prompt,
                                          int width, int height, int numFrames, double fps,
                                          Integer seed, List<String> imageUrls) {
-        // 根据分辨率裁剪帧数上限（API对不同分辨率有帧数限制）
-        int maxFrames = getMaxVideoFrames(width, height);
-        if (numFrames > maxFrames) {
-            numFrames = maxFrames;
-        }
         AgnesVideoService service = getOrCreateVideoService();
         if (service == null) {
             addErrorMessage("Agnes API Key 未配置", LocalTime.now().format(TF));
             return;
+        }
+
+        // 提前解析图片 URL（注册本地文件到临时 HTTP 服务器，不阻塞，无 IO）
+        List<String> resolvedUrls = null;
+        String urlInfoText = "";
+        try {
+            resolvedUrls = resolveImageUrls(imageUrls, true);
+            if (resolvedUrls != null && !resolvedUrls.isEmpty()) {
+                // 如果有本地文件通过临时 HTTP 服务器暴露，显示服务器地址
+                if (NgrokPanel.isFileServerRunning()) {
+                    String baseUrl = getTempFileServerBaseUrl();
+                    boolean hasLocal = resolvedUrls.stream().anyMatch(u -> u.contains("127.0.0.1:") || u.contains("bore.pub"));
+                    if (hasLocal) {
+                        if (NgrokPanel.isRunning()) {
+                            urlInfoText = "\n(穿透公网) " + NgrokPanel.getPublicUrl()
+                                    + "\n外部API可通过此地址下载本地图片";
+                        } else {
+                            urlInfoText = "\n(本地服务器) " + baseUrl
+                                    + "\n警告: 127.0.0.1 仅本机可访问，请在 [隧道穿透] 标签页启动内网穿透";
+                        }
+                    }
+                }
+                String urlPreview = resolvedUrls.size() > 2
+                        ? resolvedUrls.get(0) + ", " + resolvedUrls.get(1) + " ...共" + resolvedUrls.size() + "张"
+                        : String.join(", ", resolvedUrls);
+                urlInfoText += "\n图片: " + urlPreview;
+            }
+        } catch (Exception e) {
+            addErrorMessage("读取本地图片失败: " + e.getMessage(), LocalTime.now().format(TF));
+            return;
+        }
+
+        // 如果有本地文件但隧道未启动或文件服务器未启动，拒绝发送请求（避免外部API无法访问导致超时）
+        if (resolvedUrls != null && !resolvedUrls.isEmpty() && imageUrls != null) {
+            boolean hasLocalFile = imageUrls.stream().anyMatch(u -> {
+                String url = u.trim();
+                return !url.isEmpty() && !url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("data:");
+            });
+            if (hasLocalFile) {
+                if (!NgrokPanel.isFileServerRunning()) {
+                    addErrorMessage("检测到本地文件但文件服务器未启动。\n请先在 [隧道穿透] 标签页中启动文件服务器后再生成视频。",
+                            LocalTime.now().format(TF));
+                    return;
+                }
+                if (!NgrokPanel.isRunning()) {
+                    addErrorMessage("检测到本地图片但内网穿透未开启，外部API无法访问 127.0.0.1 地址。\n请先在 [隧道穿透] 标签页启动 Bore 隧道后再生成视频。",
+                            LocalTime.now().format(TF));
+                    return;
+                }
+            }
         }
 
         // 显示用户消息气泡
@@ -4225,12 +4875,17 @@ public class AiChatPanel extends AbstractCommandPanel {
         clearPlaceholderIfNeeded();
         addMessageBubble("你", userMsg, userTime, true);
 
-        // 显示生成中的 AI 气泡
+        // 显示生成中的 AI 气泡（包含服务器地址信息）
+        double effectiveSecs = numFrames / fps;
+        String durationHint = effectiveSecs < 60
+                ? String.format(" (约%.0f秒)", effectiveSecs)
+                : String.format(" (约%d分%.0f秒)", (int)(effectiveSecs/60), effectiveSecs%60);
         String aiTime = LocalTime.now().format(TF);
         ChatBubble genBubble = new ChatBubble("AI",
                 "正在创建视频任务...\n\nPrompt：" + prompt
                         + "\n分辨率：" + width + "x" + height
-                        + "\n帧数：" + numFrames + " @ " + fps + "fps",
+                        + "\n帧数：" + numFrames + " @ " + formatFps(fps) + "fps" + durationHint
+                        + urlInfoText,
                 aiTime, false);
 
         JPanel wrapper = new JPanel(new BorderLayout());
@@ -4250,33 +4905,52 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatMessagePanel.repaint();
         scrollToBottom();
 
-        // 构建请求
-        AgnesVideoRequest req = buildVideoRequest(mode, prompt, width, height, numFrames, fps, seed, imageUrls);
+        // 计时器：每秒更新气泡中的耗时
+        final long videoStartTime2 = System.currentTimeMillis();
+        final java.util.concurrent.atomic.AtomicReference<String> latestStatus =
+                new java.util.concurrent.atomic.AtomicReference<>("正在创建视频任务...");
+        final java.util.concurrent.atomic.AtomicInteger latestProgress =
+                new java.util.concurrent.atomic.AtomicInteger(0);
+        int finalNumFrames1 = numFrames;
+        javax.swing.Timer videoTimer2 = new javax.swing.Timer(1000, e -> {
+            long elapsedSec = (System.currentTimeMillis() - videoStartTime2) / 1000;
+            String text = latestStatus.get() + " (" + latestProgress.get() + "%)"
+                    + "\n已耗时: " + formatElapsed(elapsedSec)
+                    + "\n\nPrompt：" + prompt
+                    + "\n分辨率：" + width + "x" + height
+                    + "\n帧数：" + finalNumFrames1 + " @ " + formatFps(fps) + "fps";
+            genBubble.contentArea.setText(text);
+            genBubble.recalcContentSize();
+            genBubble.revalidateAndRepaint();
+            int newH = genBubble.getPreferredSize().height + 4;
+            wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH));
+            wrapper.revalidate();
+            wrapper.repaint();
+        });
+        videoTimer2.start();
+
+        // 在后台虚拟线程构建请求并调用 API（IO 密集，适合虚拟线程）
+        int finalNumFrames = numFrames;
+        List<String> finalResolvedUrls = resolvedUrls;
+        String finalUrlInfoText = urlInfoText;
+        Thread.startVirtualThread(() -> {
+            try {
+                AgnesVideoRequest req = buildVideoRequest(mode, prompt, width, height, finalNumFrames, fps, seed, finalResolvedUrls);
 
         // 异步创建并轮询
         String aiTimeFinal = aiTime;
-        int finalNumFrames = numFrames;
         service.createAndWaitAsync(req,
                 5000, // 5 秒轮询
                 30 * 60 * 1000, // 最长 30 分钟
                 progress -> {
-                    // 进度更新
-                    String progressText = progress.getStatusText()
-                            + " (" + progress.progress + "%)"
-                            + "\n\nPrompt：" + prompt
-                            + "\n分辨率：" + width + "x" + height
-                            + "\n帧数：" + finalNumFrames + " @ " + fps + "fps";
-                    genBubble.contentArea.setText(progressText);
-                    genBubble.recalcContentSize();
-                    genBubble.revalidateAndRepaint();
-                    int newH2 = genBubble.getPreferredSize().height + 4;
-                    wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, newH2));
-                    wrapper.revalidate();
-                    wrapper.repaint();
+                    // 进度更新（存储最新状态，由 Timer 统一刷新 UI）
+                    latestStatus.set(progress.getStatusText());
+                    latestProgress.set(progress.progress);
                 },
                 completed -> {
                     // 成功
                     SwingUtilities.invokeLater(() -> {
+                        videoTimer2.stop();
                         String videoUrl = completed.getVideoUrl();
                         String sizeInfo = completed.getSize() != null ? completed.getSize() : (width + "x" + height);
                         String secondsInfo = completed.getSeconds() != null ? completed.getSeconds() : "—";
@@ -4294,12 +4968,12 @@ public class AiChatPanel extends AbstractCommandPanel {
                             try {
                                 genBubble.addVideoPanel(videoUrl);
                             } catch (Exception ex) {
-                                genBubble.contentArea.append("\n\n⚠ 视频加载失败：" + ex.getMessage());
+                                genBubble.contentArea.append("\n\n[!] 视频加载失败：" + ex.getMessage());
                                 genBubble.recalcContentSize();
                                 genBubble.revalidateAndRepaint();
                             }
                         } else {
-                            genBubble.contentArea.append("\n\n⚠ 未获取到视频 URL");
+                            genBubble.contentArea.append("\n\n[!] 未获取到视频 URL");
                             genBubble.recalcContentSize();
                             genBubble.revalidateAndRepaint();
                         }
@@ -4314,11 +4988,13 @@ public class AiChatPanel extends AbstractCommandPanel {
                     });
                 },
                 error -> {
-                    // 失败
+                    // 失败：显示已解析的 URL 便于排查问题
                     SwingUtilities.invokeLater(() -> {
+                        videoTimer2.stop();
                         genBubble.contentArea.setText("[失败] 视频生成失败"
                                 + "\n\nPrompt：" + prompt
-                                + "\n\n错误：" + error.getMessage());
+                                + "\n\n详情：" + formatApiError(error)
+                                + finalUrlInfoText);
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
                         int newH4 = genBubble.getPreferredSize().height + 4;
@@ -4331,6 +5007,40 @@ public class AiChatPanel extends AbstractCommandPanel {
                     });
                 }
         );
+            } catch (Exception ex) {
+                SwingUtilities.invokeLater(() -> {
+                    videoTimer2.stop();
+                    genBubble.contentArea.setText("[失败] 读取本地图片失败\n\n" + formatApiError(ex));
+                    genBubble.recalcContentSize();
+                    genBubble.revalidateAndRepaint();
+                    chatMessagePanel.revalidate();
+                    chatMessagePanel.repaint();
+                    scrollToBottom();
+                });
+            }
+        });
+    }
+
+    /** 格式化耗时（秒 → mm:ss 或 ss秒） */
+    private static String formatElapsed(long seconds) {
+        if (seconds < 60) {
+            return seconds + "秒";
+        }
+        long min = seconds / 60;
+        long sec = seconds % 60;
+        return String.format("%d分%02d秒", min, sec);
+    }
+
+    /** 格式化异常信息，包含类型、消息和原因链 */
+    private static String formatApiError(Exception ex) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(ex.toString());
+        Throwable cause = ex.getCause();
+        while (cause != null) {
+            sb.append("\n原因: ").append(cause.toString());
+            cause = cause.getCause();
+        }
+        return sb.toString();
     }
 
     /** 构建视频生成请求 */
@@ -4388,6 +5098,15 @@ public class AiChatPanel extends AbstractCommandPanel {
                 String url  = config.get("ai.model." + i + ".url", "");
                 String name = config.get("ai.model." + i + ".name", "");
                 ModelConfig mc = new ModelConfig(al, key, url, name);
+                // 恢复扩展配置（视频/图片生成参数等）
+                int extraCount = Integer.parseInt(config.get("ai.model." + i + ".extra.count", "0"));
+                for (int k = 0; k < extraCount; k++) {
+                    String ek = config.get("ai.model." + i + ".extra." + k + ".key", "");
+                    String ev = config.get("ai.model." + i + ".extra." + k + ".val", "");
+                    if (!ek.isEmpty()) {
+                        mc.putExtra(ek, ev);
+                    }
+                }
                 modelConfigs.add(mc);
             }
         }
@@ -4410,6 +5129,20 @@ public class AiChatPanel extends AbstractCommandPanel {
             config.set("ai.model." + i + ".key",   mc.getApiKey());
             config.set("ai.model." + i + ".url",   mc.getApiUrl());
             config.set("ai.model." + i + ".name",  mc.getModelName());
+
+            // 保存扩展配置（视频/图片生成参数等）
+            Map<String, String> extra = mc.getExtraConfig();
+            if (extra != null && !extra.isEmpty()) {
+                config.set("ai.model." + i + ".extra.count", String.valueOf(extra.size()));
+                int k = 0;
+                for (Map.Entry<String, String> e : extra.entrySet()) {
+                    config.set("ai.model." + i + ".extra." + k + ".key", e.getKey());
+                    config.set("ai.model." + i + ".extra." + k + ".val", e.getValue());
+                    k++;
+                }
+            } else {
+                config.set("ai.model." + i + ".extra.count", "0");
+            }
         }
 
         // 保存 Agnes Image API Key

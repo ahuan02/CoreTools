@@ -124,15 +124,9 @@ dependencies {
     // ---- Redis 客户端 ----
     implementation 'redis.clients:jedis:7.5.2'
 
-    // ---- radiance依赖
+    // ---- radiance依赖（仅 animation 模块被 AiChatPanel 使用）
     implementation 'org.pushing-pixels:radiance-animation:8.5.0'
     implementation 'org.pushing-pixels:radiance-common:8.5.0'
-    implementation 'org.pushing-pixels:radiance-theming:8.5.0'
-    implementation 'org.pushing-pixels:radiance-component:8.5.0'
-    implementation 'org.pushing-pixels:radiance-theming-extras:8.5.0'
-    implementation 'org.pushing-pixels:radiance-svg-transcoder:8.5.0'
-    implementation 'org.pushing-pixels:radiance-svg-transcoder-gradle-plugin:8.5.0'
-    implementation 'org.pushing-pixels:radiance-theming-debugger:8.5.0'
     // ---- 各个平台底层信息获取 ----
     implementation 'com.github.oshi:oshi-benchmark:7.3.1'
 
