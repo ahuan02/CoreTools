@@ -93,6 +93,24 @@ dependencies {
     runtimeOnly "org.bytedeco:ffmpeg:6.1.1-${javacvVer}:windows-x86_64"
     runtimeOnly "org.bytedeco:opencv:4.9.0-${javacvVer}:windows-x86_64"
     runtimeOnly "org.bytedeco:openblas:0.3.26-${javacvVer}:windows-x86_64"
+    // macOS 原生库（兼容 Intel + Apple Silicon）
+//   runtimeOnly "org.bytedeco:javacpp:${javacvVer}:macosx-x86_64"
+//   runtimeOnly "org.bytedeco:javacpp:${javacvVer}:macosx-arm64"
+//   runtimeOnly "org.bytedeco:ffmpeg:6.1.1-${javacvVer}:macosx-x86_64"
+//   runtimeOnly "org.bytedeco:ffmpeg:6.1.1-${javacvVer}:macosx-arm64"
+//   runtimeOnly "org.bytedeco:opencv:4.9.0-${javacvVer}:macosx-x86_64"
+//   runtimeOnly "org.bytedeco:opencv:4.9.0-${javacvVer}:macosx-arm64"
+//   runtimeOnly "org.bytedeco:openblas:0.3.26-${javacvVer}:macosx-x86_64"
+//   runtimeOnly "org.bytedeco:openblas:0.3.26-${javacvVer}:macosx-arm64"
+    // Linux 原生库（兼容 x86_64 + ARM64）
+//     runtimeOnly "org.bytedeco:javacpp:${javacvVer}:linux-x86_64"
+//     runtimeOnly "org.bytedeco:javacpp:${javacvVer}:linux-arm64"
+//     runtimeOnly "org.bytedeco:ffmpeg:6.1.1-${javacvVer}:linux-x86_64"
+//     runtimeOnly "org.bytedeco:ffmpeg:6.1.1-${javacvVer}:linux-arm64"
+//     runtimeOnly "org.bytedeco:opencv:4.9.0-${javacvVer}:linux-x86_64"
+//     runtimeOnly "org.bytedeco:opencv:4.9.0-${javacvVer}:linux-arm64"
+//     runtimeOnly "org.bytedeco:openblas:0.3.26-${javacvVer}:linux-x86_64"
+//     runtimeOnly "org.bytedeco:openblas:0.3.26-${javacvVer}:linux-arm64"
 //    testImplementation platform('org.junit:junit-bom:5.10.0')
 //    testImplementation 'org.junit.jupiter:junit-jupiter'
     implementation 'com.fazecast:jSerialComm:[2.0.0,3.0.0)'
@@ -176,7 +194,8 @@ tasks.compileJava {
 
 runtime {
     options = ['--strip-debug', '--compress', 'zip-9', '--no-header-files', '--no-man-pages',
-               '--include-locales', 'en,zh']
+               '--include-locales', 'en,zh',
+               '--bind-services']
 
     modules = [
             'java.base',
@@ -186,7 +205,10 @@ runtime {
             'java.management',
             'java.net.http',
             'java.security.jgss',
+            'java.security.sasl',
             'java.xml',
+            'jdk.crypto.ec',
+            'jdk.net',
             'jdk.unsupported',
             'jdk.localedata'
     ]

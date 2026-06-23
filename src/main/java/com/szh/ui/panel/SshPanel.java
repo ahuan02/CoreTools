@@ -1008,6 +1008,13 @@ public class SshPanel extends AbstractCommandPanel {
         SshConnEditDialog dlg = new SshConnEditDialog(SwingUtilities.getWindowAncestor(this), conn);
         dlg.setVisible(true);
         if (dlg.confirmed) {
+            // 把对话框里的新值写回原对象
+            SshConn updated = dlg.getConnection();
+            conn.name = updated.name;
+            conn.host = updated.host;
+            conn.port = updated.port;
+            conn.username = updated.username;
+            conn.password = updated.password;
             connList.repaint();
             saveConnectionsToConfig();
             appendTerminal("[已更新连接: " + conn + "]\n", C_SYS);
@@ -2179,6 +2186,13 @@ public class SshPanel extends AbstractCommandPanel {
 
                 SshClient client = SshClient.setUpDefaultClient();
                 conn.client = client;
+
+                // 设置客户端级超时（防止防火墙静默丢包导致无限等待），单位：毫秒
+                client.getProperties().put("io-connect-timeout", 10000L);
+                client.getProperties().put("auth-timeout", 10000L);
+                client.getProperties().put("idle-timeout", 30000L);
+                client.getProperties().put("nio2-read-timeout", 15000L);
+
                 client.start();
 
                 // ---- 主机密钥验证 ----
@@ -2304,18 +2318,21 @@ public class SshPanel extends AbstractCommandPanel {
                 conn.channel = null;
             }
         } catch (Exception ignored) {}
-        try {
-            if (conn.session != null) {
-                conn.session.close(true);
-                conn.session = null;
-            }
-        } catch (Exception ignored) {}
-        try {
-            if (conn.client != null) {
-                conn.client.stop();
-                conn.client = null;
-            }
-        } catch (Exception ignored) {}
+            try {
+                if (conn.session != null) {
+                    conn.session.close();   // 先 close 不再等待数据包，减少 IOCP 回调
+                    conn.session = null;
+                }
+            } catch (Exception ignored) {}
+            // 留出时间让 Windows IOCP 完成剩余 I/O 事件，否则 client.stop() 关掉 NIO 线程池后
+            // InnocuousThread 里 IOCP 回调会报 IllegalStateException: Executor has been shut down
+            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                if (conn.client != null) {
+                    conn.client.stop();
+                    conn.client = null;
+                }
+            } catch (Exception ignored) {}
 
         SwingUtilities.invokeLater(() -> {
             synchronized (connLock) {
@@ -2602,6 +2619,9 @@ public class SshPanel extends AbstractCommandPanel {
             wrapper.add(form, BorderLayout.CENTER);
             wrapper.add(btnPanel, BorderLayout.SOUTH);
             add(wrapper);
+
+            // 回车键触发确定按钮
+            getRootPane().setDefaultButton(okBtn);
 
             pack();
             setLocationRelativeTo(getOwner());
