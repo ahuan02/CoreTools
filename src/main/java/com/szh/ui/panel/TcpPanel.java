@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -62,7 +63,7 @@ public class TcpPanel extends AbstractCommandPanel {
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final Map<String, SocketChannel> clients = new ConcurrentHashMap<>();
         private final Map<SocketChannel, TcpClientCtx> clientCtxMap = new ConcurrentHashMap<>();
-        private Thread nioThread;
+        private java.util.concurrent.Future<?> nioFuture;
         private DefaultListModel<String> clientListModel;
         private JList<String> clientList;
         private final Map<String, String> clientNicknames = new ConcurrentHashMap<>();
@@ -215,7 +216,7 @@ public class TcpPanel extends AbstractCommandPanel {
                 startBtn.setEnabled(false); stopBtn.setEnabled(true); portField.setEnabled(false);
                 logSys(logPane, "TCP 服务端已启动（NIO），监听端口 " + port);
 
-                nioThread = Thread.ofVirtual().name("tcp-server-nio").start(() -> {
+                nioFuture = ThreadPoolUtil.submitVirtual(() -> {
                     while (running.get()) {
                         try {
                             if (selector.select(500) <= 0) continue;

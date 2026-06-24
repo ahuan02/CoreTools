@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -61,7 +62,7 @@ public class UdpPanel extends AbstractCommandPanel {
         private DatagramChannel serverChannel;
         private Selector selector;
         private final AtomicBoolean running = new AtomicBoolean(false);
-        private Thread nioThread;
+        private java.util.concurrent.Future<?> nioFuture;
         private final Map<String, InetSocketAddress> recentClients = new LinkedHashMap<>();
         private volatile String cachedReplyText = "";
         private volatile Charset cachedCharset = StandardCharsets.UTF_8;
@@ -192,7 +193,7 @@ public class UdpPanel extends AbstractCommandPanel {
                 portField.setEnabled(false);
                 logSys(logPane, "UDP 服务端已启动（NIO），监听端口 " + port);
 
-                nioThread = Thread.ofVirtual().name("udp-server-nio").start(() -> {
+                nioFuture = ThreadPoolUtil.submitVirtual(() -> {
                     ByteBuffer recvBuf = ByteBuffer.allocate(65535);
                     while (running.get()) {
                         try {

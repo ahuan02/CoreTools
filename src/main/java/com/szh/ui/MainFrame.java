@@ -107,28 +107,31 @@ public class MainFrame extends JFrame {
                 trayImage = createFallbackIcon(16);
             }
 
-            // 构造原生弹出菜单（Windows 上唯一可靠的方式）
-            PopupMenu popup = new PopupMenu();
+            // 使用 JPopupMenu 替代原生 PopupMenu，避免 Windows 原生菜单 emoji 乱码
+            JPopupMenu trayMenu = createTrayMenu();
 
-            MenuItem openItem = new MenuItem("📂 打开界面");
-            openItem.addActionListener(e -> restoreFromTray());
-
-            MenuItem exitItem = new MenuItem("✕ 退出");
-            exitItem.addActionListener(e -> exitApplication());
-
-            popup.add(openItem);
-            popup.addSeparator();
-            popup.add(exitItem);
-
-            trayIcon = new TrayIcon(trayImage, "CoreTools", popup);
+            trayIcon = new TrayIcon(trayImage, "CoreTools");
             trayIcon.setImageAutoSize(true);
 
-            // 左键单击打开窗口
+            // 右键弹出 JPopupMenu，左键单击打开窗口
             trayIcon.addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
                     if (e.getButton() == MouseEvent.BUTTON1 && e.getClickCount() == 1) {
                         restoreFromTray();
+                    }
+                }
+
+                @Override
+                public void mouseReleased(MouseEvent e) {
+                    if (e.isPopupTrigger()) {
+                        // 用屏幕绝对坐标定位（e.getX/Y 是相对于小图标的，不对）
+                        Point screenLoc = MouseInfo.getPointerInfo().getLocation();
+                        // 预计算菜单高度，让菜单从鼠标上方弹出，避免遮挡托盘图标
+                        trayMenu.pack(); // 确保 preferredSize 有效
+                        int offsetY = trayMenu.getPreferredSize().height + 8; // 上方 8px 偏移
+                        trayMenu.setLocation(screenLoc.x - 10, screenLoc.y - offsetY);
+                        trayMenu.setVisible(true);
                     }
                 }
             });
@@ -139,6 +142,24 @@ public class MainFrame extends JFrame {
             traySupported = false;
             e.printStackTrace();
         }
+    }
+
+    /** 创建自定义 JPopupMenu（非原生，支持 emoji 和 FlatLaf 主题） */
+    private JPopupMenu createTrayMenu() {
+        JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem openItem = new JMenuItem("\uD83D\uDCC2 打开界面"); // 📂
+        openItem.setFont(UIManager.getFont("MenuItem.font"));
+        openItem.addActionListener(e -> restoreFromTray());
+
+        JMenuItem exitItem = new JMenuItem("\u2715 退出"); // ✕
+        exitItem.addActionListener(e -> exitApplication());
+
+        menu.add(openItem);
+        menu.addSeparator();
+        menu.add(exitItem);
+
+        return menu;
     }
 
     /** 兜底图标（应用图标加载失败时） */
@@ -272,7 +293,7 @@ public class MainFrame extends JFrame {
     public String createPanel(int index) {
         switch (index) {
             case 0:  panels.put("AI 对话", new AiChatPanel());        break;
-            case 1:  panels.put("系统监控", new SystemMonitorPanel());  break;
+            case 1:  panels.put("隧道穿透", new NgrokPanel());         break;
             case 2:  panels.put("串口调试", new SerialPanel());         break;
             case 3:  panels.put("HTTP", new HttpPanel());             break;
             case 4:  panels.put("UDP", new UdpPanel());               break;
@@ -292,7 +313,7 @@ public class MainFrame extends JFrame {
             case 18: panels.put("MQTT", new MqttPanel());            break;
             case 19: panels.put("gRPC", new GrpcPanel());            break;
             case 20: panels.put("二维码", new QrCodePanel());          break;
-            case 21: panels.put("隧道穿透", new NgrokPanel());         break;
+            case 21: panels.put("系统监控", new SystemMonitorPanel());  break;
             default: return null;
         }
         // 返回最后 put 的名字（Map 保证插入顺序，切合 index）
@@ -327,7 +348,9 @@ public class MainFrame extends JFrame {
 
         // 加载各面板保存的配置
         for (AbstractCommandPanel panel : panels.values()) {
-            panel.loadConfig(config);
+            if (panel != null) {
+                panel.loadConfig(config);
+            }
         }
 
         // 如果有背景图，重新应用透明——背景在构造时已设置到 contentPane，
@@ -515,7 +538,9 @@ public class MainFrame extends JFrame {
         config.set("font.color", String.valueOf(currentTextColor.getRGB()));
         // 通知各面板保存配置
         for (AbstractCommandPanel panel : panels.values()) {
-            panel.saveConfig(config);
+            if (panel != null){
+                panel.saveConfig(config);
+            }
         }
         config.save();
     }

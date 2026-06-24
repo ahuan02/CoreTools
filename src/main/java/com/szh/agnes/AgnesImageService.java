@@ -2,6 +2,7 @@ package com.szh.agnes;
 
 import com.szh.agnes.entity.AgnesImageRequest;
 import com.szh.agnes.entity.AgnesImageResponse;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import java.net.URI;
@@ -159,7 +160,7 @@ public class AgnesImageService {
     public void generateAsync(AgnesImageRequest request,
                               Consumer<AgnesImageResponse> onSuccess,
                               Consumer<Exception> onError) {
-        Thread.ofVirtual().start(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 AgnesImageResponse resp = generate(request);
                 if (onSuccess != null) {
@@ -182,7 +183,7 @@ public class AgnesImageService {
     public void generateImageBytesAsync(AgnesImageRequest request,
                                         Consumer<byte[]> onImageReady,
                                         Consumer<Exception> onError) {
-        Thread.ofVirtual().start(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 byte[] imageBytes = generateAndDownload(request);
                 if (imageBytes != null && onImageReady != null) {

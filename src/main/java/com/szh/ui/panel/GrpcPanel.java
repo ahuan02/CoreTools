@@ -10,6 +10,7 @@ import com.google.protobuf.util.JsonFormat;
 import com.szh.grpc.TestGrpcServer;
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import io.grpc.CallOptions;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -315,7 +316,7 @@ public class GrpcPanel extends AbstractCommandPanel {
 
         final String fHost = host;
         final int fPort = port;
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 logSys(logPane, "正在连接 " + fHost + ":" + fPort + " ...");
                 channel = ManagedChannelBuilder.forAddress(fHost, fPort)
@@ -343,7 +344,7 @@ public class GrpcPanel extends AbstractCommandPanel {
             logWarn(logPane, "未连接");
             return;
         }
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 channel.shutdown().awaitTermination(3, TimeUnit.SECONDS);
                 logSys(logPane, "已断开连接");
@@ -371,7 +372,7 @@ public class GrpcPanel extends AbstractCommandPanel {
             logWarn(logPane, "请先连接");
             return;
         }
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 serviceMap.clear();
                 ServerReflectionGrpc.ServerReflectionStub stub =
@@ -511,7 +512,7 @@ public class GrpcPanel extends AbstractCommandPanel {
         }
         final String jsonInput = requestArea.getText().trim();
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 // 解析 JSON → DynamicMessage
                 DynamicMessage.Builder reqBuilder = DynamicMessage.newBuilder(md.getInputType());
@@ -591,7 +592,7 @@ public class GrpcPanel extends AbstractCommandPanel {
     }
 
     private void doStartTestServer() {
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 int port;
                 try { port = Integer.parseInt(portField.getText().trim()); }
@@ -616,7 +617,7 @@ public class GrpcPanel extends AbstractCommandPanel {
 
     private void doStopTestServer() {
         if (testServer == null || !testServer.isRunning()) return;
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 testServer.stop();
                 testServer = null;

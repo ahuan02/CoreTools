@@ -11,6 +11,7 @@ import com.szh.manager.ConfigManager;
 import com.szh.ui.MainFrame;
 import com.szh.utils.AiUtils;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
@@ -1005,8 +1006,8 @@ public class AiChatPanel extends AbstractCommandPanel {
         setModelButtonsEnabled(false);
         // 思考中状态已在 AI 气泡内部显示（● AI 思考中...），不再单独添加指示器
 
-        // 异步流式调用 AI API（虚拟线程）
-        Thread.ofVirtual().start(() -> {
+        // 异步流式调用 AI API
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 String apiKey = selectedModel.getApiKey();
                 String apiUrl = selectedModel.getApiUrl();
@@ -2848,7 +2849,7 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         /** 异步加载图片 */
         private void loadImageAsync(String imageUrl) {
-            Thread.ofVirtual().start(() -> {
+            ThreadPoolUtil.submitVirtual(() -> {
                 try {
                     LoadedImage loaded = downloadImage(imageUrl);
                     if (loaded != null && loaded.image != null) {
@@ -3789,7 +3790,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         private volatile boolean ready = false;    // 下载完成、grabber 已初始化
 
         private FFmpegFrameGrabber grabber;
-        private Thread grabThread;
+        private java.util.concurrent.Future<?> grabFuture;
         private volatile boolean running = false;
         private volatile boolean playing = false;
         private volatile boolean videoEnded = false;
@@ -3949,7 +3950,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 if (defaultName.isEmpty()) defaultName = "video.mp4";
                 fc.setSelectedFile(new java.io.File(defaultName));
                 if (fc.showSaveDialog(SwingUtilities.getWindowAncestor(this)) == JFileChooser.APPROVE_OPTION) {
-                    Thread.ofVirtual().start(() -> {
+                    ThreadPoolUtil.submitVirtual(() -> {
                         try {
                             java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
                                     .followRedirects(java.net.http.HttpClient.Redirect.NORMAL).build();
@@ -4174,7 +4175,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             final long targetSeekMs = seekToMs; // 捕获 seek 目标
             seekToMs = -1; // 消费掉
 
-            grabThread = new Thread(() -> {
+            grabFuture = ThreadPoolUtil.submitPlatform(() -> {
                 try {
                     disposeGrabber();
                     closeAudioLine();
@@ -4335,9 +4336,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                         stopSeekUpdateTimer();
                     }
                 }
-            }, "chat-video-player");
-            grabThread.setDaemon(true);
-            grabThread.start();
+            });
 
             // 启动进度条定时刷新
             startSeekUpdateTimer();
@@ -4414,17 +4413,17 @@ public class AiChatPanel extends AbstractCommandPanel {
             // 停止当前播放，让旧线程感知并退出
             running = false;
             playing = false;
-            Thread oldThread = grabThread;
-            grabThread = null;
-            if (oldThread != null) {
-                oldThread.interrupt();
+            final java.util.concurrent.Future<?> oldFuture = grabFuture;
+            grabFuture = null;
+            if (oldFuture != null) {
+                oldFuture.cancel(true);
             }
             // 不在这里 dispose grabber，让旧线程的 finally 块自行清理
 
-            // 等待旧线程退出后重新开始
-            Thread.ofVirtual().start(() -> {
-                if (oldThread != null) {
-                    try { oldThread.join(3000); } catch (InterruptedException ignored) {}
+            // 等待旧线程退出后重新开始（平台线程池，FFmpeg 是 JNI 调用）
+            ThreadPoolUtil.submitPlatform(() -> {
+                if (oldFuture != null) {
+                    try { oldFuture.get(3, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
                 }
                 // 旧线程已退出，清理可能残留的 grabber，然后重新开始
                 disposeGrabber();
@@ -4465,9 +4464,9 @@ public class AiChatPanel extends AbstractCommandPanel {
             label.setText(String.format("%02d:%02d", min, sec));
         }
 
-        /** 后台预下载视频到本地临时文件，并抓取首帧作为缩略图 */
+        /** 后台预下载视频到本地临时文件，并抓取首帧作为缩略图（含 FFmpeg JNI 调用，用平台线程池） */
         private void startPreload() {
-            Thread.ofVirtual().start(() -> {
+            ThreadPoolUtil.submitPlatform(() -> {
                 boolean downloadOk = false;
                 try {
                     // === 阶段1：下载视频到临时文件 ===
@@ -4599,9 +4598,9 @@ public class AiChatPanel extends AbstractCommandPanel {
             seekRequested = false;
             seekToMs = -1;
             stopSeekUpdateTimer();
-            if (grabThread != null) {
-                grabThread.interrupt();
-                grabThread = null;
+            if (grabFuture != null) {
+                grabFuture.cancel(true);
+                grabFuture = null;
             }
             disposeGrabber();
             closeAudioLine();
@@ -4997,8 +4996,8 @@ public class AiChatPanel extends AbstractCommandPanel {
         });
         imgTimer.start();
 
-        // 在后台虚拟线程解析本地图片并发送请求（IO密集，适合虚拟线程）
-        Thread.startVirtualThread(() -> {
+        // 在后台线程解析本地图片并发送请求
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 List<String> resolved = resolveImageUrls(imageUrls, false);
                 AgnesImageRequest req = buildImageRequest(mode, prompt, size, resolved);
@@ -5282,7 +5281,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         int finalNumFrames = numFrames;
         List<String> finalResolvedUrls = resolvedUrls;
         String finalUrlInfoText = urlInfoText;
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 AgnesVideoRequest req = buildVideoRequest(mode, prompt, width, height, finalNumFrames, fps, seed, finalResolvedUrls);
 

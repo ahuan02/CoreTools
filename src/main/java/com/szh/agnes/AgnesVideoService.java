@@ -2,6 +2,7 @@ package com.szh.agnes;
 
 import com.szh.agnes.entity.AgnesVideoRequest;
 import com.szh.agnes.entity.AgnesVideoTaskResponse;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import java.net.URI;
@@ -297,7 +298,7 @@ public class AgnesVideoService {
         final long actualPollInterval = pollIntervalMs > 0 ? pollIntervalMs : DEFAULT_POLL_INTERVAL_MS;
         final long actualMaxWait = maxWaitMs > 0 ? maxWaitMs : DEFAULT_MAX_WAIT_MS;
 
-        Thread.ofVirtual().start(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 // Step 1: 创建任务
                 AgnesVideoTaskResponse createResp = createTask(request);
@@ -398,7 +399,7 @@ public class AgnesVideoService {
     public void downloadVideoAsync(String videoUrl,
                                    Consumer<byte[]> onSuccess,
                                    Consumer<Exception> onError) {
-        Thread.ofVirtual().start(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 byte[] data = downloadVideo(videoUrl);
                 if (onSuccess != null) {

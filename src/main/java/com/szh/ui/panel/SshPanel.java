@@ -3,6 +3,7 @@ package com.szh.ui.panel;
 import com.formdev.flatlaf.extras.FlatSVGIcon;
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import org.apache.sshd.client.SshClient;
 import org.apache.sshd.client.channel.ChannelExec;
 import org.apache.sshd.client.channel.ChannelShell;
@@ -651,7 +652,7 @@ public class SshPanel extends AbstractCommandPanel {
         synchronized (connLock) { conn = currentConn; }
         if (conn == null || !conn.connected || conn.session == null) return;
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             String cwd = cachedRemotePwd;
             if (cwd == null) {
                 // 首次连接：用 $HOME 作为初始目录
@@ -842,7 +843,7 @@ public class SshPanel extends AbstractCommandPanel {
             appendTerminal("[未连接到服务器，无法上传]\n", C_WARN);
             return;
         }
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             // 优先通过交互式 shell 执行 pwd 获取真实当前目录
             String cwd = getRemotePwdViaShell(conn.session, conn.toChannel);
             if (cwd == null) {
@@ -906,7 +907,7 @@ public class SshPanel extends AbstractCommandPanel {
             if (ret != JOptionPane.YES_OPTION) return;
         }
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             SftpClient sftp = null;
             TransferProgressDialog dlg = null;
             try {
@@ -966,7 +967,7 @@ public class SshPanel extends AbstractCommandPanel {
                 JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (ret != JOptionPane.YES_OPTION) return;
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             SftpClient sftp = null;
             try {
                 sftp = SftpClientFactory.instance().createSftpClient(conn.session);
@@ -1374,7 +1375,7 @@ public class SshPanel extends AbstractCommandPanel {
         File[] files = chooser.getSelectedFiles();
         if (files == null || files.length == 0) return;
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             // 优先通过交互式 shell 执行 pwd 获取真实当前目录
             String remoteDir = getRemotePwdViaShell(conn.session, conn.toChannel);
             if (remoteDir == null) {
@@ -1453,7 +1454,7 @@ public class SshPanel extends AbstractCommandPanel {
         }
 
         final String finalRemotePath = remotePath;
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             // 优先通过交互式 shell 获取真实当前目录
             String remoteDir = getRemotePwdViaShell(conn.session, conn.toChannel);
             if (remoteDir == null) {
@@ -1561,7 +1562,7 @@ public class SshPanel extends AbstractCommandPanel {
                                          java.util.concurrent.atomic.AtomicReference<String> errRef) {
         ChannelExec exec = null;
         OutputStream base64Encoder = null;
-        Thread stderrReader = null;
+        java.util.concurrent.Future<?> stderrReader = null;
         java.io.ByteArrayOutputStream stderrBuf = new java.io.ByteArrayOutputStream();
         try {
             String escapedPath = remotePath.replace("'", "'\\''");
@@ -1572,7 +1573,7 @@ public class SshPanel extends AbstractCommandPanel {
 
             // 启动 stderr 读取线程，捕获权限错误等
             final ChannelExec execRef = exec;
-            stderrReader = Thread.startVirtualThread(() -> {
+            stderrReader = ThreadPoolUtil.submitVirtual(() -> {
                 try {
                     java.io.InputStream errIn = execRef.getInvertedErr();
                     byte[] b = new byte[256];
@@ -1598,7 +1599,7 @@ public class SshPanel extends AbstractCommandPanel {
                 base64Encoder.flush();
             } catch (java.io.IOException e) {
                 // 写入失败通常是因为远端命令已退出（权限不足等）
-                stderrReader.join(2000);
+                try { stderrReader.get(2, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
                 String errText = stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8).trim();
                 if (!errText.isEmpty()) {
                     errRef.set("Exec错误: " + errText);
@@ -1623,7 +1624,7 @@ public class SshPanel extends AbstractCommandPanel {
             dlg.setTarget(fileSize, displayTotal);
 
             // 等待 stderr reader 完成
-            stderrReader.join(2000);
+            try { stderrReader.get(2, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
             String errText = stderrBuf.toString(java.nio.charset.StandardCharsets.UTF_8).trim();
 
             if (!verifyRemoteFile(session, escapedPath, fileSize)) {
@@ -1645,8 +1646,8 @@ public class SshPanel extends AbstractCommandPanel {
             }
             return false;
         } finally {
-            if (stderrReader != null && stderrReader.isAlive()) {
-                try { stderrReader.join(1000); } catch (InterruptedException ignored) {}
+            if (stderrReader != null && !stderrReader.isDone()) {
+                try { stderrReader.get(1, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
             }
             if (base64Encoder != null) try { base64Encoder.close(); } catch (Exception ignored) {}
             if (exec != null && exec.isOpen()) try { exec.close(true); } catch (Exception ignored) {}
@@ -2180,7 +2181,7 @@ public class SshPanel extends AbstractCommandPanel {
     // ==================== SSH 连接核心 ====================
 
     private void openConnection(SshConn conn) {
-        Thread.ofVirtual().name("ssh-" + conn.name).start(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 appendTerminal("[正在连接 " + conn.name + " (" + conn.host + ":" + conn.port + ")...]\n", C_SYS);
 

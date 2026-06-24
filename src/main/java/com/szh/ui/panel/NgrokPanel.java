@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -136,7 +137,7 @@ public class NgrokPanel extends AbstractCommandPanel {
     private JTextArea logArea;
 
     private Process tunnelProcess;
-    private Thread outputReaderThread;
+    private java.util.concurrent.Future<?> outputReaderFuture;
     private volatile boolean intentionalStop; // 是否由用户主动停止（与意外退出区分）
     private int restartCount; // 当前自动重试次数
     private static final int MAX_AUTO_RESTART = 5; // 最大自动重试次数
@@ -373,10 +374,8 @@ public class NgrokPanel extends AbstractCommandPanel {
 
         add(logPanel, BorderLayout.SOUTH);
 
-        // JVM 退出时自动停止服务器
-        Runtime.getRuntime().addShutdownHook(Thread.ofVirtual()
-                .name("file-server-shutdown")
-                .unstarted(NgrokPanel::shutdownAll));
+        // JVM 退出时自动停止服务器（ShutdownHook 必须用平台线程，虚拟线程在 JVM 关闭时无法调度）
+        Runtime.getRuntime().addShutdownHook(new Thread(NgrokPanel::shutdownAll, "file-server-shutdown"));
     }
 
     // ==================== 文件服务器 ====================
@@ -902,13 +901,13 @@ public class NgrokPanel extends AbstractCommandPanel {
         final int finalPort = port;
         final boolean finalIsDirMode = isDirMode;
 
-        Thread.ofVirtual().start(() -> {
+        ThreadPoolUtil.submitPlatform(() -> {
             try {
                 ProcessBuilder pb = new ProcessBuilder(binaryPath, "local", String.valueOf(finalPort), "--local-host", targetHost, "--to", "bore.pub");
                 pb.redirectErrorStream(true);
                 tunnelProcess = pb.start();
 
-                outputReaderThread = Thread.ofVirtual().start(() -> {
+                outputReaderFuture = ThreadPoolUtil.submitPlatform(() -> {
                     try (BufferedReader reader = new BufferedReader(
                             new InputStreamReader(tunnelProcess.getInputStream(), StandardCharsets.UTF_8))) {
                         String line;
@@ -938,7 +937,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         // 意外退出 → 自动重连
                         appendLog("隧道意外断开 (exit=" + exitCode + ")，尝试自动重连...");
                         tunnelProcess = null;
-                        outputReaderThread = null;
+                        outputReaderFuture = null;
                         autoRestartTunnel(finalPort, targetHost, finalIsDirMode, binaryPath);
                     }
                 });
@@ -948,7 +947,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         // 启动过程中的异常也尝试重连
                         appendLog("隧道启动异常: " + e.getMessage() + "，尝试自动重连...");
                         tunnelProcess = null;
-                        outputReaderThread = null;
+                        outputReaderFuture = null;
                         autoRestartTunnel(finalPort, targetHost, finalIsDirMode, binaryPath);
                         return;
                     }
@@ -986,9 +985,9 @@ public class NgrokPanel extends AbstractCommandPanel {
             }
             tunnelProcess = null;
         }
-        if (outputReaderThread != null && outputReaderThread.isAlive()) {
-            outputReaderThread.interrupt();
-            outputReaderThread = null;
+        if (outputReaderFuture != null && !outputReaderFuture.isDone()) {
+            outputReaderFuture.cancel(true);
+            outputReaderFuture = null;
         }
         if (dirModeBtn.isSelected()) {
             stopDirHttpServer();
@@ -1044,14 +1043,7 @@ public class NgrokPanel extends AbstractCommandPanel {
         tunnelStatusLabel.setText("自动重连中 (" + restartCount + "/" + MAX_AUTO_RESTART + ") ...");
         tunnelStatusLabel.setForeground(Color.ORANGE);
 
-        Thread.ofVirtual().start(() -> {
-            try {
-                TimeUnit.SECONDS.sleep(delaySec);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-
+        ThreadPoolUtil.submitPlatformDelay(delaySec * 1000L, () -> {
             SwingUtilities.invokeLater(() -> {
                 if (intentionalStop) return; // 等待期间用户点了停止
 
@@ -1064,7 +1056,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                     pb.redirectErrorStream(true);
                     tunnelProcess = pb.start();
 
-                    outputReaderThread = Thread.ofVirtual().start(() -> {
+                    outputReaderFuture = ThreadPoolUtil.submitPlatform(() -> {
                         try (BufferedReader reader = new BufferedReader(
                                 new InputStreamReader(tunnelProcess.getInputStream(), StandardCharsets.UTF_8))) {
                             String line;
@@ -1091,7 +1083,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         } else {
                             appendLog("隧道再次断开 (exit=" + exitCode + ")，尝试自动重连...");
                             tunnelProcess = null;
-                            outputReaderThread = null;
+                            outputReaderFuture = null;
                             autoRestartTunnel(port, targetHost, isDirMode, binaryPath);
                         }
                     });
@@ -1100,7 +1092,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         if (!intentionalStop) {
                             appendLog("自动重连异常: " + e.getMessage());
                             tunnelProcess = null;
-                            outputReaderThread = null;
+                            outputReaderFuture = null;
                             autoRestartTunnel(port, targetHost, isDirMode, binaryPath);
                         }
                     });

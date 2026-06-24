@@ -1,6 +1,7 @@
 package com.szh;
 
 import com.szh.ui.MainFrame;
+import com.szh.utils.ThreadPoolUtil;
 import org.bytedeco.opencv.opencv_core.Mat;
 import org.bytedeco.opencv.opencv_core.Size;
 
@@ -16,6 +17,10 @@ import static org.bytedeco.opencv.global.opencv_imgproc.resize;
 
 public class Start {
     public static void main(String[] args) {
+        // 初始化全局线程池（必须在任何模块创建之前，避免 JNI 原生调用 pin 住虚拟线程）
+        ThreadPoolUtil.init();
+        Runtime.getRuntime().addShutdownHook(new Thread(ThreadPoolUtil::shutdown));
+
         // 第一步：只构建框架外壳（无面板），窗口秒开
         MainFrame frame = new MainFrame();
 

@@ -1,24 +1,28 @@
 package com.szh.ui.panel;
 
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import org.knowm.xchart.*;
 import org.knowm.xchart.style.Styler;
 import org.knowm.xchart.style.markers.SeriesMarkers;
 import oshi.SystemInfo;
 import oshi.hardware.*;
-import oshi.software.os.*;
+import oshi.software.os.OSFileStore;
+import oshi.software.os.OSProcess;
 import oshi.software.os.OperatingSystem;
 import oshi.util.FormatUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
-import javax.swing.table.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableCellRenderer;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.lang.management.*;
-import java.time.*;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
 import java.util.List;
+import java.util.*;
 
 /**
  * 系统监控面板：CPU、内存、磁盘、网卡、JVM 实时图表 + OSHI 系统详情
@@ -83,7 +87,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
     // 控制标志
     private volatile boolean running = false;
-    private Thread monitorThread;
+    private java.util.concurrent.Future<?> monitorFuture;
 
     // JMX Beans（JVM 内部信息）
     private final MemoryMXBean memBean = ManagementFactory.getMemoryMXBean();
@@ -114,7 +118,15 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
     private JTable processTable;
     private DefaultTableModel processTableModel;
     private long lastProcessRefreshTime;
+    private volatile java.util.List<OSProcess> cachedRawProcesses; // 缓存的原始进程列表，展开/折叠时直接复用
     private final Map<String, Icon> iconCache = new HashMap<>();
+    private int selectedPid = -1; // 用户选中的进程 PID（刷新时按 PID 保持选中状态）
+    private String selectedGroupName = null; // 选中的组头行纯名称（PID=-1 时用于区分各组）
+    private final Set<String> expandedGroups = new HashSet<>(); // 展开的进程组名（纯名称）
+
+
+    /** OSHI 是否已初始化 */
+    private boolean oshiInitialized;
 
     public SystemMonitorPanel() {
         super(null);
@@ -125,7 +137,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         setLayout(new BorderLayout(6, 6));
         setBackground(BG_DARK);
 
-        initOshi();
+        // OSHI 初始化推迟到 startMonitoring() 后台线程，避免 new SystemInfo() 在构造期阻塞启动
 
         add(createOverviewPanel(), BorderLayout.NORTH);
 
@@ -169,8 +181,8 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
         // ---- Tab 3: 进程 ----
         processTableModel = new DefaultTableModel(
-                new String[]{"", "PID", "名称", "CPU%", "内存MB", "用户", "线程", "命令行", ""}, 0) {
-            public boolean isCellEditable(int row, int col) { return col == 8; }
+                new String[]{"", "PID", "名称", "CPU%", "内存MB", "用户", "线程", "命令行"}, 0) {
+            public boolean isCellEditable(int row, int col) { return false; }
             public Class<?> getColumnClass(int col) { return col == 0 ? Icon.class : Object.class; }
         };
         processTable = new JTable(processTableModel);
@@ -180,6 +192,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         processTable.setFont(FONT_SMALL);
         processTable.setRowHeight(22);
         processTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        processTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         processTable.getTableHeader().setBackground(new Color(0x333333));
         processTable.getTableHeader().setForeground(WHITE);
         processTable.getTableHeader().setFont(FONT_SMALL);
@@ -198,17 +211,113 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         processTable.getColumnModel().getColumn(6).setPreferredWidth(50);
         processTable.getColumnModel().getColumn(7).setPreferredWidth(300);
 
-        // 操作按钮列
-        processTable.getColumnModel().getColumn(8).setPreferredWidth(55);
-        processTable.getColumnModel().getColumn(8).setMaxWidth(55);
-        processTable.getColumnModel().getColumn(8).setResizable(false);
-        processTable.getColumnModel().getColumn(8).setCellRenderer(new ButtonRenderer());
-        processTable.getColumnModel().getColumn(8).setCellEditor(new ButtonEditor());
+        // 点击选中行时记录 PID + 组名（组头行 PID=-1，用组名区分）
+        processTable.getSelectionModel().addListSelectionListener(e -> {
+            if (e.getValueIsAdjusting()) return;
+            int row = processTable.getSelectedRow();
+            if (row >= 0 && row < processTableModel.getRowCount()) {
+                selectedPid = (int) processTableModel.getValueAt(row, 1);
+                if (selectedPid < 0) {
+                    String name = (String) processTableModel.getValueAt(row, 2);
+                    selectedGroupName = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+                } else {
+                    selectedGroupName = null;
+                }
+            }
+        });
+
+        // 点击组头行立即切换展开/折叠（复用缓存，不重新采集，即时生效）
+        processTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                int row = processTable.rowAtPoint(e.getPoint());
+                if (row < 0 || row >= processTableModel.getRowCount()) return;
+                int pid = (int) processTableModel.getValueAt(row, 1);
+                if (pid >= 0) return;
+                String name = (String) processTableModel.getValueAt(row, 2);
+                String pureName = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+                if (expandedGroups.contains(pureName)) {
+                    expandedGroups.remove(pureName);
+                } else {
+                    expandedGroups.add(pureName);
+                }
+                // 立即用缓存刷新——零延迟，零 JNI 调用
+                refreshProcessTableFromCache();
+            }
+        });
+
+        // 自定义行渲染：组头行（PID=-1）用粗体灰色背景
+        processTable.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+            @Override
+            public Component getTableCellRendererComponent(JTable table, Object value,
+                    boolean isSelected, boolean hasFocus, int row, int column) {
+                Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+                if (row < processTableModel.getRowCount()) {
+                    int pid = (int) processTableModel.getValueAt(row, 1);
+                    if (pid < 0) { // 组头行
+                        c.setFont(FONT_SMALL.deriveFont(Font.BOLD));
+                        if (!isSelected) c.setBackground(new Color(0x383838));
+                    } else {
+                        c.setFont(FONT_SMALL);
+                        if (!isSelected) c.setBackground(BG_DARK);
+                    }
+                }
+                if (isSelected) c.setBackground(new Color(0x444444));
+                return c;
+            }
+        });
 
         JScrollPane procScroll = new JScrollPane(processTable);
         procScroll.getViewport().setBackground(BG_DARK);
+
+        // 顶部栏：提示文字 + 结束进程按钮（右上角）
+        JPanel procTopBar = new JPanel(new BorderLayout());
+        procTopBar.setBackground(BG_DARK);
+        procTopBar.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+        JLabel procHint = new JLabel("选中进程后点击右侧按钮结束");
+        procHint.setFont(FONT_SMALL);
+        procHint.setForeground(new Color(0x888888));
+        procTopBar.add(procHint, BorderLayout.WEST);
+
+        JButton killBtn = new JButton("结束进程");
+        killBtn.setFont(FONT_SMALL);
+        killBtn.setFocusPainted(false);
+        killBtn.setBackground(new Color(0xD32F2F));
+        killBtn.setForeground(Color.WHITE);
+        killBtn.setBorder(BorderFactory.createEmptyBorder(2, 10, 2, 10));
+        killBtn.addActionListener(e -> {
+            int row = processTable.getSelectedRow();
+            if (row < 0 || row >= processTableModel.getRowCount()) {
+                JOptionPane.showMessageDialog(this, "请先在列表中选中一个进程", "提示", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            int pid = (int) processTableModel.getValueAt(row, 1);
+            String name = (String) processTableModel.getValueAt(row, 2);
+
+            if (pid < 0) {
+                // 组头行：结束同名所有进程
+                String pureName = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+                int groupSize = getGroupPids(pureName).size();
+                int ret = JOptionPane.showConfirmDialog(this,
+                        "确定要结束 \"" + pureName + "\" 的全部 " + groupSize + " 个进程吗？\n（使用 /T 结束每个进程树）",
+                        "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ret == JOptionPane.YES_OPTION) {
+                    killProcessGroup(pureName);
+                }
+            } else {
+                int ret = JOptionPane.showConfirmDialog(this,
+                        "确定要结束进程 " + name + " (PID=" + pid + ") 吗？\n（使用 /T 结束进程树，含所有子进程）",
+                        "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ret == JOptionPane.YES_OPTION) {
+                    killProcess(pid);
+                }
+            }
+        });
+        procTopBar.add(killBtn, BorderLayout.EAST);
+
         JPanel procPanel = new JPanel(new BorderLayout());
         procPanel.setBackground(BG_DARK);
+        procPanel.add(procTopBar, BorderLayout.NORTH);
         procPanel.add(procScroll, BorderLayout.CENTER);
         tabbedPane.addTab("进程", procPanel);
 
@@ -417,8 +526,18 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         prevNetBytesRecv = -1;
         prevNetTime = -1;
 
-        // 虚拟线程轮询：采集数据 + 调度 EDT 更新
-        monitorThread = Thread.ofVirtual().name("SysMonitor").start(() -> {
+        // 平台线程池轮询：OSHI 是 JNI/WMI 原生调用，虚拟线程会 pin 住 carrier
+        monitorFuture = ThreadPoolUtil.submitPlatform(() -> {
+            // 首次在后台初始化 OSHI
+            if (!oshiInitialized) {
+                oshiInitialized = true;
+                initOshi();
+                SwingUtilities.invokeLater(() -> {
+                    if (tabbedPane != null && tabbedPane.getTabCount() > 1) {
+                        tabbedPane.setComponentAt(1, createSysInfoPanel());
+                    }
+                });
+            }
             while (running) {
                 try {
                     Thread.sleep(UPDATE_INTERVAL_MS);
@@ -1018,42 +1137,133 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
     // ===== 进程表 =====
 
-    /** 工作线程采集进程数据（不进 EDT） */
+    /** 工作线程采集进程数据（不进 EDT），按名称排序，同名进程聚合在一起 */
     private java.util.List<Object[]> collectProcessData() {
         java.util.List<Object[]> rows = new ArrayList<>();
         if (processTableModel == null || oshiOs == null) return rows;
         try {
             java.util.List<OSProcess> procs = oshiOs.getProcesses(
                     oshi.software.os.OperatingSystem.ProcessFiltering.ALL_PROCESSES,
-                    oshi.software.os.OperatingSystem.ProcessSorting.CPU_DESC, 50);
+                    oshi.software.os.OperatingSystem.ProcessSorting.PID_ASC, 200);
 
-            for (OSProcess p : procs) {
-                int pid = p.getProcessID();
-                rows.add(new Object[]{
-                        getProcessIcon(p),           // 0: 图标
-                        pid,                          // 1: PID
-                        p.getName(),                  // 2: 名称
-                        String.format("%.1f", 100d * p.getProcessCpuLoadCumulative()), // 3: CPU%
-                        String.format("%.1f", p.getResidentMemory() / (1024.0 * 1024.0)), // 4: 内存MB
-                        p.getUser(),                  // 5: 用户
-                        p.getThreadCount(),           // 6: 线程
-                        p.getCommandLine(),           // 7: 命令行
-                        pid                           // 8: PID(供按钮读取)
-                });
-            }
+            // 按名称排序并缓存原始列表，供展开/折叠即时刷新用
+            procs.sort(Comparator.comparing(p -> p.getName().toLowerCase()));
+            cachedRawProcesses = procs;
+
+            buildRowsFromCache(rows);
+
         } catch (Exception e) {
             // 静默降级
         }
         return rows;
     }
 
-    /** EDT 将预采集的进程数据写入表格（轻量，仅操作 TableModel） */
+    /** 从缓存的原始进程列表构建表格行（含展开/折叠状态） */
+    private void buildRowsFromCache(java.util.List<Object[]> rows) {
+        if (cachedRawProcesses == null) return;
+        String lastName = "";
+        List<OSProcess> group = new ArrayList<>();
+        for (OSProcess p : cachedRawProcesses) {
+            String name = p.getName();
+            if (!name.equalsIgnoreCase(lastName)) {
+                flushGroup(group, rows);
+                group.clear();
+                lastName = name;
+            }
+            group.add(p);
+        }
+        flushGroup(group, rows);
+    }
+
+    /** 立即刷新进程表（不重新采集，直接复用缓存 + 当前展开/折叠状态） */
+    private void refreshProcessTableFromCache() {
+        if (cachedRawProcesses == null) return;
+        java.util.List<Object[]> rows = new ArrayList<>();
+        buildRowsFromCache(rows);
+        applyProcessData(rows);
+    }
+
+    /** 输出一组同名进程：默认只显示组头（折叠），已展开的才列出子进程；单个进程直接加入 */
+    private void flushGroup(List<OSProcess> group, List<Object[]> rows) {
+        if (group.isEmpty()) return;
+        if (group.size() > 1) {
+            String pureName = group.getFirst().getName();
+            boolean expanded = expandedGroups.contains(pureName);
+            rows.add(createGroupHeader(group, expanded));
+            if (expanded) {
+                for (OSProcess p : group) {
+                    rows.add(createDataRow(p));
+                }
+            }
+        } else {
+            rows.add(createDataRow(group.get(0)));
+        }
+    }
+
+    /** 创建同名进程组汇总行（粗体灰底，带展开/折叠标记 ▸/▾） */
+    private Object[] createGroupHeader(List<OSProcess> group, boolean expanded) {
+        OSProcess first = group.getFirst();
+        double totalCpu = 0;
+        double totalMem = 0;
+        for (OSProcess p : group) {
+            totalCpu += 100d * p.getProcessCpuLoadCumulative();
+            totalMem += p.getResidentMemory() / (1024.0 * 1024.0);
+        }
+        String arrow = expanded ? "\u25BE " : "\u25B8 "; // ▾ or ▸
+        return new Object[]{
+                getProcessIcon(first),
+                -1, // PID = -1 标记为组头
+                arrow + first.getName() + " (" + group.size() + "个进程)",
+                String.format("%.1f", totalCpu),
+                String.format("%.1f", totalMem),
+                first.getUser(),
+                "",
+                expanded ? "点击收起" : "点击展开",
+        };
+    }
+
+    /** 创建单个进程数据行 */
+    private Object[] createDataRow(OSProcess p) {
+        int pid = p.getProcessID();
+        return new Object[]{
+                getProcessIcon(p),
+                pid,
+                p.getName(),
+                String.format("%.1f", 100d * p.getProcessCpuLoadCumulative()),
+                String.format("%.1f", p.getResidentMemory() / (1024.0 * 1024.0)),
+                p.getUser(),
+                p.getThreadCount(),
+                p.getCommandLine(),
+        };
+    }
+
+    // ===== 进程图标 =====
+
+    /** EDT 将预采集的进程数据写入表格，按 PID + 组名保持选中状态 */
     private void applyProcessData(java.util.List<Object[]> rows) {
         if (processTableModel == null) return;
         try {
             processTableModel.setRowCount(0);
+            int selectRow = -1;
             for (Object[] row : rows) {
                 processTableModel.addRow(row);
+                int pid = (int) row[1];
+                if (pid > 0 && pid == selectedPid) {
+                    selectRow = processTableModel.getRowCount() - 1;
+                } else if (pid < 0 && selectedGroupName != null) {
+                    String name = (String) row[2];
+                    String pure = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+                    if (pure.equals(selectedGroupName)) {
+                        selectRow = processTableModel.getRowCount() - 1;
+                    }
+                }
+            }
+            if (selectRow >= 0) {
+                processTable.setRowSelectionInterval(selectRow, selectRow);
+            } else {
+                processTable.clearSelection();
+                selectedPid = -1;
+                selectedGroupName = null;
             }
         } catch (Exception e) {
             // 静默降级
@@ -1115,24 +1325,57 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         return null;
     }
 
-    /** 结束指定 PID 的进程 */
+    /** 结束指定 PID 的进程（Windows 用 /T 结束整个进程树，Linux 用 kill -9） */
     private void killProcess(int pid) {
         try {
             String os = System.getProperty("os.name").toLowerCase();
-            String cmd = Arrays.toString(os.contains("win")
-                    ? new String[]{"taskkill", "/PID", String.valueOf(pid), "/F"}
-                    : new String[]{"kill", "-9", String.valueOf(pid)});
             if (os.contains("win")) {
-                new ProcessBuilder("taskkill", "/PID", String.valueOf(pid), "/F")
+                // /T = 结束进程树（父进程 + 所有子进程）
+                new ProcessBuilder("taskkill", "/PID", String.valueOf(pid), "/T", "/F")
                         .redirectErrorStream(true).start();
             } else {
                 new ProcessBuilder("kill", "-9", String.valueOf(pid))
                         .redirectErrorStream(true).start();
             }
+            selectedPid = -1;
+            selectedGroupName = null;
         } catch (Exception e) {
             JOptionPane.showMessageDialog(this, "结束进程失败: " + e.getMessage(),
                     "错误", JOptionPane.ERROR_MESSAGE);
         }
+    }
+
+    /** 获取同名进程组中所有 PID */
+    private List<Integer> getGroupPids(String name) {
+        List<Integer> pids = new ArrayList<>();
+        for (int i = 0; i < processTableModel.getRowCount(); i++) {
+            String rowName = (String) processTableModel.getValueAt(i, 2);
+            if (rowName != null && rowName.equals(name)) {
+                int pid = (int) processTableModel.getValueAt(i, 1);
+                if (pid > 0) pids.add(pid);
+            }
+        }
+        return pids;
+    }
+
+    /** 结束同名进程组中的所有进程 */
+    private void killProcessGroup(String name) {
+        List<Integer> pids = getGroupPids(name);
+        if (pids.isEmpty()) return;
+        for (int pid : pids) {
+            try {
+                String os = System.getProperty("os.name").toLowerCase();
+                if (os.contains("win")) {
+                    new ProcessBuilder("taskkill", "/PID", String.valueOf(pid), "/T", "/F")
+                            .redirectErrorStream(true).start();
+                } else {
+                    new ProcessBuilder("kill", "-9", String.valueOf(pid))
+                            .redirectErrorStream(true).start();
+                }
+            } catch (Exception ignored) {}
+        }
+        selectedPid = -1;
+        selectedGroupName = null;
     }
 
     /** 图标列渲染器 */
@@ -1152,60 +1395,6 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 setBackground(BG_DARK);
             }
             return this;
-        }
-    }
-
-    /** 按钮列渲染器 */
-    private static class ButtonRenderer extends JButton implements TableCellRenderer {
-        public ButtonRenderer() {
-            setFont(FONT_SMALL);
-            setMargin(new Insets(0, 0, 0, 0));
-            setFocusPainted(false);
-        }
-        @Override
-        public Component getTableCellRendererComponent(JTable table, Object value,
-                boolean isSelected, boolean hasFocus, int row, int column) {
-            setText("结束");
-            return this;
-        }
-    }
-
-    /** 按钮列编辑器（点击即触发结束进程） */
-    private class ButtonEditor extends DefaultCellEditor {
-        private final JButton button;
-        private int pid;
-
-        public ButtonEditor() {
-            super(new JCheckBox());
-            button = new JButton("结束");
-            button.setFont(FONT_SMALL);
-            button.setMargin(new Insets(0, 0, 0, 0));
-            button.setFocusPainted(false);
-            button.addActionListener(e -> {
-                if (pid > 0) {
-                    int ret = JOptionPane.showConfirmDialog(SystemMonitorPanel.this,
-                            "确定要结束进程 PID=" + pid + " 吗？",
-                            "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-                    if (ret == JOptionPane.YES_OPTION) {
-                        fireEditingStopped();
-                    } else {
-                        fireEditingCanceled();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public Component getTableCellEditorComponent(JTable table, Object value,
-                boolean isSelected, int row, int column) {
-            pid = value instanceof Integer ? (Integer) value : -1;
-            return button;
-        }
-
-        @Override
-        public Object getCellEditorValue() {
-            killProcess(pid);
-            return pid;
         }
     }
 
@@ -1252,9 +1441,9 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
     /** 供外部调用：停止轮询 */
     public void stopMonitoring() {
         running = false;
-        if (monitorThread != null) {
-            monitorThread.interrupt();
-            monitorThread = null;
+        if (monitorFuture != null) {
+            monitorFuture.cancel(true);
+            monitorFuture = null;
         }
     }
 }

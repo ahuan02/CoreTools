@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import org.eclipse.paho.mqttv5.client.*;
 import org.eclipse.paho.mqttv5.client.persist.MemoryPersistence;
 import org.eclipse.paho.mqttv5.common.MqttException;
@@ -350,7 +351,7 @@ public class MqttPanel extends AbstractCommandPanel {
         }
         final String clientId = cid;
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 logSys(allLogPane, "正在连接 " + broker + " ...");
                 MqttConnectionOptions opts = new MqttConnectionOptions();
@@ -443,7 +444,7 @@ public class MqttPanel extends AbstractCommandPanel {
             logWarn(allLogPane, "未连接");
             return;
         }
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 // 自动取消所有订阅
                 synchronized (subscribedTopics) {
@@ -495,7 +496,7 @@ public class MqttPanel extends AbstractCommandPanel {
         }
         int qos = subQosCombo.getSelectedIndex();
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 MqttSubscription sub = new MqttSubscription(topic, qos);
                 client.subscribe(new MqttSubscription[]{sub});
@@ -546,7 +547,7 @@ public class MqttPanel extends AbstractCommandPanel {
         }
 
         final String finalTopic = topic;
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 client.unsubscribe(finalTopic);
                 synchronized (subscribedTopics) {
@@ -586,7 +587,7 @@ public class MqttPanel extends AbstractCommandPanel {
         int qos = pubQosCombo.getSelectedIndex();
         boolean retained = retainedCheck.isSelected();
 
-        Thread.startVirtualThread(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
                 msg.setQos(qos);

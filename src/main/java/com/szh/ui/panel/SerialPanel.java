@@ -5,6 +5,7 @@ import com.fazecast.jSerialComm.SerialPortDataListener;
 import com.fazecast.jSerialComm.SerialPortEvent;
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -175,9 +176,9 @@ public class SerialPanel extends AbstractCommandPanel {
             startPortMonitor();
         }
 
-        /** 后台虚拟线程：每2秒检测串口增减，自动刷新下拉框 */
+        /** 后台线程：每2秒检测串口增减（SerialPort 是 JNI 调用，必须用平台线程池避免 pin 住虚拟线程 carrier） */
         private void startPortMonitor() {
-            Thread.ofVirtual().name("serial-port-monitor").start(() -> {
+            ThreadPoolUtil.submitPlatform(() -> {
                 String lastPorts = "";
                 while (monitorRunning.get()) {
                     try { Thread.sleep(2000); } catch (InterruptedException e) { break; }
