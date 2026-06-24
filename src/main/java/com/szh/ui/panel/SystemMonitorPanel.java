@@ -23,6 +23,7 @@ import java.awt.event.MouseEvent;
 import java.lang.management.*;
 import java.util.List;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 系统监控面板：CPU、内存、磁盘、网卡、JVM 实时图表 + OSHI 系统详情
@@ -115,14 +116,22 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
     private String cachedFsText = "磁盘: --";
     private String cachedTcpUdpText = "TCP/UDP: --";
 
+    // 慢操作节流：温度采集（wmic/PowerShell 很慢，降低频率）
+    private double cachedCpuTemp = -1;
+    private long lastTempRefreshTime;
+    private long lastDynamicInfoRefreshTime;
+
     private JTable processTable;
     private DefaultTableModel processTableModel;
     private long lastProcessRefreshTime;
     private volatile java.util.List<OSProcess> cachedRawProcesses; // 缓存的原始进程列表，展开/折叠时直接复用
-    private final Map<String, Icon> iconCache = new HashMap<>();
+    private final Map<String, Icon> iconCache = new ConcurrentHashMap<>();
     private int selectedPid = -1; // 用户选中的进程 PID（刷新时按 PID 保持选中状态）
     private String selectedGroupName = null; // 选中的组头行纯名称（PID=-1 时用于区分各组）
     private final Set<String> expandedGroups = new HashSet<>(); // 展开的进程组名（纯名称）
+    private volatile boolean suppressSelectionEvents = false; // 程序化操作表时抑制 ListSelectionListener
+    private final Vector<String> processColumnNames = new Vector<>(
+            Arrays.asList("", "PID", "名称", "CPU%", "内存MB", "用户", "线程", "命令行"));
 
 
     /** OSHI 是否已初始化 */
@@ -213,7 +222,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
         // 点击选中行时记录 PID + 组名（组头行 PID=-1，用组名区分）
         processTable.getSelectionModel().addListSelectionListener(e -> {
-            if (e.getValueIsAdjusting()) return;
+            if (e.getValueIsAdjusting() || suppressSelectionEvents) return;
             int row = processTable.getSelectedRow();
             if (row >= 0 && row < processTableModel.getRowCount()) {
                 selectedPid = (int) processTableModel.getValueAt(row, 1);
@@ -226,7 +235,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             }
         });
 
-        // 点击组头行立即切换展开/折叠（复用缓存，不重新采集，即时生效）
+        // 点击组头行立即切换展开/折叠（局部插入/删除，零重建）
         processTable.addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
@@ -236,13 +245,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 if (pid >= 0) return;
                 String name = (String) processTableModel.getValueAt(row, 2);
                 String pureName = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
-                if (expandedGroups.contains(pureName)) {
-                    expandedGroups.remove(pureName);
-                } else {
-                    expandedGroups.add(pureName);
-                }
-                // 立即用缓存刷新——零延迟，零 JNI 调用
-                refreshProcessTableFromCache();
+                toggleProcessGroup(row, pureName);
             }
         });
 
@@ -286,17 +289,48 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         killBtn.setForeground(Color.WHITE);
         killBtn.setBorder(BorderFactory.createEmptyBorder(2, 10, 2, 10));
         killBtn.addActionListener(e -> {
+            // 优先用 selectedPid / selectedGroupName（用户最后一次手动选择），getSelectedRow 做兜底
+            int pid = selectedPid;
+            String name = null;
+            if (pid > 0) {
+                // 从模型反查进程名（避免从可能错位的选中行读取）
+                for (int i = 0; i < processTableModel.getRowCount(); i++) {
+                    if ((int) processTableModel.getValueAt(i, 1) == pid) {
+                        name = (String) processTableModel.getValueAt(i, 2);
+                        break;
+                    }
+                }
+            }
+            if (pid <= 0 && selectedGroupName != null) {
+                // 选中的是组头
+                int groupSize = getGroupPids(selectedGroupName).size();
+                int ret = JOptionPane.showConfirmDialog(this,
+                        "确定要结束 \"" + selectedGroupName + "\" 的全部 " + groupSize + " 个进程吗？\n（使用 /T 结束每个进程树）",
+                        "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ret == JOptionPane.YES_OPTION) {
+                    killProcessGroup(selectedGroupName);
+                }
+                return;
+            }
+            if (pid > 0 && name != null) {
+                int ret = JOptionPane.showConfirmDialog(this,
+                        "确定要结束进程 " + name + " (PID=" + pid + ") 吗？\n（使用 /T 结束进程树，含所有子进程）",
+                        "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ret == JOptionPane.YES_OPTION) {
+                    killProcess(pid);
+                }
+                return;
+            }
+            // 兜底：从当前选中行读取
             int row = processTable.getSelectedRow();
             if (row < 0 || row >= processTableModel.getRowCount()) {
                 JOptionPane.showMessageDialog(this, "请先在列表中选中一个进程", "提示", JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
-            int pid = (int) processTableModel.getValueAt(row, 1);
-            String name = (String) processTableModel.getValueAt(row, 2);
-
-            if (pid < 0) {
-                // 组头行：结束同名所有进程
-                String pureName = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+            int fallbackPid = (int) processTableModel.getValueAt(row, 1);
+            String fallbackName = (String) processTableModel.getValueAt(row, 2);
+            if (fallbackPid < 0) {
+                String pureName = fallbackName.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
                 int groupSize = getGroupPids(pureName).size();
                 int ret = JOptionPane.showConfirmDialog(this,
                         "确定要结束 \"" + pureName + "\" 的全部 " + groupSize + " 个进程吗？\n（使用 /T 结束每个进程树）",
@@ -306,10 +340,10 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 }
             } else {
                 int ret = JOptionPane.showConfirmDialog(this,
-                        "确定要结束进程 " + name + " (PID=" + pid + ") 吗？\n（使用 /T 结束进程树，含所有子进程）",
+                        "确定要结束进程 " + fallbackName + " (PID=" + fallbackPid + ") 吗？\n（使用 /T 结束进程树，含所有子进程）",
                         "确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                 if (ret == JOptionPane.YES_OPTION) {
-                    killProcess(pid);
+                    killProcess(fallbackPid);
                 }
             }
         });
@@ -526,6 +560,9 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         prevNetBytesRecv = -1;
         prevNetTime = -1;
 
+        // 立即渲染空图表（零数据），不等 OSHI 初始化，让用户马上看到图表框架
+        renderChartsInitial();
+
         // 平台线程池轮询：OSHI 是 JNI/WMI 原生调用，虚拟线程会 pin 住 carrier
         monitorFuture = ThreadPoolUtil.submitPlatform(() -> {
             // 首次在后台初始化 OSHI
@@ -538,6 +575,9 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                     }
                 });
             }
+            // 初始化完成后立即采集一次，不等待
+            if (running) collectAndUpdate();
+
             while (running) {
                 try {
                     Thread.sleep(UPDATE_INTERVAL_MS);
@@ -668,16 +708,21 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                     oshiOs != null ? oshiOs.getVersionInfo().getVersion() : System.getProperty("os.version"),
                     System.getProperty("os.arch"));
 
-            // 温度采集
-            Sensors sensors = hal.getSensors();
-            double cpuTemp = sensors.getCpuTemperature();
+            // 温度采集（节流：每 5 秒一次，wmic/PowerShell 很慢）
+            long now = System.currentTimeMillis();
+            if (now - lastTempRefreshTime > 5000) {
+                lastTempRefreshTime = now;
+                cachedCpuTemp = getCpuTemperature();
+            }
 
-            // ---- 工作线程采集动态信息（不进 EDT，避免卡顿）----
-            collectDynamicInfo();
+            // ---- 工作线程采集动态信息（节流：每 3 秒一次，避免每次 OSHI WMI 查询拖慢图表刷新）----
+            if (now - lastDynamicInfoRefreshTime > 3000) {
+                lastDynamicInfoRefreshTime = now;
+                collectDynamicInfo();
+            }
 
             // 进程表数据采集（防抖：每 3 秒一次，工作线程）
             java.util.List<Object[]> processRows;
-            long now = System.currentTimeMillis();
             if (now - lastProcessRefreshTime > 3000) {
                 lastProcessRefreshTime = now;
                 processRows = collectProcessData();
@@ -687,6 +732,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
             final double finalNetSentRate = netSentRate;
             final double finalNetRecvRate = netRecvRate;
+            final double finalCpuTemp = cachedCpuTemp;
 
             // ---- EDT 更新 UI（仅轻量操作：标签文字、图表更新、重绘）----
             SwingUtilities.invokeLater(() -> {
@@ -694,7 +740,8 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                         formatNetRate(finalNetSentRate), formatNetRate(finalNetRecvRate)));
                 cpuLabel.setText(cpuText);
                 memLabel.setText(memText);
-                tempLabel.setText(String.format("温度: %.0f°C", cpuTemp));
+                tempLabel.setText(finalCpuTemp > 0
+                        ? String.format("温度: %.0f°C", finalCpuTemp) : "温度: N/A");
                 threadLabel.setText(threadText);
                 uptimeLabel.setText(uptimeText);
                 osLabel.setText(osText);
@@ -746,6 +793,69 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         } catch (Throwable t) {
             System.err.println("OSHI 初始化失败: " + t.getMessage());
         }
+    }
+
+    /** 获取 CPU 温度：OSHI 传感器 → Windows WMIC / PowerShell 兜底 */
+    private double getCpuTemperature() {
+        // 1) OSHI 传感器（跨平台首选）
+        if (hal != null) {
+            try {
+                double t = hal.getSensors().getCpuTemperature();
+                if (t > 0) return t;
+            } catch (Exception ignored) {}
+        }
+
+        // 2) Windows 兜底：wmic 查询 ThermalZoneTemperature
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("win")) {
+            try {
+                // 方式 A：wmic 查询（需要 Kelvin → °C 转换）
+                Process p = new ProcessBuilder(
+                        "wmic", "/namespace:\\\\root\\wmi", "PATH", "MSAcpi_ThermalZoneTemperature",
+                        "get", "CurrentTemperature", "/format:value")
+                        .redirectErrorStream(true).start();
+                try (java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream()))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        line = line.trim();
+                        if (line.startsWith("CurrentTemperature=")) {
+                            String val = line.substring(line.indexOf('=') + 1).trim();
+                            if (!val.isEmpty()) {
+                                // 单位是 0.1K，转换为 °C
+                                double kelvin = Double.parseDouble(val) / 10.0;
+                                double celsius = kelvin - 273.15;
+                                if (celsius > 0 && celsius < 120) return celsius;
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            try {
+                // 方式 B：PowerShell / CIM（Win10+ 更通用）
+                Process p = new ProcessBuilder(
+                        "powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature")
+                        .redirectErrorStream(true).start();
+                try (java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream()))) {
+                    String line = r.readLine();
+                    if (line != null) {
+                        line = line.trim();
+                        if (!line.isEmpty()) {
+                            try {
+                                double kelvin = Double.parseDouble(line) / 10.0;
+                                double celsius = kelvin - 273.15;
+                                if (celsius > 0 && celsius < 120) return celsius;
+                            } catch (NumberFormatException ignored2) {}
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        return 0;
     }
 
     /** 基于两次采样的 CPU tick 差值计算利用率，全平台一致 */
@@ -970,16 +1080,16 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         try {
             // --- 传感器 ---
             StringBuilder sb = new StringBuilder("传感器: ");
+            // 使用缓存的温度（已在 collectAndUpdate 中节流采集），避免重复调用慢速 wmic/PowerShell
+            sb.append(cachedCpuTemp > 0 ? String.format("%.1f°C", cachedCpuTemp) : "N/A");
             Sensors sensors = hal.getSensors();
             if (sensors != null) {
-                double temp = sensors.getCpuTemperature();
-                sb.append(temp > 0 ? String.format("%.1f°C", temp) : "N/A");
                 int[] fans = sensors.getFanSpeeds();
                 if (fans.length > 0) {
                     for (int i = 0; i < Math.min(2, fans.length); i++)
                         sb.append("  风扇").append(i + 1).append(": ").append(fans[i]).append("RPM");
                 }
-            } else sb.append("--");
+            }
             cachedSensorsText = sb.toString();
 
             // --- 负载 ---
@@ -1137,7 +1247,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
     // ===== 进程表 =====
 
-    /** 工作线程采集进程数据（不进 EDT），按名称排序，同名进程聚合在一起 */
+    /** 工作线程采集进程数据（不进 EDT），按内存占用降序，同名进程聚合在一起 */
     private java.util.List<Object[]> collectProcessData() {
         java.util.List<Object[]> rows = new ArrayList<>();
         if (processTableModel == null || oshiOs == null) return rows;
@@ -1146,9 +1256,21 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                     oshi.software.os.OperatingSystem.ProcessFiltering.ALL_PROCESSES,
                     oshi.software.os.OperatingSystem.ProcessSorting.PID_ASC, 200);
 
-            // 按名称排序并缓存原始列表，供展开/折叠即时刷新用
-            procs.sort(Comparator.comparing(p -> p.getName().toLowerCase()));
-            cachedRawProcesses = procs;
+            // 先按名称分组，组内按内存降序，组间按总内存降序
+            procs.sort(Comparator.comparing((OSProcess p) -> p.getName().toLowerCase())
+                    .thenComparing((OSProcess p) -> p.getResidentMemory(), Comparator.reverseOrder()));
+            // 按组总内存重新排序：先收集组信息，再按组内存降序排列
+            List<List<OSProcess>> grouped = groupByName(procs);
+            grouped.sort(Comparator.<List<OSProcess>>comparingLong(
+                    g -> g.stream().mapToLong(OSProcess::getResidentMemory).sum()).reversed());
+            List<OSProcess> sorted = new ArrayList<>();
+            for (List<OSProcess> g : grouped) {
+                sorted.addAll(g);
+            }
+            cachedRawProcesses = sorted;
+
+            // 后台预加载所有进程图标到缓存，避免 EDT 上首次展开时触发文件 I/O 卡顿
+            warmProcessIcons(sorted);
 
             buildRowsFromCache(rows);
 
@@ -1156,6 +1278,24 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             // 静默降级
         }
         return rows;
+    }
+
+    /** 将已按名称排好序的进程列表按名称分组（保持组内顺序） */
+    private static List<List<OSProcess>> groupByName(List<OSProcess> procs) {
+        List<List<OSProcess>> groups = new ArrayList<>();
+        List<OSProcess> current = new ArrayList<>();
+        String lastName = "";
+        for (OSProcess p : procs) {
+            String name = p.getName().toLowerCase();
+            if (!name.equals(lastName)) {
+                if (!current.isEmpty()) groups.add(current);
+                current = new ArrayList<>();
+                lastName = name;
+            }
+            current.add(p);
+        }
+        if (!current.isEmpty()) groups.add(current);
+        return groups;
     }
 
     /** 从缓存的原始进程列表构建表格行（含展开/折叠状态） */
@@ -1175,12 +1315,88 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         flushGroup(group, rows);
     }
 
-    /** 立即刷新进程表（不重新采集，直接复用缓存 + 当前展开/折叠状态） */
-    private void refreshProcessTableFromCache() {
+    /** 后台预加载所有进程图标到缓存，避免 EDT 上首次展开触发文件 I/O */
+    private void warmProcessIcons(List<OSProcess> procs) {
+        for (OSProcess p : procs) {
+            getProcessIcon(p);
+        }
+    }
+
+    /** 局部切换进程组展开/折叠：只插入/移除该组的子行，不重建整个表 */
+    private void toggleProcessGroup(int headerRow, String pureName) {
         if (cachedRawProcesses == null) return;
-        java.util.List<Object[]> rows = new ArrayList<>();
-        buildRowsFromCache(rows);
-        applyProcessData(rows);
+        List<OSProcess> group = getGroupByName(pureName);
+        if (group.size() <= 1) return; // 单进程无需展开
+
+        suppressSelectionEvents = true;
+        try {
+            if (expandedGroups.contains(pureName)) {
+                // ---- 折叠：删除 headerRow 下方的子行 ----
+                expandedGroups.remove(pureName);
+                int childCount = countChildRows(headerRow);
+                for (int i = 0; i < childCount; i++) {
+                    processTableModel.removeRow(headerRow + 1);
+                }
+                updateHeaderRow(headerRow, group, false);
+            } else {
+                // ---- 展开：在 headerRow 下方插入子行 ----
+                expandedGroups.add(pureName);
+                updateHeaderRow(headerRow, group, true);
+                for (int i = 0; i < group.size(); i++) {
+                    processTableModel.insertRow(headerRow + 1 + i, createDataRow(group.get(i)));
+                }
+            }
+            // 保持选择状态
+            if (selectedPid > 0 || selectedGroupName != null) {
+                for (int i = 0; i < processTableModel.getRowCount(); i++) {
+                    int pid = (int) processTableModel.getValueAt(i, 1);
+                    if (pid > 0 && pid == selectedPid) {
+                        processTable.setRowSelectionInterval(i, i);
+                        return;
+                    }
+                    if (pid < 0 && selectedGroupName != null) {
+                        String name = (String) processTableModel.getValueAt(i, 2);
+                        String pure = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
+                        if (pure.equals(selectedGroupName)) {
+                            processTable.setRowSelectionInterval(i, i);
+                            return;
+                        }
+                    }
+                }
+            }
+        } finally {
+            suppressSelectionEvents = false;
+        }
+    }
+
+    /** 统计 headerRow 下方连续的非组头行数量 */
+    private int countChildRows(int headerRow) {
+        int count = 0;
+        for (int r = headerRow + 1; r < processTableModel.getRowCount(); r++) {
+            if ((int) processTableModel.getValueAt(r, 1) < 0) break;
+            count++;
+        }
+        return count;
+    }
+
+    /** 更新组头行的显示（箭头和汇总数据） */
+    private void updateHeaderRow(int row, List<OSProcess> group, boolean expanded) {
+        Object[] header = createGroupHeader(group, expanded);
+        for (int col = 0; col < header.length; col++) {
+            processTableModel.setValueAt(header[col], row, col);
+        }
+    }
+
+    /** 从缓存中按名称获取同组进程列表 */
+    private List<OSProcess> getGroupByName(String name) {
+        List<OSProcess> result = new ArrayList<>();
+        if (cachedRawProcesses == null) return result;
+        for (OSProcess p : cachedRawProcesses) {
+            if (p.getName().equalsIgnoreCase(name)) {
+                result.add(p);
+            }
+        }
+        return result;
     }
 
     /** 输出一组同名进程：默认只显示组头（折叠），已展开的才列出子进程；单个进程直接加入 */
@@ -1239,25 +1455,33 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
 
     // ===== 进程图标 =====
 
-    /** EDT 将预采集的进程数据写入表格，按 PID + 组名保持选中状态 */
+    /** EDT 将预采集的进程数据批量写入表格，按 PID + 组名保持选中状态 */
     private void applyProcessData(java.util.List<Object[]> rows) {
         if (processTableModel == null) return;
+        suppressSelectionEvents = true;
         try {
-            processTableModel.setRowCount(0);
+            // 用 setDataVector 批量替换，只触发一次 tableChanged，避免逐行 addRow 的 N 次重绘
+            Vector<Vector<Object>> dataVector = new Vector<>(rows.size());
             int selectRow = -1;
+            int idx = 0;
             for (Object[] row : rows) {
-                processTableModel.addRow(row);
+                Vector<Object> vRow = new Vector<>(row.length);
+                Collections.addAll(vRow, row);
+                dataVector.add(vRow);
                 int pid = (int) row[1];
                 if (pid > 0 && pid == selectedPid) {
-                    selectRow = processTableModel.getRowCount() - 1;
+                    selectRow = idx;
                 } else if (pid < 0 && selectedGroupName != null) {
                     String name = (String) row[2];
                     String pure = name.replaceAll("^[▸▾]\\s*", "").replaceAll("\\s*\\(\\d+个进程\\)", "");
                     if (pure.equals(selectedGroupName)) {
-                        selectRow = processTableModel.getRowCount() - 1;
+                        selectRow = idx;
                     }
                 }
+                idx++;
             }
+            processTableModel.setDataVector(dataVector, processColumnNames);
+
             if (selectRow >= 0) {
                 processTable.setRowSelectionInterval(selectRow, selectRow);
             } else {
@@ -1267,6 +1491,8 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             }
         } catch (Exception e) {
             // 静默降级
+        } finally {
+            suppressSelectionEvents = false;
         }
     }
 
@@ -1417,6 +1643,35 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
     }
 
     // ==================== 生命周期 ====================
+
+    /** 立即用预填的零数据渲染图表框架，不等 OSHI 初始化 */
+    private void renderChartsInitial() {
+        List<Date> xData;
+        List<Double> cpuSnap, memSnap, jvmHeapSnap, jvmNonHeapSnap, netSentSnap, netRecvSnap;
+        synchronized (timeAxis) {
+            xData = new ArrayList<>(timeAxis);
+            cpuSnap = new ArrayList<>(cpuData);
+            memSnap = new ArrayList<>(memUsedData);
+            jvmHeapSnap = new ArrayList<>(jvmHeapData);
+            jvmNonHeapSnap = new ArrayList<>(jvmNonHeapData);
+            netSentSnap = new ArrayList<>(netSentHistory);
+            netRecvSnap = new ArrayList<>(netRecvHistory);
+        }
+        if (cpuChart != null) updateXY(cpuChart, "CPU 使用率", xData, cpuSnap);
+        if (memChart != null) {
+            updateXY(memChart, "已用", xData, memSnap);
+            updateXY(memChart, "总量", xData, new ArrayList<>(memMaxData));
+        }
+        if (jvmChart != null) {
+            updateXY(jvmChart, "堆", xData, jvmHeapSnap);
+            updateXY(jvmChart, "非堆", xData, jvmNonHeapSnap);
+        }
+        if (netChart != null) {
+            updateXY(netChart, "发送", xData, netSentSnap);
+            updateXY(netChart, "接收", xData, netRecvSnap);
+        }
+        repaintCharts();
+    }
 
     private void repaintCharts() {
         if (cpuChartPanel != null) cpuChartPanel.repaint();

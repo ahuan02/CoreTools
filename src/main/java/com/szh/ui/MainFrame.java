@@ -1,6 +1,7 @@
 package com.szh.ui;
 
 import com.formdev.flatlaf.FlatLaf;
+import com.formdev.flatlaf.extras.FlatSVGIcon;
 import com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme;
 import com.szh.manager.ConfigManager;
 import com.szh.ui.panel.*;
@@ -19,6 +20,7 @@ import java.awt.event.WindowEvent;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.net.URL;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -148,18 +150,35 @@ public class MainFrame extends JFrame {
     private JPopupMenu createTrayMenu() {
         JPopupMenu menu = new JPopupMenu();
 
-        JMenuItem openItem = new JMenuItem("\uD83D\uDCC2 打开界面"); // 📂
+        JMenuItem openItem = new JMenuItem("打开界面");
         openItem.setFont(UIManager.getFont("MenuItem.font"));
         openItem.addActionListener(e -> restoreFromTray());
+        // 加载 open.svg 图标
+        Icon openIcon = loadTrayIcon("/icons/open.svg");
+        if (openIcon != null) openItem.setIcon(openIcon);
 
-        JMenuItem exitItem = new JMenuItem("\u2715 退出"); // ✕
+        JMenuItem exitItem = new JMenuItem("退出");
         exitItem.addActionListener(e -> exitApplication());
+        // 加载 pop.svg 图标
+        Icon exitIcon = loadTrayIcon("/icons/pop.svg");
+        if (exitIcon != null) exitItem.setIcon(exitIcon);
 
         menu.add(openItem);
         menu.addSeparator();
         menu.add(exitItem);
 
         return menu;
+    }
+
+    /** 加载托盘菜单图标（16x16，失败静默返回 null） */
+    private Icon loadTrayIcon(String path) {
+        try {
+            URL url = getClass().getResource(path);
+            if (url != null) {
+                return new FlatSVGIcon(url).derive(16, 16);
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     /** 兜底图标（应用图标加载失败时） */
@@ -888,69 +907,6 @@ public class MainFrame extends JFrame {
         aboutItem.addActionListener(e -> showAboutDialog());
         aboutMenu.add(aboutItem);
         bar.add(aboutMenu);
-
-        // ---- 消息测试菜单 ----
-        JMenu msgTestMenu = new JMenu("消息测试");
-
-        JMenu typeMenu = new JMenu("类型测试（默认位置）");
-        JMenuItem testSuccess = new JMenuItem("✅ 成功消息");
-        testSuccess.addActionListener(e -> MessageDialog.success("操作执行成功！"));
-        typeMenu.add(testSuccess);
-
-        JMenuItem testInfo = new JMenuItem("ℹ️ 普通消息");
-        testInfo.addActionListener(e -> MessageDialog.info("这是一条普通信息提示。"));
-        typeMenu.add(testInfo);
-
-        JMenuItem testWarning = new JMenuItem("⚠️ 警告消息");
-        testWarning.addActionListener(e -> MessageDialog.warning("请注意：磁盘空间已不足 10%，建议及时清理。"));
-        typeMenu.add(testWarning);
-
-        JMenuItem testError = new JMenuItem("❌ 错误消息");
-        testError.addActionListener(e -> MessageDialog.error("操作失败：网络连接超时，请检查网络后重试。"));
-        typeMenu.add(testError);
-        msgTestMenu.add(typeMenu);
-
-        JMenu placementMenu = new JMenu("位置测试");
-        for (MessageDialog.Placement p : MessageDialog.Placement.values()) {
-            String label = switch (p) {
-                case TOP -> "顶部居中 ↑";
-                case TOP_LEFT -> "左上角 ↖";
-                case TOP_RIGHT -> "右上角 ↗";
-                case BOTTOM -> "底部居中 ↓";
-                case BOTTOM_LEFT -> "左下角 ↙";
-                case BOTTOM_RIGHT -> "右下角 ↘";
-                case CENTER -> "屏幕中央 ⊕";
-            };
-            JMenuItem item = new JMenuItem(label);
-            item.addActionListener(e -> {
-                MessageDialog.getInstance().show(
-                        "当前位置：" + p.name() + " —— 鼠标移入可暂停消失",
-                        MessageDialog.Type.INFO, null, 4000, p);
-            });
-            placementMenu.add(item);
-        }
-        msgTestMenu.add(placementMenu);
-
-        JMenuItem testHover = new JMenuItem("鼠标悬停测试（6 秒长消息）");
-        testHover.addActionListener(e ->
-                MessageDialog.getInstance().show(
-                        "鼠标移到我身上试试～ 我会等你移开后才消失 (6s)",
-                        MessageDialog.Type.WARNING, null, 6000));
-        msgTestMenu.add(testHover);
-
-        JMenuItem testStack = new JMenuItem("堆叠测试（连发 3 条）");
-        testStack.addActionListener(e -> {
-            MessageDialog.info("第 1 条 — 我会被顶上去");
-            Timer t = new Timer(200, ev -> MessageDialog.success("第 2 条 — 我在中间"));
-            t.setRepeats(false);
-            t.start();
-            Timer t2 = new Timer(400, ev -> MessageDialog.warning("第 3 条 — 我最后到"));
-            t2.setRepeats(false);
-            t2.start();
-        });
-        msgTestMenu.add(testStack);
-
-        bar.add(msgTestMenu);
 
         return bar;
     }
