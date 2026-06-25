@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.exceptions.JedisException;
 import redis.clients.jedis.params.ScanParams;
@@ -23,8 +24,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * Redis 客户端面板（模仿 Redis Desktop Manager 风格）
@@ -73,7 +72,6 @@ public class RedisPanel extends AbstractCommandPanel {
         "script", "eval", "evalsha", "function",
     };
 
-    private final ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
     private final ConfigManager localConfig = new ConfigManager("app_config.properties");
 
     // ===== 左侧：连接树 =====
@@ -820,7 +818,7 @@ public class RedisPanel extends AbstractCommandPanel {
 
     /** 刷新 DB 选项卡的 Key 列表，刷新完成后选中指定 key */
     private void refreshDbTabKeys(DbTabContext ctx, ConnectionInfo info, String afterRefreshKey) {
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(ctx.db);
 
@@ -875,7 +873,7 @@ public class RedisPanel extends AbstractCommandPanel {
     /** 加载 DB 选项卡中 Key 的值 */
     private void loadDbTabValue(DbTabContext ctx, ConnectionInfo info) {
         if (ctx.currentKey == null) return;
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(ctx.db);
                 String type = jedis.type(ctx.currentKey);
@@ -943,7 +941,7 @@ public class RedisPanel extends AbstractCommandPanel {
         String newValue = ctx.valueArea.getText();
         String type = ctx.keyTypeLabel.getText().replace("类型: ", "");
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(ctx.db);
                 switch (type) {
@@ -998,7 +996,7 @@ public class RedisPanel extends AbstractCommandPanel {
         // 从列表移除
         ctx.keyModel.removeElement(key);
         ctx.keyCountLabel.setText("共 " + ctx.keyModel.size() + " 个 key");
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(ctx.db);
                 jedis.del(key);
@@ -1024,7 +1022,7 @@ public class RedisPanel extends AbstractCommandPanel {
                 "确认删除", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (result != JOptionPane.YES_OPTION) return;
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(ctx.db);
                 jedis.del(key);
@@ -1127,7 +1125,7 @@ public class RedisPanel extends AbstractCommandPanel {
             }
 
             dialog.dispose();
-            threadPool.submit(() -> {
+            ThreadPoolUtil.submitVirtual(() -> {
                 try (Jedis jedis = createJedis(info)) {
                     jedis.select(ctx.db);
                     switch (type) {
@@ -1472,7 +1470,7 @@ public class RedisPanel extends AbstractCommandPanel {
 
     private void connectToRedis(ConnectionInfo info) {
         currentConnectionName = info.name;
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 String pong = jedis.ping();
                 String serverInfo = jedis.info("server");
@@ -1495,7 +1493,7 @@ public class RedisPanel extends AbstractCommandPanel {
                 SwingUtilities.invokeLater(() -> {
                     StringBuilder html = new StringBuilder();
                     html.append("<html><body style='color:#A9B7C6;font-family:Microsoft YaHei;font-size:12px;margin:6px'>");
-                    html.append("<b style='color:#6A9955'>连接:</b> ").append(escapeHtml(info.name)).append("<br>");
+                    html.append("<b style='color:#6A9955'>连接:</b> ").append(NetUtil.escapeHtml(info.name)).append("<br>");
                     html.append("<b style='color:#6A9955'>状态:</b> <span style='color:#4EC9B0'>").append(pong).append("</span><br><br>");
 
                     // 解析 server info，输出带样式的 HTML
@@ -1517,7 +1515,7 @@ public class RedisPanel extends AbstractCommandPanel {
                 });
             } catch (JedisException ex) {
                 SwingUtilities.invokeLater(() -> {
-                    serverInfoPane.setText("<html><body style='color:#E57373;font-family:Microsoft YaHei;font-size:12px;margin:4px'>连接失败: " + escapeHtml(ex.getMessage()) + "</body></html>");
+                    serverInfoPane.setText("<html><body style='color:#E57373;font-family:Microsoft YaHei;font-size:12px;margin:4px'>连接失败: " + NetUtil.escapeHtml(ex.getMessage()) + "</body></html>");
                 });
             }
         });
@@ -1551,7 +1549,7 @@ public class RedisPanel extends AbstractCommandPanel {
 
     /** 刷新 DB 节点的 key 数量（从 Redis 实时获取） */
     private void refreshDbNodeCount(ConnectionInfo info, int db) {
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(db);
                 long count = jedis.dbSize();
@@ -1570,7 +1568,7 @@ public class RedisPanel extends AbstractCommandPanel {
                 "危险操作", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (result != JOptionPane.YES_OPTION) return;
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(db);
                 jedis.flushDB();
@@ -1625,16 +1623,11 @@ public class RedisPanel extends AbstractCommandPanel {
                 String[] kv = line.split(":", 2);
                 if (kv.length == 2) {
                     html.append("&nbsp;&nbsp;<span style='color:#9CDCFE'>").append(kv[0])
-                        .append(":</span> <span style='color:#B5CEA8'>").append(escapeHtml(kv[1]))
+                        .append(":</span> <span style='color:#B5CEA8'>").append(NetUtil.escapeHtml(kv[1]))
                         .append("</span><br>");
                 }
             }
         }
-    }
-
-    private static String escapeHtml(String s) {
-        if (s == null) return "";
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     // ==================== Redis 命令控制台 ====================
@@ -1661,7 +1654,7 @@ public class RedisPanel extends AbstractCommandPanel {
         consoleInput.setText("");
         autoCompletePopup.setVisible(false);
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try (Jedis jedis = createJedis(info)) {
                 jedis.select(db);
 

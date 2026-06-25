@@ -1,18 +1,22 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
 import javax.swing.text.*;
 import java.awt.*;
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 
 /**
  * 视频流面板：RTSP 流地址输入 + 视频预览画面 + 发送/响应日志
  */
 public class VideoStreamPanel extends AbstractCommandPanel {
+
+    private static final Logger logger = LogManager.getLogger(VideoStreamPanel.class);
 
     private JTextField hostField;
     private JTextField portField;
@@ -23,7 +27,7 @@ public class VideoStreamPanel extends AbstractCommandPanel {
     // 日志相关
     private JTextPane logPane;
     private Style logStyleSend, logStyleOk, logStyleErr, logStyleTimeout, logStyleTime;
-    private final SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS");
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     private static final int MAX_LOG_LINES = 2000;
     private int logLineCount = 0;
 
@@ -162,13 +166,13 @@ public class VideoStreamPanel extends AbstractCommandPanel {
                     logLineCount -= endLine;
                 }
             }
-            String time = "[" + sdf.format(new Date()) + "] ";
+            String time = "[" + TS_FMT.format(LocalTime.now()) + "] ";
             doc.insertString(doc.getLength(), time, logStyleTime);
             doc.insertString(doc.getLength(), msg + "\n", style);
             logLineCount++;
             logPane.setCaretPosition(doc.getLength());
         } catch (BadLocationException e) {
-            e.printStackTrace();
+            logger.warn("视频流日志区域位置异常", e);
         }
     }
 

@@ -1,7 +1,10 @@
 package com.szh.ui.panel;
 
+import com.szh.ui.MessageDialog;
 import com.szh.utils.NetUtil;
 import com.szh.utils.ThreadPoolUtil;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -14,8 +17,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.text.SimpleDateFormat;
-import java.util.*;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -35,6 +42,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class NgrokPanel extends AbstractCommandPanel {
 
+    private static final Logger logger = LogManager.getLogger(NgrokPanel.class);
+
     // ==================== 共享状态（AiChatPanel 通过此处获取公网 URL） ====================
 
     /** 当前暴露的公网 URL，未启动时为 null */
@@ -53,7 +62,8 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     // ==================== 文件服务器（供 AiChatPanel 注册本地文件） ====================
 
-    private static com.sun.net.httpserver.HttpServer fileServer;
+    // 字段类型用 Object 避免 jdk.httpserver 模块缺失时类加载失败
+    private static Object fileServer;
     private static int fileServerPort = -1;
     private static boolean fileServerRunning;
     private static final Map<String, File> fileMap = new ConcurrentHashMap<>();
@@ -88,10 +98,8 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     // ==================== 目录模式内置 HTTP 文件服务器 ====================
 
-    private static com.sun.net.httpserver.HttpServer dirHttpServer;
+    private static Object dirHttpServer;
     private static File dirHttpServerRoot;
-    private static final ConcurrentHashMap<String, String> dirContentTypeCache = new ConcurrentHashMap<>();
-
     // ==================== UI 组件 ====================
 
     // --- 文件服务器 ---
@@ -169,7 +177,7 @@ public class NgrokPanel extends AbstractCommandPanel {
         fsPanel.setAlignmentX(CENTER_ALIGNMENT);
 
         fsPanel.add(new JLabel("端口："), gbc(0, 0));
-        fsPortField = new JTextField(String.valueOf(findFreePort()), 8);
+        fsPortField = new JTextField("18080", 8); // 默认端口，避免 findFreePort() 在构造期阻塞 EDT
         fsPanel.add(fsPortField, gbc(1, 0));
 
         fsStartBtn = new JButton("启动");
@@ -268,7 +276,7 @@ public class NgrokPanel extends AbstractCommandPanel {
         dirModePanel.add(browseDirBtn, gbc(2, 0));
 
         dirModePanel.add(new JLabel("服务器端口："), gbc(0, 1));
-        dirPortField = new JTextField(String.valueOf(findFreePort()), 8);
+        dirPortField = new JTextField("8080", 8);
         dirModePanel.add(dirPortField, gbc(1, 1));
 
         configPanel.add(dirModePanel, gbc(0, row, 4));
@@ -396,36 +404,42 @@ public class NgrokPanel extends AbstractCommandPanel {
         }
 
         try {
-            fileServer = com.sun.net.httpserver.HttpServer.create(new InetSocketAddress(fileServerPort), 0);
-            fileServer.createContext("/temp/", exchange -> {
-                String path = exchange.getRequestURI().getPath();
-                String fileId = path.substring(path.lastIndexOf('/') + 1);
-                File f = fileMap.get(fileId);
-                if (f == null || !f.isFile()) {
-                    String resp = "{\"error\":\"file not found\"}";
-                    byte[] data = resp.getBytes(StandardCharsets.UTF_8);
-                    exchange.sendResponseHeaders(404, data.length);
-                    try (OutputStream os = exchange.getResponseBody()) {
-                        os.write(data);
+            com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                    new InetSocketAddress(fileServerPort), 0);
+            // 用匿名内部类而非 lambda：避免 lambda 生成合成方法被 getDeclaredMethods 扫描触发 NoClassDefFoundError
+            final com.sun.net.httpserver.HttpHandler fileHandler = new com.sun.net.httpserver.HttpHandler() {
+                @Override
+                public void handle(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
+                    String path = exchange.getRequestURI().getPath();
+                    String fileId = path.substring(path.lastIndexOf('/') + 1);
+                    File f = fileMap.get(fileId);
+                    if (f == null || !f.isFile()) {
+                        String resp = "{\"error\":\"file not found\"}";
+                        byte[] data = resp.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(404, data.length);
+                        try (OutputStream os = exchange.getResponseBody()) {
+                            os.write(data);
+                        }
+                        return;
                     }
-                    return;
+                    String name = f.getName().toLowerCase();
+                    String contentType = name.endsWith(".png") ? "image/png"
+                            : name.endsWith(".gif") ? "image/gif"
+                            : name.endsWith(".bmp") ? "image/bmp"
+                            : name.endsWith(".webp") ? "image/webp"
+                            : "image/jpeg";
+                    exchange.getResponseHeaders().set("Content-Type", contentType);
+                    exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                    exchange.sendResponseHeaders(200, f.length());
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        Files.copy(f.toPath(), os);
+                    }
                 }
-                String name = f.getName().toLowerCase();
-                String contentType = name.endsWith(".png") ? "image/png"
-                        : name.endsWith(".gif") ? "image/gif"
-                        : name.endsWith(".bmp") ? "image/bmp"
-                        : name.endsWith(".webp") ? "image/webp"
-                        : "image/jpeg";
-                exchange.getResponseHeaders().set("Content-Type", contentType);
-                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-                byte[] data = Files.readAllBytes(f.toPath());
-                exchange.sendResponseHeaders(200, data.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(data);
-                }
-            });
-            fileServer.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
-            fileServer.start();
+            };
+            server.createContext("/temp/", fileHandler);
+            server.setExecutor(ThreadPoolUtil.getVirtualExecutor());
+            server.start();
+            fileServer = server;
             fileServerRunning = true;
 
             // 自动同步到隧道端口输入框
@@ -437,16 +451,17 @@ public class NgrokPanel extends AbstractCommandPanel {
             fsStatusLabel.setText("[运行中] http://127.0.0.1:" + fileServerPort);
             fsStatusLabel.setForeground(new Color(76, 175, 80));
             appendLog("文件服务器已启动: http://127.0.0.1:" + fileServerPort);
-        } catch (IOException e) {
+        } catch (Throwable e) {
+            logger.error("启动文件服务器失败 port={}", fileServerPort, e);
             appendLog("失败: 启动文件服务器失败: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, "启动文件服务器失败:\n" + e.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+            MessageDialog.error("启动文件服务器失败: " + e.getMessage());
         }
     }
 
     /** 停止文件服务器 */
     private void stopFileServer() {
         if (fileServer != null) {
-            fileServer.stop(0);
+            ((com.sun.net.httpserver.HttpServer) fileServer).stop(0);
             fileServer = null;
         }
         fileServerRunning = false;
@@ -470,11 +485,11 @@ public class NgrokPanel extends AbstractCommandPanel {
     /** JVM 退出时关闭所有服务 */
     private static void shutdownAll() {
         if (fileServer != null) {
-            fileServer.stop(0);
+            ((com.sun.net.httpserver.HttpServer) fileServer).stop(0);
             fileServer = null;
         }
         if (dirHttpServer != null) {
-            dirHttpServer.stop(0);
+            ((com.sun.net.httpserver.HttpServer) dirHttpServer).stop(0);
             dirHttpServer = null;
         }
     }
@@ -632,6 +647,7 @@ public class NgrokPanel extends AbstractCommandPanel {
             Desktop.getDesktop().browse(new URI("https://github.com/ekzhang/bore/releases"));
             appendLog("已打开 bore 下载页面，请下载 bore-vX.X.X-x86_64-pc-windows-msvc.zip 并解压");
         } catch (Exception e) {
+            logger.warn("打开 bore 下载页面失败: {}", e.getMessage());
             appendLog("无法打开浏览器: " + e.getMessage());
             JOptionPane.showMessageDialog(this,
                     "请手动访问:\nhttps://github.com/ekzhang/bore/releases",
@@ -645,65 +661,76 @@ public class NgrokPanel extends AbstractCommandPanel {
         if (dirHttpServer != null) stopDirHttpServer();
 
         dirHttpServerRoot = rootDir;
-        dirContentTypeCache.clear();
 
-        dirHttpServer = com.sun.net.httpserver.HttpServer.create(new InetSocketAddress(port), 0);
-        dirHttpServer.createContext("/", exchange -> {
-            String path = exchange.getRequestURI().getPath();
-            if (path == null || path.isEmpty() || "/".equals(path)) path = "/";
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                new InetSocketAddress(port), 0);
+        // 用匿名内部类而非 lambda：避免 lambda 生成合成方法被 getDeclaredMethods 扫描触发 NoClassDefFoundError
+        final File finalRootDir = rootDir;
+        final com.sun.net.httpserver.HttpHandler dirHandler = new com.sun.net.httpserver.HttpHandler() {
+            @Override
+            public void handle(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
+                String path = exchange.getRequestURI().getPath();
+                if (path == null || path.isEmpty() || "/".equals(path)) path = "/";
 
-            File targetFile;
-            if ("/".equals(path)) {
-                try {
-                    sendDirectoryListing(exchange, rootDir, "");
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
+                File targetFile;
+                if ("/".equals(path)) {
+                    try {
+                        sendDirectoryListing(exchange, finalRootDir, "");
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                    return;
+                } else {
+                    String relativePath = path.startsWith("/") ? path.substring(1) : path;
+                    targetFile = new File(finalRootDir, relativePath);
+                    if (!targetFile.getCanonicalPath().startsWith(finalRootDir.getCanonicalPath())) {
+                        exchange.sendResponseHeaders(403, -1);
+                        return;
+                    }
                 }
-                return;
-            } else {
-                String relativePath = path.startsWith("/") ? path.substring(1) : path;
-                targetFile = new File(rootDir, relativePath);
-                if (!targetFile.getCanonicalPath().startsWith(rootDir.getCanonicalPath())) {
-                    exchange.sendResponseHeaders(403, -1);
+
+                if (!targetFile.exists()) {
+                    String resp = "<html><body><h1>404 Not Found</h1><p>" + NetUtil.escapeHtml(path) + "</p></body></html>";
+                    byte[] data = resp.getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+                    exchange.sendResponseHeaders(404, data.length);
+                    try (OutputStream os = exchange.getResponseBody()) { os.write(data); }
                     return;
                 }
-            }
 
-            if (!targetFile.exists()) {
-                String resp = "<html><body><h1>404 Not Found</h1><p>" + escapeHtml(path) + "</p></body></html>";
-                byte[] data = resp.getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
-                exchange.sendResponseHeaders(404, data.length);
-                try (OutputStream os = exchange.getResponseBody()) { os.write(data); }
-                return;
-            }
-
-            if (targetFile.isDirectory()) {
-                String relPath = rootDir.toURI().relativize(targetFile.toURI()).getPath();
-                try {
-                    sendDirectoryListing(exchange, rootDir, relPath);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
+                if (targetFile.isDirectory()) {
+                    String relPath = finalRootDir.toURI().relativize(targetFile.toURI()).getPath();
+                    try {
+                        sendDirectoryListing(exchange, finalRootDir, relPath);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                    return;
                 }
-                return;
-            }
 
-            String contentType = getContentType(targetFile.getName());
-            exchange.getResponseHeaders().set("Content-Type", contentType);
-            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            byte[] data = Files.readAllBytes(targetFile.toPath());
-            exchange.sendResponseHeaders(200, data.length);
-            try (OutputStream os = exchange.getResponseBody()) { os.write(data); }
-        });
-        dirHttpServer.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
-        dirHttpServer.start();
+                String contentType = NetUtil.getContentType(targetFile.getName());
+                exchange.getResponseHeaders().set("Content-Type", contentType);
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                exchange.sendResponseHeaders(200, targetFile.length());
+                try (OutputStream os = exchange.getResponseBody()) {
+                    Files.copy(targetFile.toPath(), os);
+                }
+            }
+        };
+        server.createContext("/", dirHandler);
+        server.setExecutor(ThreadPoolUtil.getVirtualExecutor());
+        server.start();
+        dirHttpServer = server;
     }
 
-    private static void sendDirectoryListing(com.sun.net.httpserver.HttpExchange exchange, File rootDir, String relativePath) throws Exception {
+    // 参数改用 Object 避免 getDeclaredMethods 扫描时触发 jdk.httpserver 模块缺失
+    @SuppressWarnings("unchecked")
+    private static void sendDirectoryListing(Object exchangeObj, File rootDir, String relativePath) throws Exception {
+        com.sun.net.httpserver.HttpExchange exchange = (com.sun.net.httpserver.HttpExchange) exchangeObj;
         File dir = "/".equals(relativePath) || relativePath.isEmpty() ? rootDir : new File(rootDir, relativePath);
         StringBuilder html = new StringBuilder(1024);
         html.append("<!DOCTYPE html><html><head><meta charset='utf-8'>");
-        html.append("<title>").append(escapeHtml(relativePath.isEmpty() ? "/" : relativePath)).append("</title>");
+        html.append("<title>").append(NetUtil.escapeHtml(relativePath.isEmpty() ? "/" : relativePath)).append("</title>");
         html.append("<style>");
         html.append("body{font-family:'Segoe UI',sans-serif;max-width:900px;margin:20px auto;padding:0 20px;background:#f5f5f5;}");
         html.append("h1{color:#333;border-bottom:2px solid #4CAF50;padding-bottom:8px;}");
@@ -715,8 +742,8 @@ public class NgrokPanel extends AbstractCommandPanel {
         html.append(".dir{font-weight:bold;}");
         html.append("</style></head><body>");
 
-        html.append("<h1>").append(escapeHtml(relativePath.isEmpty() ? "/" : relativePath)).append("</h1>");
-        html.append("<p style='color:#888;margin-bottom:16px;'>目录: <code>").append(escapeHtml(rootDir.getAbsolutePath())).append("</code></p>");
+        html.append("<h1>").append(NetUtil.escapeHtml(relativePath.isEmpty() ? "/" : relativePath)).append("</h1>");
+        html.append("<p style='color:#888;margin-bottom:16px;'>目录: <code>").append(NetUtil.escapeHtml(rootDir.getAbsolutePath())).append("</code></p>");
         html.append("<table><tr><th>名称</th><th>大小</th><th>修改时间</th></tr>");
 
         if (!relativePath.isEmpty() && !"/".equals(relativePath)) {
@@ -742,11 +769,14 @@ public class NgrokPanel extends AbstractCommandPanel {
                 if (f.isDirectory()) href += "/";
 
                 String icon = f.isDirectory() ? "[DIR]" : getFileIcon(name);
-                String size = f.isDirectory() ? "-" : formatFileSize(f.length());
-                String time = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm").format(f.lastModified());
+                String size = f.isDirectory() ? "-" : NetUtil.formatFileSize(f.length());
+                String time = java.time.LocalDateTime.ofInstant(
+                        java.time.Instant.ofEpochMilli(f.lastModified()),
+                        java.time.ZoneId.systemDefault())
+                        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
 
                 html.append("<tr><td class='dir'><a href='").append(href).append("'>")
-                        .append(icon).append(" ").append(escapeHtml(name))
+                        .append(icon).append(" ").append(NetUtil.escapeHtml(name))
                         .append("</a></td><td>").append(size).append("</td><td>").append(time).append("</td></tr>");
             }
         }
@@ -775,56 +805,11 @@ public class NgrokPanel extends AbstractCommandPanel {
         return "[FILE]";
     }
 
-    private static String formatFileSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
-        if (bytes < 1024 * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
-        return String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
-    }
-
-    private static String getContentType(String fileName) {
-        String cached = dirContentTypeCache.get(fileName.toLowerCase());
-        if (cached != null) return cached;
-
-        String name = fileName.toLowerCase();
-        String ct;
-        if (name.endsWith(".png")) ct = "image/png";
-        else if (name.endsWith(".gif")) ct = "image/gif";
-        else if (name.endsWith(".bmp")) ct = "image/bmp";
-        else if (name.endsWith(".webp")) ct = "image/webp";
-        else if (name.endsWith(".svg")) ct = "image/svg+xml";
-        else if (name.endsWith(".ico")) ct = "image/x-icon";
-        else if (name.endsWith(".jpg") || name.endsWith(".jpeg")) ct = "image/jpeg";
-        else if (name.endsWith(".mp4")) ct = "video/mp4";
-        else if (name.endsWith(".webm")) ct = "video/webm";
-        else if (name.endsWith(".ogg")) ct = "video/ogg";
-        else if (name.endsWith(".mp3")) ct = "audio/mpeg";
-        else if (name.endsWith(".wav")) ct = "audio/wav";
-        else if (name.endsWith(".pdf")) ct = "application/pdf";
-        else if (name.endsWith(".json")) ct = "application/json";
-        else if (name.endsWith(".xml")) ct = "application/xml";
-        else if (name.endsWith(".html") || name.endsWith(".htm")) ct = "text/html; charset=utf-8";
-        else if (name.endsWith(".css")) ct = "text/css; charset=utf-8";
-        else if (name.endsWith(".js")) ct = "application/javascript; charset=utf-8";
-        else if (name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".log")) ct = "text/plain; charset=utf-8";
-        else if (name.endsWith(".zip")) ct = "application/zip";
-        else ct = "application/octet-stream";
-
-        dirContentTypeCache.put(name, ct);
-        return ct;
-    }
-
-    private static String escapeHtml(String s) {
-        if (s == null) return "";
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
-    }
-
     private void stopDirHttpServer() {
         if (dirHttpServer != null) {
-            dirHttpServer.stop(1);
+            ((com.sun.net.httpserver.HttpServer) dirHttpServer).stop(1);
             dirHttpServer = null;
             dirHttpServerRoot = null;
-            dirContentTypeCache.clear();
         }
     }
 
@@ -868,9 +853,10 @@ public class NgrokPanel extends AbstractCommandPanel {
                 appendLog("目录服务器已启动: http://127.0.0.1:" + port);
                 appendLog("   根目录: " + dir.getAbsolutePath());
                 SwingUtilities.invokeLater(() -> dirBrowseUrlLabel.setText("本地浏览: http://127.0.0.1:" + port));
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                logger.error("启动目录 HTTP 服务器失败 port={}", port, e);
                 appendLog("启动目录服务器失败: " + e.getMessage());
-                JOptionPane.showMessageDialog(this, "启动目录 HTTP 服务器失败:\n" + e.getMessage(), "错误", JOptionPane.ERROR_MESSAGE);
+                MessageDialog.error("启动目录服务器失败: " + e.getMessage());
                 return;
             }
         } else {
@@ -920,6 +906,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         }
                     } catch (Exception e) {
                         if (!"Stream closed".equals(e.getMessage())) {
+                            logger.error("Bore 隧道输出读取异常", e);
                             SwingUtilities.invokeLater(() -> appendLog("读取输出异常: " + e.getMessage()));
                         }
                     }
@@ -942,6 +929,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                     }
                 });
             } catch (Exception e) {
+                logger.error("Bore 隧道启动异常", e);
                 SwingUtilities.invokeLater(() -> {
                     if (!intentionalStop) {
                         // 启动过程中的异常也尝试重连
@@ -1069,6 +1057,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                             }
                         } catch (Exception e) {
                             if (!"Stream closed".equals(e.getMessage())) {
+                                logger.error("Bore 隧道重连输出读取异常", e);
                                 SwingUtilities.invokeLater(() -> appendLog("读取输出异常: " + e.getMessage()));
                             }
                         }
@@ -1088,6 +1077,7 @@ public class NgrokPanel extends AbstractCommandPanel {
                         }
                     });
                 } catch (Exception e) {
+                    logger.error("Bore 自动重连异常", e);
                     SwingUtilities.invokeLater(() -> {
                         if (!intentionalStop) {
                             appendLog("自动重连异常: " + e.getMessage());
@@ -1127,10 +1117,10 @@ public class NgrokPanel extends AbstractCommandPanel {
         appendLogSeparator();
     }
 
-    private static final SimpleDateFormat LOG_TIME_FMT = new SimpleDateFormat("HH:mm:ss");
+    private static final DateTimeFormatter LOG_TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private void appendLog(String msg) {
-        String timestamp = LOG_TIME_FMT.format(new Date());
+        String timestamp = LOG_TIME_FMT.format(LocalTime.now());
         logArea.append(String.format("[%s] %s%n", timestamp, msg));
         logArea.setCaretPosition(logArea.getDocument().getLength());
     }

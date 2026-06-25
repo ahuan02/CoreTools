@@ -1,6 +1,7 @@
 package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -13,8 +14,7 @@ import java.net.*;
 import java.util.List;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -26,8 +26,6 @@ import static com.szh.utils.NetUtil.*;
  * - 端口扫描：指定 IP + 端口范围，TCP 连接检测
  */
 public class ScanPanel extends AbstractCommandPanel {
-
-    private final ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
 
     // ===== 网段扫描 =====
     private JTextField subnetField;
@@ -56,6 +54,9 @@ public class ScanPanel extends AbstractCommandPanel {
 
     // ===== 日志 =====
     private JTextPane logPane;
+
+    // 并发限制：同时最多 50 个扫描任务，防止 TCP 连接资源耗尽
+    private static final int MAX_SCAN_CONCURRENCY = 50;
 
     public ScanPanel() {
         super(null);
@@ -354,7 +355,8 @@ public class ScanPanel extends AbstractCommandPanel {
             }
         });
 
-        threadPool.submit(() -> {
+
+        ThreadPoolUtil.submitVirtual(() -> {
             int round = 0;
             while (subnetScanning.get()) {
                 round++;
@@ -369,12 +371,22 @@ public class ScanPanel extends AbstractCommandPanel {
                 AtomicInteger aliveCount = new AtomicInteger(0);
                 AtomicInteger completedCount = new AtomicInteger(0);
                 final int total = 254;
+                final Semaphore scanSemaphore = new Semaphore(MAX_SCAN_CONCURRENCY);
 
                 for (int i = 1; i <= total && subnetScanning.get(); i++) {
                     final int host = i;
-                    threadPool.submit(() -> {
+                    ThreadPoolUtil.submitVirtual(() -> {
+                        try {
+                            if (!subnetScanning.get()) {
+                                return;
+                            }
+                            scanSemaphore.acquire();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                         if (!subnetScanning.get()) {
-                            completedCount.incrementAndGet();
+                            scanSemaphore.release();
                             return;
                         }
                         try {
@@ -421,6 +433,7 @@ public class ScanPanel extends AbstractCommandPanel {
                             }
                         } catch (Exception ignored) {
                         } finally {
+                            scanSemaphore.release();
                             completedCount.incrementAndGet();
                         }
                     });
@@ -440,7 +453,6 @@ public class ScanPanel extends AbstractCommandPanel {
 
                 // 循环模式下：清理已不在线的 IP 行（从表格中移除）
                 if (loopMode && subnetScanning.get()) {
-                    // 从后往前删除不在本轮存活集合中的 IP
                     for (int row = subnetTableModel.getRowCount() - 1; row >= 0; row--) {
                         if (!subnetScanning.get()) break;
                         String rowIp = (String) subnetTableModel.getValueAt(row, 0);
@@ -448,7 +460,6 @@ public class ScanPanel extends AbstractCommandPanel {
                             subnetTableModel.removeRow(row);
                         }
                     }
-                    // 重建 rowMap
                     rebuildSubnetRowMap();
                 }
 
@@ -589,7 +600,8 @@ public class ScanPanel extends AbstractCommandPanel {
             }
         });
 
-        threadPool.submit(() -> {
+
+        ThreadPoolUtil.submitVirtual(() -> {
             int round = 0;
             while (portScanning.get()) {
                 round++;
@@ -603,12 +615,20 @@ public class ScanPanel extends AbstractCommandPanel {
                 AtomicInteger openCount = new AtomicInteger(0);
                 AtomicInteger completedCount = new AtomicInteger(0);
                 int total = end - start + 1;
+                final Semaphore scanSemaphore = new Semaphore(MAX_SCAN_CONCURRENCY);
 
                 for (int port = start; port <= end && portScanning.get(); port++) {
                     final int p = port;
-                    threadPool.submit(() -> {
+                    ThreadPoolUtil.submitVirtual(() -> {
+                        try {
+                            if (!portScanning.get()) return;
+                            scanSemaphore.acquire();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                         if (!portScanning.get()) {
-                            completedCount.incrementAndGet();
+                            scanSemaphore.release();
                             return;
                         }
                         try {
@@ -625,6 +645,7 @@ public class ScanPanel extends AbstractCommandPanel {
                             }
                         } catch (Exception ignored) {
                         } finally {
+                            scanSemaphore.release();
                             completedCount.incrementAndGet();
                         }
                     });

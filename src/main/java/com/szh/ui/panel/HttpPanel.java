@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
 import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
 import org.fife.ui.rtextarea.RTextScrollPane;
@@ -30,8 +31,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 import static com.szh.utils.NetUtil.*;
 
@@ -40,7 +39,6 @@ import static com.szh.utils.NetUtil.*;
  */
 public class HttpPanel extends AbstractCommandPanel {
 
-    private final ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .followRedirects(HttpClient.Redirect.NORMAL)
@@ -618,7 +616,7 @@ public class HttpPanel extends AbstractCommandPanel {
             final String finalUrl = url;
             final int finalTimeout = timeoutSec;
 
-            threadPool.submit(() -> {
+            ThreadPoolUtil.submitVirtual(() -> {
                 try {
                     String requestUrl = finalUrl;
 
@@ -921,9 +919,7 @@ public class HttpPanel extends AbstractCommandPanel {
 
             // 文件名 + 大小
             long size = file.length();
-            String sizeStr = size < 1024 ? size + " B" :
-                    size < 1024 * 1024 ? String.format("%.1f KB", size / 1024.0) :
-                            String.format("%.2f MB", size / (1024.0 * 1024.0));
+            String sizeStr = NetUtil.formatFileSize(size);
 
             JLabel nameLabel = new JLabel(file.getName());
             nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));

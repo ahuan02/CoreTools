@@ -2,6 +2,7 @@ package com.szh.ui.panel;
 
 import com.szh.manager.ConfigManager;
 import com.szh.utils.NetUtil;
+import com.szh.utils.ThreadPoolUtil;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -9,8 +10,6 @@ import java.awt.*;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.szh.utils.NetUtil.*;
@@ -19,8 +18,6 @@ import static com.szh.utils.NetUtil.*;
  * Telnet 终端
  */
 public class TelnetPanel extends AbstractCommandPanel {
-
-    private final ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
 
     private JTextField telnetHostField;
     private JTextField telnetPortField;
@@ -108,7 +105,7 @@ public class TelnetPanel extends AbstractCommandPanel {
         final String targetHost = host;
         final int targetPort = port;
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 telnetSocket = new Socket();
                 telnetSocket.connect(new InetSocketAddress(targetHost, targetPort), 5000);
@@ -174,7 +171,7 @@ public class TelnetPanel extends AbstractCommandPanel {
 
         telnetInputField.setText("");
 
-        threadPool.submit(() -> {
+        ThreadPoolUtil.submitVirtual(() -> {
             try {
                 telnetWriter.write(cmd);
                 telnetWriter.newLine();

@@ -65,6 +65,11 @@ public final class ThreadPoolUtil {
 
     // ==================== 提交任务 ====================
 
+    /** 获取虚拟线程 Executor（供 HttpServer.setExecutor 等场景使用） */
+    public static Executor getVirtualExecutor() {
+        return pool(virtualPool);
+    }
+
     /** 提交到虚拟线程池（纯 I/O） */
     public static Future<?> submitVirtual(Runnable task) {
         return pool(virtualPool).submit(task);

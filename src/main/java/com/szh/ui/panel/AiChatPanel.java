@@ -22,6 +22,8 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.Java2DFrameConverter;
@@ -70,6 +72,8 @@ import java.util.regex.Pattern;
  * AI 对话面板 - 基于 langchain4j
  */
 public class AiChatPanel extends AbstractCommandPanel {
+
+    private static final Logger logger = LogManager.getLogger(AiChatPanel.class);
 
     // ==================== 聊天组件 ====================
     private JPanel chatMessagePanel;     // 气泡消息列表容器
@@ -1122,7 +1126,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             } catch (Exception ex) {
                 boolean isUserStop = "User stopped".equals(ex.getMessage());
                 if (!isUserStop) {
-                    ex.printStackTrace();
+                    logger.error("AI 对话流式请求异常", ex);
                 }
                 SwingUtilities.invokeLater(() -> {
                     if (!isUserStop && streamingWrapper != null) {
@@ -1178,7 +1182,7 @@ public class AiChatPanel extends AbstractCommandPanel {
     private void handleStreamError(Throwable error, boolean isOuter) {
         boolean isUserStop = "User stopped".equals(error.getMessage());
         if (!isUserStop) {
-            error.printStackTrace();
+            logger.error("AI 对话流式错误", error);
         }
         SwingUtilities.invokeLater(() -> {
             if (!isUserStop && streamingWrapper != null) {
@@ -2418,7 +2422,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     modelConfigs.set(idx, mc);
                 } else {
                     // 仍然找不到，追加到末尾
-                    System.err.println("[模型编辑] 警告：无法定位旧配置 alias=" + editing.getAlias() + "，已追加");
+                    logger.warn("[模型编辑] 无法定位旧配置 alias={}，已追加", editing.getAlias());
                     modelConfigs.add(mc);
                 }
             } else {
@@ -4315,8 +4319,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                         try { matConverter.close(); } catch (Exception ignored) {}
                     }
                 } catch (Exception e) {
-                    System.err.println("[视频播放] 异常: " + e.getMessage());
-                    e.printStackTrace();
+                    logger.error("[视频播放] 异常", e);
                     if (!seekRequested) {
                         // 非 seek 导致的异常才报错
                         SwingUtilities.invokeLater(() -> {
@@ -4358,7 +4361,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                         audioLine.open(af, audioSampleRate * audioChannels * 2 / 10);
                         audioLine.start();
                     } catch (Exception e) {
-                        System.err.println("[音频] 初始化失败 (视频静音播放): " + e.getMessage());
+                        logger.warn("[音频] 初始化失败 (视频静音播放): {}", e.getMessage());
                         audioLine = null;
                         return; // 初始化失败，跳过本帧
                     }
@@ -4514,7 +4517,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     downloadOk = true;
                 } catch (Exception e) {
                     // 下载阶段失败 → 清除文件引用，降级到在线播放
-                    System.err.println("[视频预加载] 下载失败: " + e.getMessage());
+                    logger.warn("[视频预加载] 下载失败: {}", e.getMessage());
                     localVideoFile = null;
                     placeholderText = "下载失败，将在线播放";
                     ready = true;
@@ -4569,7 +4572,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                     grabber = null;
                 } catch (Exception e) {
                     // FFmpeg 解析失败不影响播放——文件本身是好的，播放时再重新打开
-                    System.err.println("[视频预加载] 元数据解析失败（不影响播放）: " + e.getMessage());
+                    logger.warn("[视频预加载] 元数据解析失败（不影响播放）: {}", e.getMessage());
                     if (grabber != null) {
                         try { grabber.stop(); } catch (Exception ignored) {}
                         try { grabber.release(); } catch (Exception ignored) {}

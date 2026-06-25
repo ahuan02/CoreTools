@@ -6,6 +6,8 @@ import com.formdev.flatlaf.intellijthemes.FlatMaterialDesignDarkIJTheme;
 import com.szh.manager.ConfigManager;
 import com.szh.ui.panel.*;
 import com.szh.utils.NetUtil;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.imageio.ImageIO;
 import javax.swing.*;
@@ -26,6 +28,8 @@ import java.util.Map;
 
 public class MainFrame extends JFrame {
 
+    private static final Logger logger = LogManager.getLogger(MainFrame.class);
+
     private final Map<String, AbstractCommandPanel> panels = new LinkedHashMap<>();
     private VideoStreamPanel videoStreamPanel;
     private final ConfigManager config = new ConfigManager("app_config.properties");
@@ -35,6 +39,9 @@ public class MainFrame extends JFrame {
     // 系统托盘
     private TrayIcon trayIcon;
     private boolean traySupported;
+    private JPopupMenu trayMenu;
+    private JDialog trayDlg;          // 托盘弹出（JDialog 焦点管理比 JWindow 可靠）
+    private Timer trayAnimTimer;      // 弹出动画
 
     public MainFrame() {
         initTheme();
@@ -109,13 +116,13 @@ public class MainFrame extends JFrame {
                 trayImage = createFallbackIcon(16);
             }
 
-            // 使用 JPopupMenu 替代原生 PopupMenu，避免 Windows 原生菜单 emoji 乱码
-            JPopupMenu trayMenu = createTrayMenu();
+            // 创建 JPopupMenu（非原生，支持动画和主题）
+            trayMenu = createTrayMenu();
 
             trayIcon = new TrayIcon(trayImage, "CoreTools");
             trayIcon.setImageAutoSize(true);
 
-            // 右键弹出 JPopupMenu，左键单击打开窗口
+            // 右键弹出 JPopupMenu（带动画），左键单击打开窗口
             trayIcon.addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
@@ -127,13 +134,8 @@ public class MainFrame extends JFrame {
                 @Override
                 public void mouseReleased(MouseEvent e) {
                     if (e.isPopupTrigger()) {
-                        // 用屏幕绝对坐标定位（e.getX/Y 是相对于小图标的，不对）
-                        Point screenLoc = MouseInfo.getPointerInfo().getLocation();
-                        // 预计算菜单高度，让菜单从鼠标上方弹出，避免遮挡托盘图标
-                        trayMenu.pack(); // 确保 preferredSize 有效
-                        int offsetY = trayMenu.getPreferredSize().height + 8; // 上方 8px 偏移
-                        trayMenu.setLocation(screenLoc.x - 10, screenLoc.y - offsetY);
-                        trayMenu.setVisible(true);
+                        hideTrayPopup();
+                        showTrayPopup();
                     }
                 }
             });
@@ -142,24 +144,150 @@ public class MainFrame extends JFrame {
             traySupported = true;
         } catch (Exception e) {
             traySupported = false;
-            e.printStackTrace();
+            logger.warn("系统托盘初始化失败", e);
         }
     }
 
-    /** 创建自定义 JPopupMenu（非原生，支持 emoji 和 FlatLaf 主题） */
+    /** 显示托盘 Popup，带动画 + 点击外部自动关闭 */
+    private void showTrayPopup() {
+        if (trayMenu == null) return;
+        hideTrayPopup(); // 关旧的
+
+        trayMenu.pack();
+        int w = trayMenu.getPreferredSize().width;
+        int h = trayMenu.getPreferredSize().height;
+        Point screenLoc = MouseInfo.getPointerInfo().getLocation();
+        final int targetX = screenLoc.x - 10;
+        final int targetY = screenLoc.y - h - 8;
+
+        // 构建菜单面板
+        JPanel content = buildPopupContent();
+
+        // undecorated JDialog（焦点管理原生可靠）
+        trayDlg = new JDialog(this);
+        trayDlg.setUndecorated(true);
+        trayDlg.setAlwaysOnTop(true);
+        trayDlg.setFocusable(true);
+        trayDlg.setFocusableWindowState(true);
+        trayDlg.setAutoRequestFocus(true);
+        trayDlg.setBackground(new Color(0, 0, 0, 0));
+        trayDlg.getRootPane().setOpaque(false);
+        trayDlg.setContentPane(content);
+
+        // 失焦关闭
+        trayDlg.addWindowFocusListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowLostFocus(java.awt.event.WindowEvent e) { hideTrayPopup(); }
+        });
+
+        // 鼠标移出安全区 200ms 后自动关闭（安全区 = Popup + 托盘图标 ±20px）
+        final Rectangle safeZone = new Rectangle(
+                screenLoc.x - 20, screenLoc.y - 20, 40, 40); // 托盘图标区域
+        Timer exitCheck = new Timer(200, null);
+        final int[] exitCount = {0};
+        exitCheck.addActionListener(ev -> {
+            if (trayDlg == null || !trayDlg.isVisible()) { exitCheck.stop(); return; }
+            Point mouse = MouseInfo.getPointerInfo().getLocation();
+            boolean inPopup = trayDlg.getBounds().contains(mouse);
+            boolean onTray = safeZone.contains(mouse);
+            if (inPopup || onTray) {
+                exitCount[0] = 0;
+            } else {
+                exitCount[0]++;
+                if (exitCount[0] >= 3) { exitCheck.stop(); hideTrayPopup(); }
+            }
+        });
+        exitCheck.start();
+
+        // --- 渐显 + 上滑动画 ---
+        final int startY = targetY + 20;
+        trayDlg.setBounds(targetX, startY, w, h);
+        try { trayDlg.setOpacity(0.05f); } catch (Exception ignored) {}
+        trayDlg.setVisible(true);
+
+        trayAnimTimer = new Timer(16, null);
+        final long animStart = System.currentTimeMillis();
+        final int duration = 220;
+        trayAnimTimer.addActionListener(e -> {
+            long elapsed = System.currentTimeMillis() - animStart;
+            float progress = Math.min(1f, (float) elapsed / duration);
+            float eased = 1f - (1f - progress) * (1f - progress) * (1f - progress);
+            int curY = (int) (startY + (targetY - startY) * eased);
+            trayDlg.setLocation(targetX, curY);
+            try { trayDlg.setOpacity(Math.max(0.05f, eased)); } catch (Exception ignored) {}
+            if (progress >= 1f) {
+                trayAnimTimer.stop();
+                trayAnimTimer = null;
+            }
+        });
+        trayAnimTimer.start();
+    }
+
+    /** 从 JPopupMenu 提取菜单项构建 JPanel */
+    private JPanel buildPopupContent() {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+        panel.setBackground(new Color(0x2B, 0x2B, 0x2B));
+
+        for (int i = 0; i < trayMenu.getComponentCount(); i++) {
+            Component c = trayMenu.getComponent(i);
+            if (c instanceof JMenuItem item) {
+                JButton btn = new JButton(item.getText());
+                btn.setFont(item.getFont());
+                btn.setIcon(item.getIcon());
+                btn.setHorizontalAlignment(SwingConstants.LEFT);
+                btn.setFocusPainted(false);
+                btn.setBorderPainted(false);
+                btn.setContentAreaFilled(false);
+                btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                btn.setForeground(new Color(0xE0, 0xE0, 0xE0));
+                btn.addMouseListener(new MouseAdapter() {
+                    @Override public void mouseEntered(MouseEvent e) { btn.setBackground(new Color(0x3A, 0x6E, 0xE8)); btn.setOpaque(true); btn.repaint(); }
+                    @Override public void mouseExited(MouseEvent e)  { btn.setOpaque(false); btn.repaint(); }
+                });
+                btn.addActionListener(item.getActionListeners()[0]); // 复用菜单项的 action
+                btn.addActionListener(e -> hideTrayPopup()); // 额外加关闭
+                btn.setMaximumSize(new Dimension(Integer.MAX_VALUE, btn.getPreferredSize().height + 8));
+                panel.add(btn);
+            } else if (c instanceof JSeparator) {
+                panel.add(Box.createVerticalStrut(4));
+                JSeparator sep = new JSeparator();
+                sep.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+                panel.add(sep);
+                panel.add(Box.createVerticalStrut(4));
+            }
+        }
+
+        panel.setSize(panel.getPreferredSize());
+        return panel;
+    }
+
+    /** 隐藏托盘 Popup */
+    private void hideTrayPopup() {
+        if (trayAnimTimer != null) { trayAnimTimer.stop(); trayAnimTimer = null; }
+        if (trayDlg != null) { trayDlg.setVisible(false); trayDlg.dispose(); trayDlg = null; }
+        if (trayMenu != null && trayMenu.isVisible()) { trayMenu.setVisible(false); }
+    }
+
+    /** 创建自定义 JPopupMenu（非原生），菜单项点击后自动关闭 Popup */
     private JPopupMenu createTrayMenu() {
         JPopupMenu menu = new JPopupMenu();
+        menu.setLightWeightPopupEnabled(false); // 窗口最小化时也必须可见
 
         JMenuItem openItem = new JMenuItem("打开界面");
         openItem.setFont(UIManager.getFont("MenuItem.font"));
-        openItem.addActionListener(e -> restoreFromTray());
-        // 加载 open.svg 图标
+        openItem.addActionListener(e -> {
+            hideTrayPopup();
+            restoreFromTray();
+        });
         Icon openIcon = loadTrayIcon("/icons/open.svg");
         if (openIcon != null) openItem.setIcon(openIcon);
 
         JMenuItem exitItem = new JMenuItem("退出");
-        exitItem.addActionListener(e -> exitApplication());
-        // 加载 pop.svg 图标
+        exitItem.addActionListener(e -> {
+            hideTrayPopup();
+            exitApplication();
+        });
         Icon exitIcon = loadTrayIcon("/icons/pop.svg");
         if (exitIcon != null) exitItem.setIcon(exitIcon);
 
@@ -212,6 +340,7 @@ public class MainFrame extends JFrame {
 
     /** 从系统托盘恢复窗口 */
     private void restoreFromTray() {
+        hideTrayPopup();
         setVisible(true);
         setExtendedState(JFrame.NORMAL);
         toFront();
@@ -479,7 +608,9 @@ public class MainFrame extends JFrame {
                     backgroundImage = ImageIO.read(bgFile);
                     backgroundImagePath = bgPath;
                     applyBackgroundImage();
-                } catch (IOException ignored) { /* 图片失效则忽略 */ }
+                } catch (IOException e) {
+                    logger.warn("加载背景图片 [{}] 失败: {}", bgPath, e.getMessage());
+                }
             }
         }
         // 加载窗口尺寸和位置（在 setSize/setLocation 之后调用以覆盖默认值）
@@ -578,7 +709,9 @@ public class MainFrame extends JFrame {
                 FlatLaf.updateUILater();
                 currentThemeClassName = saved;
                 return;
-            } catch (Exception ignored) { /* fallback */ }
+            } catch (Exception e) {
+                logger.warn("加载保存的主题 [{}] 失败，使用默认主题", saved, e);
+            }
         }
         FlatMaterialDesignDarkIJTheme.setup();
         currentThemeClassName = FlatMaterialDesignDarkIJTheme.class.getName();
@@ -605,7 +738,8 @@ public class MainFrame extends JFrame {
                 getRootPane().repaint();
             });
         } catch (Exception ex) {
-            System.err.println("切换主题失败: " + ex.getMessage());
+            logger.error("切换主题失败: {}", ex.getMessage(), ex);
+            MessageDialog.error("切换主题失败: " + ex.getMessage());
         }
     }
 
@@ -893,8 +1027,7 @@ public class MainFrame extends JFrame {
                 svgStream.close();
             }
         } catch (Exception ex) {
-            // SVG 加载失败就退回到纯文字
-            ex.printStackTrace();
+            logger.warn("捐助菜单 SVG 图标加载失败", ex);
         }
         JMenuItem donateItem = new JMenuItem("支持开发者");
         donateItem.addActionListener(e -> showDonateDialog());
@@ -907,6 +1040,21 @@ public class MainFrame extends JFrame {
         aboutItem.addActionListener(e -> showAboutDialog());
         aboutMenu.add(aboutItem);
         bar.add(aboutMenu);
+
+        // ---- 测试菜单 ----（开发调试用）
+        // JMenu testMenu = new JMenu("测试");
+        // JMenuItem testMsgItem = new JMenuItem("测试消息弹窗");
+        // testMsgItem.addActionListener(e -> {
+        //     MessageDialog.success("操作成功！");
+        //     Timer t = new Timer(800, ev -> MessageDialog.info("这是一条信息"));
+        //     t.setRepeats(false); t.start();
+        //     Timer t2 = new Timer(1600, ev -> MessageDialog.warning("请注意检查"));
+        //     t2.setRepeats(false); t2.start();
+        //     Timer t3 = new Timer(2400, ev -> MessageDialog.error("操作失败"));
+        //     t3.setRepeats(false); t3.start();
+        // });
+        // testMenu.add(testMsgItem);
+        // bar.add(testMenu);
 
         return bar;
     }
@@ -1071,9 +1219,8 @@ public class MainFrame extends JFrame {
                 applyBackgroundImage();
                 config.set("background.image", backgroundImagePath);
             } catch (IOException ex) {
-                JOptionPane.showMessageDialog(this,
-                        "无法加载图片: " + ex.getMessage(),
-                        "错误", JOptionPane.ERROR_MESSAGE);
+                logger.error("加载背景图片失败: {}", ex.getMessage(), ex);
+                MessageDialog.error("无法加载图片: " + ex.getMessage());
             }
         }
     }
@@ -1248,6 +1395,7 @@ public class MainFrame extends JFrame {
                 panel.add(fallback, BorderLayout.CENTER);
             }
         } catch (IOException e) {
+            logger.warn("捐助二维码图片加载失败: {}", e.getMessage());
             JLabel fallback = new JLabel("加载图片失败: " + e.getMessage(), SwingConstants.CENTER);
             fallback.setForeground(Color.GRAY);
             panel.add(fallback, BorderLayout.CENTER);

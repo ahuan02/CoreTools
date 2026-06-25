@@ -1,6 +1,8 @@
 package com.szh.utils;
 
 import com.szh.manager.ConfigManager;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -16,15 +18,17 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
 
 /**
  * 网络面板共享工具类
  */
 public class NetUtil {
+
+    private static final Logger logger = LogManager.getLogger(NetUtil.class);
 
     // ===== 日志配色 =====
     public static final Color C_TIME  = new Color(0x888888);
@@ -48,10 +52,10 @@ public class NetUtil {
     // ===== 格式模式枚举 =====
     public enum FormatMode { TEXT, HEX, BIN }
 
-    private static final SimpleDateFormat SDF = new SimpleDateFormat("HH:mm:ss.SSS");
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     public static String ts() {
-        return "[" + SDF.format(new Date()) + "] ";
+        return "[" + TS_FMT.format(LocalTime.now()) + "] ";
     }
 
     public static FormatMode fromComboIndex(int idx) {
@@ -299,7 +303,7 @@ public class NetUtil {
 
                 log.setCaretPosition(doc.getLength());
             } catch (BadLocationException e) {
-                e.printStackTrace();
+                logger.warn("文本区域位置异常", e);
             }
         });
     }
@@ -355,5 +359,47 @@ public class NetUtil {
     public static void saveCombo(JComboBox<String> c, ConfigManager cfg, String key) {
         Object sel = c.getSelectedItem();
         if (sel != null) cfg.set(key, sel.toString());
+    }
+
+    // ==================== 通用工具方法 ====================
+
+    /** 格式化文件大小为易读字符串 */
+    public static String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    /** HTML 转义，防止 XSS */
+    public static String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    /** 根据文件名后缀推断 Content-Type（MIME 类型） */
+    public static String getContentType(String fileName) {
+        String name = fileName.toLowerCase();
+        if (name.endsWith(".png")) return "image/png";
+        if (name.endsWith(".gif")) return "image/gif";
+        if (name.endsWith(".bmp")) return "image/bmp";
+        if (name.endsWith(".webp")) return "image/webp";
+        if (name.endsWith(".svg")) return "image/svg+xml";
+        if (name.endsWith(".ico")) return "image/x-icon";
+        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+        if (name.endsWith(".mp4")) return "video/mp4";
+        if (name.endsWith(".webm")) return "video/webm";
+        if (name.endsWith(".ogg")) return "video/ogg";
+        if (name.endsWith(".mp3")) return "audio/mpeg";
+        if (name.endsWith(".wav")) return "audio/wav";
+        if (name.endsWith(".pdf")) return "application/pdf";
+        if (name.endsWith(".json")) return "application/json";
+        if (name.endsWith(".xml")) return "application/xml";
+        if (name.endsWith(".html") || name.endsWith(".htm")) return "text/html; charset=utf-8";
+        if (name.endsWith(".css")) return "text/css; charset=utf-8";
+        if (name.endsWith(".js")) return "application/javascript; charset=utf-8";
+        if (name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".log")) return "text/plain; charset=utf-8";
+        if (name.endsWith(".zip")) return "application/zip";
+        return "application/octet-stream";
     }
 }

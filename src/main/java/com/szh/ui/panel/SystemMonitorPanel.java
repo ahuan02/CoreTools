@@ -2,6 +2,8 @@ package com.szh.ui.panel;
 
 import com.szh.utils.NetUtil;
 import com.szh.utils.ThreadPoolUtil;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.knowm.xchart.*;
 import org.knowm.xchart.style.Styler;
 import org.knowm.xchart.style.markers.SeriesMarkers;
@@ -29,6 +31,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 系统监控面板：CPU、内存、磁盘、网卡、JVM 实时图表 + OSHI 系统详情
  */
 public class SystemMonitorPanel extends AbstractCommandPanel {
+
+    private static final Logger logger = LogManager.getLogger(SystemMonitorPanel.class);
 
     private static final int HISTORY_SIZE = 60;
     private static final int UPDATE_INTERVAL_MS = 1000;
@@ -772,7 +776,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             });
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.warn("系统监视器刷新失败", e);
         }
     }
 
@@ -791,7 +795,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             prevCpuTicks = processor.getSystemCpuLoadTicks();
             refreshDynamicInfo();
         } catch (Throwable t) {
-            System.err.println("OSHI 初始化失败: " + t.getMessage());
+            logger.error("OSHI 初始化失败", t);
         }
     }
 
@@ -885,7 +889,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 sent += net.getBytesSent();
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.warn("获取网络流量统计失败", e);
         }
         return new long[]{sent, recv};
     }
@@ -1508,10 +1512,16 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 java.io.File f = new java.io.File(path);
                 if (f.exists()) {
                     Icon icon = javax.swing.filechooser.FileSystemView.getFileSystemView().getSystemIcon(f);
-                    ImageIcon scaled = new ImageIcon(
-                            ((ImageIcon) icon).getImage().getScaledInstance(18, 18, Image.SCALE_SMOOTH));
-                    iconCache.put(path, scaled);
-                    return scaled;
+                    if (icon instanceof javax.swing.ImageIcon) {
+                        ImageIcon scaled = new ImageIcon(
+                                ((javax.swing.ImageIcon) icon).getImage().getScaledInstance(18, 18, Image.SCALE_SMOOTH));
+                        iconCache.put(path, scaled);
+                        return scaled;
+                    } else if (icon != null) {
+                        // 非 ImageIcon 类型（某些平台的 FileSystemView 可能返回其他类型图标）
+                        iconCache.put(path, icon);
+                        return icon;
+                    }
                 }
             }
             // 回退到名称缓存
@@ -1520,11 +1530,14 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
             if (cached != null) return cached;
             // 跨平台兜底图标
             Icon def = getPlatformFallbackIcon();
-            if (def != null) {
+            if (def instanceof javax.swing.ImageIcon) {
                 ImageIcon scaled = new ImageIcon(
-                        ((ImageIcon) def).getImage().getScaledInstance(18, 18, Image.SCALE_SMOOTH));
+                        ((javax.swing.ImageIcon) def).getImage().getScaledInstance(18, 18, Image.SCALE_SMOOTH));
                 iconCache.put(name, scaled);
                 return scaled;
+            } else if (def != null) {
+                iconCache.put(name, def);
+                return def;
             }
         } catch (Exception e) {
             // ignore

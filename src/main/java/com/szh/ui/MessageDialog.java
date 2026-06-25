@@ -186,6 +186,7 @@ public final class MessageDialog {
     private static final Color TEXT_COLOR  = new Color(0xE0, 0xE0, 0xE0);
     private static final Color SHADOW_COLOR = new Color(0, 0, 0, 80);
     private static final Color BORDER_COLOR = new Color(0x50, 0x50, 0x50, 180);
+    private static final Font MSG_FONT = new Font("Microsoft YaHei", Font.PLAIN, 13);
 
     // ==================== 实例字段 ====================
 
@@ -215,7 +216,9 @@ public final class MessageDialog {
             }
             MessageItem item = new MessageItem(content, type, icon, durationMs, placement, cs);
             cs.items.add(item);
-            relayoutContainer(cs);
+            // 先布局窗口大小 + 现有项位置，窗口暂不显示（新项 showEntry 内控制首次绘制）
+            relayoutContainer(cs, false);
+            // 入场动画（含首次 show window）
             item.showEntry();
         });
     }
@@ -235,10 +238,12 @@ public final class MessageDialog {
             window = new JWindow(owner);
             window.setBackground(new Color(0, 0, 0, 0));
             window.getRootPane().setOpaque(false);
+            window.getRootPane().setDoubleBuffered(true); // 双缓冲防抖
             window.setAlwaysOnTop(true);
             window.setFocusableWindowState(false);
             layered = new JLayeredPane();
             layered.setOpaque(false);
+            layered.setDoubleBuffered(true);
             layered.setLayout(null);
             window.setContentPane(layered);
         }
@@ -257,6 +262,13 @@ public final class MessageDialog {
     // --- 布局 ---
 
     private void relayoutContainer(ContainerState cs) {
+        relayoutContainer(cs, true);
+    }
+
+    /**
+     * @param showWindow true=立即显示窗口，false=只设大小不显示（新条目入场时用）
+     */
+    private void relayoutContainer(ContainerState cs, boolean showWindow) {
         if (cs.items.isEmpty()) {
             hideContainer(cs);
             return;
@@ -272,8 +284,11 @@ public final class MessageDialog {
             y += item.getHeight() + GAP;
         }
 
-        cs.window.setVisible(true);
-        cs.window.repaint();
+        if (showWindow) {
+            cs.window.setVisible(true);
+            cs.window.revalidate();
+            cs.window.repaint();
+        }
     }
 
     private void hideContainer(ContainerState cs) {
@@ -437,7 +452,7 @@ public final class MessageDialog {
 
                     // 文字
                     g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, a));
-                    g2.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+                    g2.setFont(MSG_FONT);
                     FontMetrics fm = g2.getFontMetrics();
                     int textX = displayIcon != null ? 50 : 28;
                     int textY = (h - 2 - fm.getHeight()) / 2 + fm.getAscent();
@@ -451,8 +466,7 @@ public final class MessageDialog {
                 public Dimension getPreferredSize() {
                     Icon displayIcon = getDisplayIcon();
                     int iconW = displayIcon != null ? 28 : 0;
-                    Font font = new Font("Microsoft YaHei", Font.PLAIN, 13);
-                    FontMetrics fm = getFontMetrics(font);
+                    FontMetrics fm = getFontMetrics(MSG_FONT);
                     int maxWidth = Math.min(520, getToolkit().getScreenSize().width - 100);
                     int textW = measureTextWidth(fm, content, maxWidth - iconW - 60);
                     int w = Math.max(160, textW + iconW + 60);
@@ -552,7 +566,7 @@ public final class MessageDialog {
 
         // ==================== 动画 ====================
 
-        /** 入场动画：根据 placement 从对应方向滑入 */
+        /** 入场动画：根据 placement 从对应方向滑入，首帧才显示窗口避免跳位 */
         void showEntry() {
             int endY = targetY;
             alpha = 0f;
@@ -564,11 +578,12 @@ public final class MessageDialog {
             if (placement == Placement.CENTER) currentY = endY;
 
             panel.setLocation(0, currentY);
-            panel.repaint();
+            panel.paintImmediately(panel.getBounds());
 
             entryTimer = new Timer(16, null);
             final long startTime = System.currentTimeMillis();
             final int startY = currentY;
+            final boolean[] firstFrame = {true};
             entryTimer.addActionListener(e -> {
                 long elapsed = System.currentTimeMillis() - startTime;
                 float progress = Math.min(1f, (float) elapsed / ENTRY_DURATION);
@@ -577,13 +592,19 @@ public final class MessageDialog {
                 alpha = eased;
                 currentY = (int) (startY + (endY - startY) * eased);
                 panel.setLocation(0, currentY);
-                panel.repaint();
+                // 首帧：先 show window 再绘制，避免"先跳到目标位再滑入"的闪屏
+                if (firstFrame[0]) {
+                    firstFrame[0] = false;
+                    containerState.window.setVisible(true);
+                    containerState.window.revalidate();
+                }
+                panel.paintImmediately(panel.getBounds());
                 if (progress >= 1f) {
                     entryTimer.stop();
                     alpha = 1f;
                     currentY = endY;
                     panel.setLocation(0, currentY);
-                    panel.repaint();
+                    panel.paintImmediately(panel.getBounds());
                     startAutoDismiss();
                 }
             });
@@ -631,7 +652,7 @@ public final class MessageDialog {
                 alpha = startAlpha * (1f - eased);
                 currentY = (int) (startY + (endY - startY) * eased);
                 panel.setLocation(0, currentY);
-                panel.repaint();
+                panel.paintImmediately(panel.getBounds());
                 if (progress >= 1f) {
                     exitTimer.stop();
                     removePanel();
@@ -649,7 +670,7 @@ public final class MessageDialog {
                 float progress = Math.min(1f, (float) elapsed / EXIT_DURATION);
                 float eased = progress * progress;
                 alpha = startAlpha * (1f - eased);
-                panel.repaint();
+                panel.paintImmediately(panel.getBounds());
                 if (progress >= 1f) {
                     exitTimer.stop();
                     removePanel();
@@ -682,10 +703,12 @@ public final class MessageDialog {
                 float eased = 1f - (1f - progress) * (1f - progress);
                 currentY = (int) (startY + (newY - startY) * eased);
                 panel.setLocation(0, currentY);
+                panel.paintImmediately(panel.getBounds());
                 if (progress >= 1f) {
                     moveTimer.stop();
                     currentY = newY;
                     panel.setLocation(0, currentY);
+                    panel.paintImmediately(panel.getBounds());
                 }
             });
             moveTimer.start();

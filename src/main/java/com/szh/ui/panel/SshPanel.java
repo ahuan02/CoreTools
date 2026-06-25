@@ -47,12 +47,9 @@ public class SshPanel extends AbstractCommandPanel {
     /** 进度条视觉追赶速度：每次 tick 最多前进的百分点数，越小越慢 */
     private static final int MAX_VISUAL_ADVANCE_PCT = 2;
 
-    /** 格式化文件大小（供整个类使用） */
+    /** 格式化文件大小（委托给 NetUtil 统一实现） */
     private static String formatSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024L * 1024) return String.format("%.1f KB", bytes / 1024.0);
-        if (bytes < 1024L * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
-        return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+        return NetUtil.formatFileSize(bytes);
     }
 
     // ===== 连接信息 =====

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" shutdownHook="disable">
+    <Properties>
+        <!-- 日志目录由 Start.java 通过 System.setProperty("app.log.dir", ...) 注入 -->
+        <Property name="LOG_DIR">${sys:app.log.dir}</Property>
+        <Property name="PATTERN">%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n</Property>
+    </Properties>
+
+    <Appenders>
+        <!-- 控制台输出（开发调试用） -->
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="${PATTERN}"/>
+        </Console>
+
+        <!-- 文件输出：append="false" 确保每次启动清空旧日志 -->
+        <File name="FileLog" fileName="${LOG_DIR}/coretools.log" append="false">
+            <PatternLayout pattern="${PATTERN}"/>
+        </File>
+
+        <!-- 错误日志单独记录（带滚动，按大小切割，最多保留 5 个） -->
+        <RollingFile name="ErrorLog"
+                     fileName="${LOG_DIR}/error.log"
+                     filePattern="${LOG_DIR}/error-%i.log.gz"
+                     append="false">
+            <PatternLayout pattern="${PATTERN}"/>
+            <Policies>
+                <SizeBasedTriggeringPolicy size="5 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="5"/>
+        </RollingFile>
+    </Appenders>
+
+    <Loggers>
+        <!-- 项目包日志级别 -->
+        <Logger name="com.szh" level="debug" additivity="false">
+            <AppenderRef ref="Console" level="info"/>
+            <AppenderRef ref="FileLog" level="debug"/>
+            <AppenderRef ref="ErrorLog" level="warn"/>
+        </Logger>
+
+        <!-- 第三方库只输出 WARN 以上 -->
+        <Root level="warn">
+            <AppenderRef ref="Console" level="warn"/>
+            <AppenderRef ref="FileLog" level="warn"/>
+        </Root>
+    </Loggers>
+</Configuration>
