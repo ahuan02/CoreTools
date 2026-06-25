@@ -28,10 +28,25 @@ import java.util.*;
 public class GenericApiCaller {
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
-            .version(HttpClient.Version.HTTP_2)
+            .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(45))
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
+
+    /** 状态英文 → 中文翻译 */
+    private static final java.util.Map<String, String> STATUS_CN = java.util.Map.of(
+            "queued", "排队中",
+            "running", "运行中",
+            "succeeded", "已完成",
+            "failed", "失败",
+            "cancelled", "已取消"
+    );
+
+    /** 翻译状态文本，未知状态保持原文 */
+    private static String translateStatus(String status) {
+        if (status == null) return "未知";
+        return STATUS_CN.getOrDefault(status, status);
+    }
 
     // ==================== 图片 URL 供应器（由上层模块注入） ====================
 
@@ -120,22 +135,77 @@ public class GenericApiCaller {
         });
     }
 
+    // ==================== 任务取消句柄 ====================
+
+    /** task 模式返回的句柄，调用方可通过它取消正在进行的任务 */
+    public static class TaskHandle {
+        private volatile boolean cancelled;
+        private volatile String taskId;
+
+        public boolean isCancelled() { return cancelled; }
+        public String getTaskId() { return taskId; }
+
+        /**
+         * 取消任务：设置标志 + 调用服务端 DELETE 端点删除排队中的任务。
+         * 如果已配置 cancelEndpoint，会发送 DELETE 请求到服务端。
+         */
+        public boolean cancel(ModelConfig mc) {
+            cancelled = true;
+            if (taskId == null || taskId.isBlank()) return false;
+            // 尝试调用服务端取消端点
+            Map<String, Object> pollCfg = mc.getResponseMapping() != null
+                    ? mc.getResponseMapping() : Map.of();
+            String cancelEndpoint = (String) pollCfg.get("cancelEndpoint");
+            if (cancelEndpoint == null || cancelEndpoint.isBlank()) return false;
+            try {
+                String cancelUrl = mc.getApiUrl();
+                if (!cancelUrl.endsWith("/")) cancelUrl += "/";
+                String resolved = cancelEndpoint.replace("{{taskId}}", taskId)
+                        .replace("{id}", taskId);
+                if (resolved.startsWith("/")) resolved = resolved.substring(1);
+                cancelUrl += resolved;
+
+                HttpRequest.Builder cb = HttpRequest.newBuilder()
+                        .uri(URI.create(cancelUrl))
+                        .timeout(Duration.ofSeconds(10))
+                        .DELETE();
+                applyHeaders(cb, mc);
+                HttpResponse<String> resp = sendWithRetry(cb.build());
+                return resp.statusCode() >= 200 && resp.statusCode() < 300;
+            } catch (Exception e) {
+                System.err.println("[TaskHandle] 取消请求失败: " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
     // ==================== task 模式（POST 创建 → 轮询 GET → 取结果） ====================
 
-    public static void callTaskAsync(ModelConfig mc, String jsonBody,
+    /** @return TaskHandle，调用方可通过它取消任务 */
+    public static TaskHandle callTaskAsync(ModelConfig mc, String jsonBody,
                                      java.util.function.Consumer<TaskResult> onSuccess,
                                      java.util.function.Consumer<Exception> onError,
                                      java.util.function.Consumer<String> onProgress) {
+        TaskHandle handle = new TaskHandle();
         ThreadPoolUtil.submitVirtual(() -> {
             try {
                 // Step 1: 创建任务
+                System.out.println("[Task] ========== 创建任务 ==========");
+                System.out.println("[Task] URL: " + mc.getApiUrl() + "/" + (mc.getEndpoint() != null ? mc.getEndpoint().replaceFirst("^/", "") : ""));
+                System.out.println("[Task] 请求体: " + jsonBody);
+
                 HttpRequest createReq = buildRequest(mc, jsonBody);
                 HttpResponse<String> createResp = sendWithRetry(createReq);
+
+                System.out.println("[Task] 响应 HTTP " + createResp.statusCode());
+                System.out.println("[Task] 响应体: " + createResp.body());
 
                 if (createResp.statusCode() < 200 || createResp.statusCode() >= 300) {
                     throw new ApiException("创建任务失败 HTTP " + createResp.statusCode() + ": "
                             + truncate(createResp.body()), createResp.statusCode());
                 }
+
+                if (handle.isCancelled()) return;
 
                 Map<String, Object> respMap = JsonUtil.parseObject(createResp.body());
 
@@ -145,7 +215,13 @@ public class GenericApiCaller {
                 if (taskIdObj == null) {
                     throw new ApiException("响应中找不到任务 ID（路径: " + taskIdPath + "）", 0);
                 }
-                String taskId = String.valueOf(taskIdObj);
+                handle.taskId = String.valueOf(taskIdObj);
+                System.out.println("[Task] 提取到 taskId=" + handle.taskId + " (path=" + taskIdPath + ")");
+
+                if (handle.isCancelled()) {
+                    handle.cancel(mc); // 刚创建就被取消，立即调用 DELETE
+                    return;
+                }
 
                 // Step 2: 轮询
                 Map<String, Object> pollCfg = mc.getResponseMapping() != null
@@ -166,15 +242,28 @@ public class GenericApiCaller {
 
                 long startTime = System.currentTimeMillis();
                 int pollCount = 0;
+                int consecutive404 = 0; // 连续 404 计数，达到阈值则认为任务不存在
+                String lastReportedStatus = null; // 记录上次推送的状态，不变就不重复推送
+                System.out.println("[Poll] ========== 开始轮询 taskId=" + handle.taskId + " ==========");
 
                 while (System.currentTimeMillis() - startTime < maxWaitMs) {
+                    // 检查用户取消
+                    if (handle.isCancelled()) {
+                        throw new ApiException("用户取消", 499);
+                    }
+
                     Thread.sleep(intervalMs);
                     pollCount++;
 
+                    // 再次检查取消
+                    if (handle.isCancelled()) {
+                        throw new ApiException("用户取消", 499);
+                    }
+
                     String pollUrl = mc.getApiUrl();
                     if (!pollUrl.endsWith("/")) pollUrl += "/";
-                    String resolvedEndpoint = endpoint.replace("{{taskId}}", taskId)
-                            .replace("{id}", taskId);
+                    String resolvedEndpoint = endpoint.replace("{{taskId}}", handle.taskId)
+                            .replace("{id}", handle.taskId);
                     if (resolvedEndpoint.startsWith("/")) resolvedEndpoint = resolvedEndpoint.substring(1);
                     pollUrl += resolvedEndpoint;
 
@@ -188,6 +277,29 @@ public class GenericApiCaller {
 
                     HttpRequest pollReq = pollReqBuilder.build();
                     HttpResponse<String> pollResp = sendWithRetry(pollReq);
+
+                    // 每次轮询都打印请求 URL 和响应
+                    System.out.println("[Poll #" + pollCount + "] " + method + " " + pollUrl
+                            + " → HTTP " + pollResp.statusCode()
+                            + (pollResp.body() != null && !pollResp.body().isEmpty()
+                                ? " body=" + pollResp.body()
+                                : " (空body)"));
+
+                    // 404：任务尚未就绪（创建后有短暂延迟）或已被服务端清理
+                    if (pollResp.statusCode() == 404) {
+                        consecutive404++;
+                        if (consecutive404 > 20) {
+                            // 连续 21 次 404（约 60 秒），认为任务不存在
+                            throw new ApiException("任务不存在（服务端已清理或 ID 无效）", 404);
+                        }
+                        if (onProgress != null) {
+                            int finalPollCount = pollCount;
+                            SwingUtilities.invokeLater(() ->
+                                    onProgress.accept("等待任务就绪... (第 " + finalPollCount + " 次)"));
+                        }
+                        continue;
+                    }
+                    consecutive404 = 0; // 非 404 → 重置计数
 
                     if (pollResp.statusCode() != 200) {
                         if (onProgress != null) {
@@ -206,30 +318,36 @@ public class GenericApiCaller {
                         status = s != null ? String.valueOf(s) : null;
                     }
 
-                    if (onProgress != null && status != null) {
-                        final String fs = status;
+                    // 只在状态变化时才推送进度（避免同状态反复刷新）
+                    if (onProgress != null && status != null && !status.equals(lastReportedStatus)) {
+                        lastReportedStatus = status;
+                        final String cnStatus = translateStatus(status);
                         int finalPollCount1 = pollCount;
-                        SwingUtilities.invokeLater(() -> onProgress.accept("状态: " + fs + " (第 " + finalPollCount1 + " 次)"));
+                        SwingUtilities.invokeLater(() -> onProgress.accept("状态: " + cnStatus + " (第 " + finalPollCount1 + " 次)"));
                     }
 
                     if (successStatus != null && successStatus.equals(status)) {
                         Object resultData = resultPath != null ? JsonUtil.getByPath(pollMap, resultPath) : pollMap;
-                        final TaskResult tr = new TaskResult(resultData, pollResp.body(), taskId);
+                        final TaskResult tr = new TaskResult(resultData, pollResp.body(), handle.taskId);
+                        System.out.println("[Poll] ✅ 任务完成! 耗时 " + (System.currentTimeMillis() - startTime) / 1000 + "s, 共 " + pollCount + " 次轮询");
                         if (onSuccess != null) SwingUtilities.invokeLater(() -> onSuccess.accept(tr));
                         return;
                     }
 
                     if (failStatus != null && failStatus.equals(status)) {
+                        System.out.println("[Poll] ❌ 任务失败, status=" + status + ", body=" + pollResp.body());
                         throw new ApiException("任务失败: " + pollResp.body(), 0);
                     }
                 }
 
+                System.out.println("[Poll] ⏰ 任务超时, 已等待 " + (maxWaitMs / 1000) + "s, " + pollCount + " 次轮询");
                 throw new ApiException("任务超时（已等待 " + (maxWaitMs / 1000) + " 秒，" + pollCount + " 次轮询）", 0);
 
             } catch (Exception e) {
                 if (onError != null) SwingUtilities.invokeLater(() -> onError.accept(e));
             }
         });
+        return handle;
     }
 
     // ==================== HTTP 构建 ====================

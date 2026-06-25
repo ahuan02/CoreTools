@@ -10,48 +10,35 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 从 JSON 文件加载 AI 模型配置。
+ * 从 JSON 文件加载 AI 模型配置（统一使用运行目录下的 models.json）。
  * <p>
  * 加载顺序：
  * <ol>
- *   <li>classpath 中的 models.json（默认内置模型）</li>
- *   <li>运行目录下的 user-models.json（用户自定义，覆盖/追加）</li>
+ *   <li>运行目录下的 models.json（用户可直接编辑）</li>
+ *   <li>classpath 中的 models.json（首次运行时的默认配置）</li>
  * </ol>
  */
 public class ModelConfigLoader {
 
-    /** classpath 中的默认模型配置文件 */
-    private static final String DEFAULT_MODELS_JSON = "models.json";
-    /** 运行目录下的用户自定义模型配置文件 */
-    private static final String USER_MODELS_JSON = "user-models.json";
+    /** 模型配置文件名（运行目录下，也作为 classpath 默认资源） */
+    private static final String MODELS_JSON = "models.json";
 
-    /** 加载全部模型（内置 + 用户自定义），用户定义的同别名模型覆盖内置 */
+    /** 运行目录下的 models.json 文件 */
+    private static File getRuntimeFile() {
+        return new File(System.getProperty("user.dir"), MODELS_JSON);
+    }
+
+    /** 加载全部模型：优先运行目录 models.json，不存在则用 classpath 默认 */
     @SuppressWarnings("unchecked")
     public static List<ModelConfig> loadAll() {
-        Map<String, ModelConfig> map = new LinkedHashMap<>();
-
-        // 1. 加载内置模型
-        List<ModelConfig> builtin = loadFromClasspath();
-        for (ModelConfig mc : builtin) {
-            map.put(mc.getAlias(), mc);
+        File runtimeFile = getRuntimeFile();
+        if (runtimeFile.exists()) {
+            return loadFromFile(runtimeFile);
         }
-
-        // 2. 用户自定义覆盖
-        List<ModelConfig> user = loadFromFile(new File(USER_MODELS_JSON));
-        for (ModelConfig mc : user) {
-            map.put(mc.getAlias(), mc); // 同别名覆盖
-        }
-
-        return new ArrayList<>(map.values());
+        return loadFromClasspath();
     }
 
-    /** 仅加载用户自定义模型 */
-    @SuppressWarnings("unchecked")
-    public static List<ModelConfig> loadUser() {
-        return loadFromFile(new File(USER_MODELS_JSON));
-    }
-
-    /** 保存用户自定义模型到 user-models.json */
+    /** 保存全部模型到运行目录下的 models.json */
     public static void saveUser(List<ModelConfig> models) {
         List<Map<String, Object>> list = new ArrayList<>();
         for (ModelConfig mc : models) {
@@ -61,10 +48,10 @@ public class ModelConfigLoader {
         root.put("models", list);
 
         try (Writer w = new OutputStreamWriter(
-                new FileOutputStream(USER_MODELS_JSON), StandardCharsets.UTF_8)) {
+                new FileOutputStream(getRuntimeFile()), StandardCharsets.UTF_8)) {
             w.write(JsonUtil.toPrettyJson(root));
         } catch (IOException ignored) {
-            System.err.println("[ModelConfigLoader] 保存 user-models.json 失败");
+            System.err.println("[ModelConfigLoader] 保存 models.json 失败");
         }
     }
 
@@ -73,7 +60,7 @@ public class ModelConfigLoader {
     @SuppressWarnings("unchecked")
     private static List<ModelConfig> loadFromClasspath() {
         try (InputStream in = ModelConfigLoader.class.getClassLoader()
-                .getResourceAsStream(DEFAULT_MODELS_JSON)) {
+                .getResourceAsStream(MODELS_JSON)) {
             if (in == null) return List.of();
             String json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
             Map<String, Object> root = JsonUtil.parseObject(json);
@@ -149,12 +136,30 @@ public class ModelConfigLoader {
         // response → resultPath / poll
         Object respObj = map.get("response");
         if (respObj instanceof Map respMap) {
-            String resultPath = str(respMap, "resultPath", null);
-            Object poll = respMap.get("poll");
-            // 用 LinkedHashMap 保存 response 配置
             Map<String, Object> respMapping = new LinkedHashMap<>();
-            if (resultPath != null) respMapping.put("resultPath", resultPath);
+
+            // 兼容格式1: 嵌套 poll 子对象 { response: { poll: { endpoint: ... } } }
+            Object poll = respMap.get("poll");
             if (poll instanceof Map) respMapping.putAll((Map<String, Object>) poll);
+
+            // 兼容格式2: 扁平化字段 { response: { endpoint: ..., statusPath: ... } }
+            // （toMap 保存时会将 poll 字段展开到 response 下）
+            String[] pollKeys = {"endpoint", "cancelEndpoint", "method",
+                    "statusPath", "successStatus", "failStatus",
+                    "intervalMs", "maxWaitMs", "timeoutSec"};
+            for (String key : pollKeys) {
+                Object val = respMap.get(key);
+                if (val != null && !respMapping.containsKey(key)) {
+                    respMapping.put(key, val);
+                }
+            }
+
+            // resultPath 可能在顶层也可能在 poll 内
+            String resultPath = str(respMap, "resultPath", null);
+            if (resultPath != null && !respMapping.containsKey("resultPath")) {
+                respMapping.put("resultPath", resultPath);
+            }
+
             if (!respMapping.isEmpty()) mc.setResponseMapping(respMapping);
 
             // taskId 提取路径
@@ -215,11 +220,26 @@ public class ModelConfigLoader {
             map.put("request", req);
         }
 
-        // response
+        // response — 保留 poll 子对象结构
         Map<String, Object> respMapping = mc.getResponseMapping();
-        boolean hasResp = (respMapping != null && !respMapping.isEmpty()) || (mc.getTaskIdPath() != null);
-        if (hasResp) {
-            Map<String, Object> resp = new LinkedHashMap<>(respMapping != null ? respMapping : Map.of());
+        if ((respMapping != null && !respMapping.isEmpty()) || mc.getTaskIdPath() != null) {
+            Map<String, Object> resp = new LinkedHashMap<>();
+            // poll 相关的 key 集合
+            java.util.Set<String> pollKeys = java.util.Set.of(
+                    "endpoint", "cancelEndpoint", "method",
+                    "statusPath", "successStatus", "failStatus",
+                    "resultPath", "intervalMs", "maxWaitMs", "timeoutSec");
+            if (respMapping != null) {
+                Map<String, Object> poll = new LinkedHashMap<>();
+                for (Map.Entry<String, Object> e : respMapping.entrySet()) {
+                    if (pollKeys.contains(e.getKey())) {
+                        poll.put(e.getKey(), e.getValue());
+                    } else {
+                        resp.put(e.getKey(), e.getValue());
+                    }
+                }
+                if (!poll.isEmpty()) resp.put("poll", poll);
+            }
             if (mc.getTaskIdPath() != null) resp.put("taskIdPath", mc.getTaskIdPath());
             map.put("response", resp);
         }

@@ -92,7 +92,7 @@ public class AiChatPanel extends AbstractCommandPanel {
     private JButton editModelBtn;
     private JButton reloadModelBtn;   // 从 JSON 热重载模型配置
 
-    /** 文件监控线程（监控 user-models.json 变化自动重载） */
+    /** 文件监控线程（监控 models.json 变化自动重载） */
     private Thread modelsWatcher;
     private volatile boolean watcherRunning = false;
     private JScrollPane chatScrollPane;
@@ -105,6 +105,12 @@ public class AiChatPanel extends AbstractCommandPanel {
 
     /** 停止流式输出标记，用户点击停止时设为 true，后台线程检测到后中断流式输出 */
     private volatile boolean stopRequested = false;
+
+    /** 通用 API 任务取消句柄（Seed3D 等 task 模式），用户点击取消时调用 */
+    private volatile GenericApiCaller.TaskHandle currentTaskHandle;
+
+    /** 当前正在执行的通用 API 任务对应的 ModelConfig（用于取消时发 DELETE） */
+    private ModelConfig currentTaskMc;
 
     /** 用户在流式输出期间手动滚上去了，不再自动滚动到底部 */
     private volatile boolean userScrolledUp = false;
@@ -744,7 +750,8 @@ public class AiChatPanel extends AbstractCommandPanel {
     private void updateSendBtnState() {
         if (sendBtn != null) {
             boolean hasText = !inputArea.getText().trim().isEmpty();
-            sendBtn.setEnabled(hasText && sendMode);
+            // 停止模式下按钮始终启用（作为取消按钮），发送模式下才检查输入内容
+            sendBtn.setEnabled(sendMode ? hasText : true);
         }
     }
 
@@ -767,8 +774,34 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
-    /** 停止流式输出 */
+    /** 停止流式输出 / 取消正在进行的异步任务 */
     private void stopStreaming() {
+        // 如果是 task 模式（Seed3D 等），取消异步任务
+        if (currentTaskHandle != null) {
+            GenericApiCaller.TaskHandle handle = currentTaskHandle;
+            currentTaskHandle = null; // 先清空，防止重复取消
+            ModelConfig mc = currentTaskMc;
+            currentTaskMc = null;
+            // 禁用按钮防止重复点击
+            if (sendBtn != null) {
+                sendBtn.setEnabled(false);
+                sendBtn.repaint();
+            }
+            ThreadPoolUtil.submitVirtual(() -> {
+                handle.cancel(mc);
+                SwingUtilities.invokeLater(() -> {
+                    switchToSendMode();
+                    setModelButtonsEnabled(true);
+                    if (sendBtn != null) {
+                        sendBtn.setEnabled(true);
+                        sendBtn.repaint();
+                    }
+                });
+            });
+            return;
+        }
+
+        // 流式对话停止
         stopRequested = true;
         // 先禁用按钮防止重复点击，等后台线程确认停止后再恢复
         if (sendBtn != null) {
@@ -1527,11 +1560,21 @@ public class AiChatPanel extends AbstractCommandPanel {
         }
     }
 
-    /** 新建会话：停止流式输出 + 清空面板 + 清除记忆 */
+    /** 新建会话：停止流式输出 / 取消异步任务 + 清空面板 + 清除记忆 */
     private void newSession() {
         // 如果正在流式输出，取消它
         if (streamingActive) {
             stopRequested = true;
+        }
+        // 如果正在执行异步任务，取消它
+        if (currentTaskHandle != null) {
+            GenericApiCaller.TaskHandle handle = currentTaskHandle;
+            currentTaskHandle = null;
+            ModelConfig mc = currentTaskMc;
+            currentTaskMc = null;
+            ThreadPoolUtil.submitVirtual(() -> handle.cancel(mc));
+            switchToSendMode();
+            setModelButtonsEnabled(true);
         }
         clearChat();
     }
@@ -1783,7 +1826,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             List<ModelConfig> reloaded = ModelConfigLoader.loadAll();
             if (reloaded.isEmpty()) {
                 javax.swing.JOptionPane.showMessageDialog(this,
-                        "未找到任何模型配置，请检查 models.json / user-models.json",
+                        "未找到任何模型配置，请检查 models.json",
                         "重新加载", javax.swing.JOptionPane.WARNING_MESSAGE);
                 return;
             }
@@ -1801,7 +1844,7 @@ public class AiChatPanel extends AbstractCommandPanel {
     }
 
     /**
-     * 启动文件监控：当 user-models.json 被外部修改时自动重载。
+     * 启动文件监控：当 models.json 被外部修改时自动重载。
      * 使用 debounce 机制避免连续保存时多次触发。
      */
     private void startUserModelsWatcher() {
@@ -1828,12 +1871,12 @@ public class AiChatPanel extends AbstractCommandPanel {
 
                     for (java.nio.file.WatchEvent<?> event : key.pollEvents()) {
                         java.nio.file.Path changed = (java.nio.file.Path) event.context();
-                        if ("user-models.json".equals(changed.toString())) {
+                        if ("models.json".equals(changed.toString())) {
                             long now = System.currentTimeMillis();
                             // 500ms debounce：防止编辑器连续保存触发多次
                             if (now - lastReload > 1500) {
                                 lastReload = now;
-                                System.out.println("[AI Chat] 检测到 user-models.json 变化，自动重载中...");
+                                System.out.println("[AI Chat] 检测到 models.json 变化，自动重载中...");
                                 // 延迟 300ms 确保文件写入完成
                                 Thread.sleep(300);
                                 SwingUtilities.invokeLater(() -> reloadModelsFromJson());
@@ -1882,8 +1925,10 @@ public class AiChatPanel extends AbstractCommandPanel {
         // Agnes 扩展配置面板（根据选中模型动态显示/隐藏）
         private JPanel extraPanel;
         private JPanel imageConfigPanel;
+        private JPanel imageInputPanel;
         private JPanel videoConfigPanel;
         private JComboBox<String> imgSizeCombo, imgModeCombo;
+        private JComboBox<String> seedSubdivCombo, seedFormatCombo;
         private JTextArea imgUrlArea;
         private JComboBox<String> vidResCombo, vidDurCombo, vidFpsCombo, vidModeCombo;
         private JTextField vidSeedField;
@@ -2158,6 +2203,98 @@ public class AiChatPanel extends AbstractCommandPanel {
             return p;
         }
 
+        /** 构建 Seed3D 等模型的图片输入面板（图片URL + 面数 + 格式） */
+        private JPanel buildImageInputPanel() {
+            JPanel p = new JPanel(new GridBagLayout());
+            p.setOpaque(false);
+            p.setBorder(BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY), "输入图片",
+                    javax.swing.border.TitledBorder.LEFT,
+                    javax.swing.border.TitledBorder.TOP, NetUtil.FONT_TEXT, C_PRIMARY));
+            GridBagConstraints g = new GridBagConstraints();
+            g.insets = new Insets(3, 4, 3, 4);
+            g.anchor = GridBagConstraints.WEST;
+            g.fill = GridBagConstraints.HORIZONTAL;
+
+            // 图片URL输入
+            g.gridx = 0; g.gridy = 0; g.weightx = 0;
+            JLabel urlLbl = new JLabel("图片URL：");
+            urlLbl.setFont(NetUtil.FONT_TEXT); urlLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(urlLbl, g);
+            g.gridx = 1; g.weightx = 1;
+            JTextArea urlArea = new JTextArea(2, 30);
+            urlArea.setFont(NetUtil.FONT_TEXT);
+            urlArea.setForeground(NetUtil.TEXT_COLOR);
+            urlArea.setBackground(C_FIELD_BG);
+            urlArea.setCaretColor(NetUtil.TEXT_COLOR);
+            urlArea.setLineWrap(true);
+            urlArea.setWrapStyleWord(true);
+            urlArea.setToolTipText("输入图片URL或本地路径，用于3D模型生成");
+            JScrollPane urlScroll = new JScrollPane(urlArea);
+            urlScroll.setPreferredSize(new Dimension(300, 45));
+            p.add(urlScroll, g);
+
+            // 选择本地图片按钮
+            g.gridx = 2; g.gridy = 0; g.weightx = 0;
+            JButton pickBtn = new JButton("选择图片");
+            pickBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            pickBtn.setForeground(C_PRIMARY);
+            pickBtn.setBackground(C_BTN_BG);
+            pickBtn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(C_PRIMARY),
+                    BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+            pickBtn.setFocusPainted(false);
+            pickBtn.addActionListener(e -> pickLocalImages(urlArea));
+            p.add(pickBtn, g);
+
+            // 提示（点击可跳转到隧道穿透面板）
+            g.gridx = 0; g.gridy = 1; g.gridwidth = 3; g.weightx = 1;
+            JLabel hint = new JLabel("<html><u>本地图片需公网链接，点击此处设置网络穿透</u> &nbsp;|&nbsp; 支持本地路径 / HTTP(S) URL / Base64 Data URI</html>");
+            hint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            hint.setForeground(new Color(255, 145, 0));
+            hint.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            hint.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    navigateToTunnelTab();
+                }
+            });
+            p.add(hint, g);
+            g.gridwidth = 1;
+
+            // 面数（subdivisionlevel）
+            g.gridx = 0; g.gridy = 2; g.weightx = 0;
+            JLabel subdivLbl = new JLabel("多边形面数：");
+            subdivLbl.setFont(NetUtil.FONT_TEXT); subdivLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(subdivLbl, g);
+            g.gridx = 1; g.weightx = 0;
+            seedSubdivCombo = new JComboBox<>(new String[]{"high (100万面)", "medium (50万面)", "low (10万面)"});
+            seedSubdivCombo.setFont(NetUtil.FONT_TEXT);
+            seedSubdivCombo.setForeground(NetUtil.TEXT_COLOR);
+            seedSubdivCombo.setBackground(C_FIELD_BG);
+            seedSubdivCombo.setSelectedIndex(1); // 默认 medium
+            p.add(seedSubdivCombo, g);
+
+            // 文件格式（fileformat）
+            g.gridx = 0; g.gridy = 3; g.weightx = 0;
+            JLabel fmtLbl = new JLabel("文件格式：");
+            fmtLbl.setFont(NetUtil.FONT_TEXT); fmtLbl.setForeground(NetUtil.TEXT_COLOR);
+            p.add(fmtLbl, g);
+            g.gridx = 1; g.weightx = 0;
+            seedFormatCombo = new JComboBox<>(new String[]{"glb", "obj", "usd", "usdz"});
+            seedFormatCombo.setFont(NetUtil.FONT_TEXT);
+            seedFormatCombo.setForeground(NetUtil.TEXT_COLOR);
+            seedFormatCombo.setBackground(C_FIELD_BG);
+            p.add(seedFormatCombo, g);
+
+            // 将 urlArea 保存到实例字段，方便保存/回填
+            imgUrlArea = urlArea;
+            imgUrlScroll = urlScroll;
+            imgUrlHint = hint;
+
+            return p;
+        }
+
         /** 构建视频生成的配置面板 */
         private JPanel buildVideoConfigPanel() {
             JPanel p = new JPanel(new GridBagLayout());
@@ -2358,10 +2495,19 @@ public class AiChatPanel extends AbstractCommandPanel {
             return p;
         }
 
-        /** 预构建两个面板 */
+        /** 预构建三个面板 */
         private void buildAgnesPanels() {
             imageConfigPanel = buildImageConfigPanel();
+            imageInputPanel = buildImageInputPanel();
             videoConfigPanel = buildVideoConfigPanel();
+        }
+
+        /** 判断是否为需要图片输入的3D/生成模型（如豆包 Seed3D） */
+        private boolean isImageInputModel(String name) {
+            if (name == null) return false;
+            String lower = name.toLowerCase();
+            // 匹配 seed-3d、seed3d、seed_3d 等变体
+            return lower.contains("seed") && (lower.contains("3d") || lower.contains("3-d"));
         }
 
         /** 根据当前模型名切换显示对应的配置面板 */
@@ -2385,6 +2531,31 @@ public class AiChatPanel extends AbstractCommandPanel {
                     }
                 }
                 extraPanel.add(imageConfigPanel, BorderLayout.CENTER);
+                extraPanel.setVisible(true);
+            } else if (isImageInputModel(name)) {
+                // Seed3D 等需要图片输入的模型：显示图片 + 面数 + 格式配置面板
+                urlField.setEditable(true);
+                urlField.setBackground(C_FIELD_BG);
+                // 回填已有配置
+                ModelConfig editing = getEditingConfig();
+                if (editing != null) {
+                    Map<String, String> ext = editing.getExtraConfig();
+                    if (ext != null) {
+                        if (ext.containsKey("image")) imgUrlArea.setText(ext.get("image"));
+                        if (ext.containsKey("sl") && seedSubdivCombo != null) {
+                            String sl = ext.get("sl");
+                            for (int i = 0; i < seedSubdivCombo.getItemCount(); i++) {
+                                if (seedSubdivCombo.getItemAt(i).startsWith(sl)) {
+                                    seedSubdivCombo.setSelectedIndex(i);
+                                    break;
+                                }
+                            }
+                        }
+                        if (ext.containsKey("ff") && seedFormatCombo != null)
+                            seedFormatCombo.setSelectedItem(ext.get("ff"));
+                    }
+                }
+                extraPanel.add(imageInputPanel, BorderLayout.CENTER);
                 extraPanel.setVisible(true);
             } else if (name.startsWith("agnes-video")) {
                 // API 链接自动填充（服务类内置），设为只读
@@ -2414,7 +2585,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 extraPanel.add(videoConfigPanel, BorderLayout.CENTER);
                 extraPanel.setVisible(true);
             } else {
-                // 非 Agnes 模型：恢复 URL 可编辑
+                // 非特殊模型：恢复 URL 可编辑
                 urlField.setEditable(true);
                 urlField.setBackground(C_FIELD_BG);
                 extraPanel.setVisible(false);
@@ -2536,7 +2707,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 }
             }
 
-            // 立即持久化到 user-models.json
+            // 立即持久化到 models.json
             ModelConfigLoader.saveUser(modelConfigs);
 
             confirmed = true;
@@ -2553,6 +2724,24 @@ public class AiChatPanel extends AbstractCommandPanel {
                     mc.putExtra("image.urls", imgUrlArea.getText().trim());
                 } else {
                     mc.getExtraConfig().remove("image.urls");
+                }
+            } else if (isImageInputModel(name) && imgUrlArea != null) {
+                // Seed3D 等需要图片输入的模型：保存图片 URL + 面数 + 格式
+                String imageUrl = imgUrlArea.getText().trim();
+                if (!imageUrl.isEmpty()) {
+                    mc.putExtra("image", imageUrl);
+                } else {
+                    mc.getExtraConfig().remove("image");
+                }
+                // 保存面数选择
+                if (seedSubdivCombo != null && seedSubdivCombo.getSelectedItem() != null) {
+                    String selected = (String) seedSubdivCombo.getSelectedItem();
+                    String sl = selected.split(" ")[0]; // "high (100万面)" → "high"
+                    mc.putExtra("sl", sl);
+                }
+                // 保存格式选择
+                if (seedFormatCombo != null && seedFormatCombo.getSelectedItem() != null) {
+                    mc.putExtra("ff", (String) seedFormatCombo.getSelectedItem());
                 }
             } else if (name != null && name.startsWith("agnes-video") && vidResCombo != null) {
                 mc.putExtra("video.size", ((String) vidResCombo.getSelectedItem()).split(" ")[0]);
@@ -2677,7 +2866,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                         JOptionPane.WARNING_MESSAGE);
                 if (option == JOptionPane.YES_OPTION) {
                     modelConfigs.remove(editing);
-                    // 立即持久化到 user-models.json
+                    // 立即持久化到 models.json
                     ModelConfigLoader.saveUser(modelConfigs);
                     deleted = true;
                     dispose();
@@ -4914,7 +5103,19 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         // 从 extraConfig 读取默认参数
         context.put("size", mc.getExtra("size") != null ? mc.getExtra("size") : "1024x1024");
-        context.put("params", mc.getExtra("params") != null ? mc.getExtra("params") : "");
+        // 动态构建 params（Seed3D 等模型的面数和格式参数）
+        String sl = mc.getExtra("sl");
+        String ff = mc.getExtra("ff");
+        String params;
+        if (sl != null || ff != null) {
+            StringBuilder sb = new StringBuilder();
+            if (sl != null) sb.append("--subdivisionlevel ").append(sl).append(" ");
+            if (ff != null) sb.append("--fileformat ").append(ff);
+            params = sb.toString().trim();
+        } else {
+            params = mc.getExtra("params") != null ? mc.getExtra("params") : "";
+        }
+        context.put("params", params);
         context.put("format", mc.getExtra("format") != null ? mc.getExtra("format") : "url");
         context.put("width", mc.getExtra("width") != null ? mc.getExtra("width") : "1152");
         context.put("height", mc.getExtra("height") != null ? mc.getExtra("height") : "768");
@@ -4952,11 +5153,13 @@ public class AiChatPanel extends AbstractCommandPanel {
         chatMessagePanel.repaint();
         scrollToBottom();
 
-        // 计时器
+        // 计时器：用 AtomicReference 存最新进度文本，避免 Timer 覆盖回"正在处理..."
         final long startTime = System.currentTimeMillis();
+        final java.util.concurrent.atomic.AtomicReference<String> latestText =
+                new java.util.concurrent.atomic.AtomicReference<>("正在处理...");
         javax.swing.Timer timer = new javax.swing.Timer(1000, e -> {
             long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-            genBubble.contentArea.setText("正在处理... (已耗时: " + elapsed + "秒)");
+            genBubble.contentArea.setText(latestText.get() + " (已耗时: " + elapsed + "秒)");
             genBubble.recalcContentSize();
             genBubble.revalidateAndRepaint();
             int newH = genBubble.getPreferredSize().height + 4;
@@ -4967,10 +5170,17 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         // 路由到 sync 或 task
         if ("task".equals(type)) {
-            // 异步任务模式
-            GenericApiCaller.callTaskAsync(mc, jsonBody,
+            // 异步任务模式 — 切换到停止模式，用户可取消
+            currentTaskMc = mc;
+            switchToStopMode();
+            setModelButtonsEnabled(false);
+            currentTaskHandle = GenericApiCaller.callTaskAsync(mc, jsonBody,
                     result -> SwingUtilities.invokeLater(() -> {
                         timer.stop();
+                        currentTaskHandle = null;
+                        currentTaskMc = null;
+                        switchToSendMode();
+                        setModelButtonsEnabled(true);
                         genBubble.contentArea.setText("[成功] 任务完成！\n模型: " + alias
                                 + "\n结果: " + (result.data() != null ? result.data() : result.rawJson()));
                         genBubble.recalcContentSize();
@@ -4981,7 +5191,16 @@ public class AiChatPanel extends AbstractCommandPanel {
                     }),
                     ex -> SwingUtilities.invokeLater(() -> {
                         timer.stop();
-                        genBubble.contentArea.setText("[失败] " + formatApiError((Exception) ex));
+                        currentTaskHandle = null;
+                        currentTaskMc = null;
+                        switchToSendMode();
+                        setModelButtonsEnabled(true);
+                        String errorMsg = formatApiError((Exception) ex);
+                        if (errorMsg.contains("用户取消") || errorMsg.contains("499")) {
+                            genBubble.contentArea.setText("[已取消] 任务已取消");
+                        } else {
+                            genBubble.contentArea.setText("[失败] " + errorMsg);
+                        }
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
                         chatMessagePanel.revalidate();
@@ -4990,7 +5209,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                     }),
                     progress -> SwingUtilities.invokeLater(() -> {
                         long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-                        genBubble.contentArea.setText("处理中: " + progress + " (已耗时: " + elapsed + "秒)");
+                        latestText.set("处理中: " + progress);
+                        genBubble.contentArea.setText(latestText.get() + " (已耗时: " + elapsed + "秒)");
                         genBubble.recalcContentSize();
                         genBubble.revalidateAndRepaint();
                         wrapper.revalidate();
@@ -5697,7 +5917,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         imageService = null; // 重置服务，下次从新 key 创建
         videoService = null; // 重置视频服务
 
-        // 从 models.json + user-models.json 加载模型配置
+        // 从 models.json 加载模型配置
         List<ModelConfig> loaded = ModelConfigLoader.loadAll();
         if (loaded.isEmpty()) {
             modelConfigs.clear();
@@ -5716,7 +5936,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             showPlaceholder();
         }
 
-        // 启动文件监控：自动感知 user-models.json 外部修改
+        // 启动文件监控：自动感知 models.json 外部修改
         startUserModelsWatcher();
     }
 
@@ -5726,7 +5946,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         if (agnesApiKey != null && !agnesApiKey.isBlank()) {
             config.set("ai.image.agnes.key", agnesApiKey);
         }
-        // 模型配置保存到 user-models.json
+        // 模型配置保存到 models.json
         ModelConfigLoader.saveUser(modelConfigs);
     }
 }
