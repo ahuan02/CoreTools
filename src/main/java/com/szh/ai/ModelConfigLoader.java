@@ -10,32 +10,103 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 从 JSON 文件加载 AI 模型配置（统一使用运行目录下的 models.json）。
+ * 从项目根目录（src 同级）的 models.json 加载 AI 模型配置。
  * <p>
- * 加载顺序：
- * <ol>
- *   <li>运行目录下的 models.json（用户可直接编辑）</li>
- *   <li>classpath 中的 models.json（首次运行时的默认配置）</li>
- * </ol>
+ * 如果文件不存在，自动生成一份仅含常用聊天模型的基础配置（无 API Key，用户自行填写）。
  */
 public class ModelConfigLoader {
 
-    /** 模型配置文件名（运行目录下，也作为 classpath 默认资源） */
+    /** 模型配置文件名 */
     private static final String MODELS_JSON = "models.json";
 
-    /** 运行目录下的 models.json 文件 */
+    /** 项目根目录下的 models.json */
     private static File getRuntimeFile() {
         return new File(System.getProperty("user.dir"), MODELS_JSON);
     }
 
-    /** 加载全部模型：优先运行目录 models.json，不存在则用 classpath 默认 */
+    /** 加载全部模型：根目录 models.json 不存在则自动生成默认配置并写出 */
     @SuppressWarnings("unchecked")
     public static List<ModelConfig> loadAll() {
         File runtimeFile = getRuntimeFile();
         if (runtimeFile.exists()) {
             return loadFromFile(runtimeFile);
         }
-        return loadFromClasspath();
+        // 首次运行：生成默认聊天模型配置并写出到根目录
+        String defaultJson = buildDefaultModelsJson();
+        try {
+            try (Writer w = new OutputStreamWriter(
+                    new FileOutputStream(runtimeFile), StandardCharsets.UTF_8)) {
+                w.write(defaultJson);
+            }
+            System.out.println("[ModelConfigLoader] 已自动生成默认配置: " + runtimeFile.getAbsolutePath());
+        } catch (IOException e) {
+            System.err.println("[ModelConfigLoader] 创建 " + runtimeFile.getAbsolutePath() + " 失败: " + e.getMessage());
+        }
+        // 直接用生成的 JSON 解析（避免写盘后重新读取）
+        try {
+            Map<String, Object> root = JsonUtil.parseObject(defaultJson);
+            List<Object> arr = (List<Object>) root.get("models");
+            if (arr == null) return List.of();
+            List<ModelConfig> list = new ArrayList<>();
+            for (Object obj : arr) {
+                if (obj instanceof Map) list.add(fromMap((Map<String, Object>) obj));
+            }
+            return list;
+        } catch (Exception e) {
+            System.err.println("[ModelConfigLoader] 解析默认配置失败: " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** 生成仅含常用聊天模型的基础配置（API Key 为空，用户自行填写） */
+    private static String buildDefaultModelsJson() {
+        // 注意：bodyTemplate 中 width/height/num_frames/frame_rate 等字段虽然写成字符串格式，
+        // 但 JsonTemplateEngine 的 tryParseNumber() 在替换 context 值时会自动转为数字。
+        return """
+                {
+                  "models": [
+                    {"alias":"GPT-4o","modelName":"gpt-4o","baseUrl":"https://api.openai.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"GPT-4o Mini","modelName":"gpt-4o-mini","baseUrl":"https://api.openai.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"DeepSeek Chat","modelName":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"DeepSeek Reasoner","modelName":"deepseek-reasoner","baseUrl":"https://api.deepseek.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"DeepSeek V4 Pro","modelName":"deepseek-v4-pro","baseUrl":"https://api.deepseek.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"DeepSeek V4 Flash","modelName":"deepseek-v4-flash","baseUrl":"https://api.deepseek.com/v1","apiKey":"","type":"chat"},
+                    {"alias":"豆包","modelName":"doubao-lite-128k","baseUrl":"https://ark.cn-beijing.volces.com/api/v3","apiKey":"","type":"chat"},
+                    {"alias":"通义千问 Plus","modelName":"qwen-plus","baseUrl":"https://dashscope.aliyuncs.com/compatible-mode/v1","apiKey":"","type":"chat"},
+                    {"alias":"通义千问 Max","modelName":"qwen-max","baseUrl":"https://dashscope.aliyuncs.com/compatible-mode/v1","apiKey":"","type":"chat"},
+                    {
+                      "alias":"Agnes 图片生成",
+                      "modelName":"agnes-image-2.0-flash",
+                      "baseUrl":"https://apihub.agnes-ai.com",
+                      "apiKey":"",
+                      "type":"sync",
+                      "endpoint":"/v1/images/generations",
+                      "request":{"bodyTemplate":{"model":"agnes-image-2.0-flash","prompt":"{{prompt}}","size":"{{size}}","return_base64":true,"extra_body":{"response_format":"{{format}}","image":"{{image}}"}}},
+                      "response":{"poll":{"resultPath":"data"}}
+                    },
+                    {
+                      "alias":"Agnes 视频生成",
+                      "modelName":"agnes-video-v2.0",
+                      "baseUrl":"https://apihub.agnes-ai.com",
+                      "apiKey":"",
+                      "type":"task",
+                      "endpoint":"/v1/videos",
+                      "request":{"bodyTemplate":{"model":"agnes-video-v2.0","prompt":"{{prompt}}","width":"{{width}}","height":"{{height}}","num_frames":"{{numFrames}}","frame_rate":"{{frameRate}}","seed":"{{seed}}","extra_body":{"image":"{{images}}","mode":"{{mode}}"}}},
+                      "response":{"poll":{"endpoint":"/agnesapi?video_id={{taskId}}","method":"GET","statusPath":"status","successStatus":"completed","failStatus":"failed","resultPath":"video_url","intervalMs":5000,"maxWaitMs":1800000},"taskIdPath":"video_id"}
+                    },
+                    {
+                      "alias":"豆包 Seed3D",
+                      "modelName":"doubao-seed3d-2-0-260328",
+                      "baseUrl":"https://ark.cn-beijing.volces.com/api/v3",
+                      "apiKey":"",
+                      "type":"task",
+                      "endpoint":"/contents/generations/tasks",
+                      "request":{"bodyTemplate":{"model":"doubao-seed3d-2-0-260328","content":[{"type":"text","text":"{{params}}"},{"type":"image_url","image_url":{"url":"{{image}}"}}]}},
+                      "response":{"poll":{"endpoint":"/contents/generations/tasks/{{taskId}}","method":"GET","statusPath":"status","successStatus":"succeeded","failStatus":"failed","resultPath":"content","intervalMs":3000,"maxWaitMs":600000,"cancelEndpoint":"contents/generations/tasks/{{taskId}}"},"taskIdPath":"id"},
+                      "extraConfig":{"params":"--subdivisionlevel medium --fileformat glb","sl":"medium","ff":"glb"}
+                    }
+                  ]
+                }""";
     }
 
     /** 保存全部模型到运行目录下的 models.json */
@@ -56,26 +127,6 @@ public class ModelConfigLoader {
     }
 
     // ==================== 内部 ====================
-
-    @SuppressWarnings("unchecked")
-    private static List<ModelConfig> loadFromClasspath() {
-        try (InputStream in = ModelConfigLoader.class.getClassLoader()
-                .getResourceAsStream(MODELS_JSON)) {
-            if (in == null) return List.of();
-            String json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-            Map<String, Object> root = JsonUtil.parseObject(json);
-            List<Object> arr = (List<Object>) root.get("models");
-            if (arr == null) return List.of();
-            List<ModelConfig> list = new ArrayList<>();
-            for (Object obj : arr) {
-                if (obj instanceof Map) list.add(fromMap((Map<String, Object>) obj));
-            }
-            return list;
-        } catch (IOException e) {
-            System.err.println("[ModelConfigLoader] 加载内置模型失败: " + e.getMessage());
-            return List.of();
-        }
-    }
 
     @SuppressWarnings("unchecked")
     private static List<ModelConfig> loadFromFile(File file) {

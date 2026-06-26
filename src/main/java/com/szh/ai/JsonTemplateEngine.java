@@ -57,6 +57,12 @@ public class JsonTemplateEngine {
             if (s.startsWith("{{") && s.endsWith("}}") && s.indexOf("{{", 2) < 0) {
                 String varName = s.substring(2, s.length() - 2).trim();
                 Object replacement = context.get(varName);
+                if (replacement instanceof String str) {
+                    // 自动识别数字：context 值全是 String（来自 extraConfig），
+                    // 但模板期望的是 JSON number，需转成 Integer 或 Double
+                    Object number = tryParseNumber(str);
+                    if (number != null) return number;
+                }
                 return replacement != null ? replacement : "";
             }
             // 部分占位符替换
@@ -89,5 +95,37 @@ public class JsonTemplateEngine {
             i = close + 2;
         }
         return sb.toString();
+    }
+
+    /**
+     * 尝试将字符串解析为数字（Integer → Long → Double），
+     * 解析失败返回 null。
+     * <p>
+     * 用于解决 extraConfig 全为 String，但 bodyTemplate 中
+     * num_frames / frame_rate / width / height 等字段应为 JSON number 的问题。
+     */
+    private static Number tryParseNumber(String s) {
+        if (s == null || s.isEmpty()) return null;
+        // 跳过明显不是数字的字符串（含非数字字符，允许负号和小数点）
+        boolean hasDigit = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= '0' && c <= '9') { hasDigit = true; continue; }
+            if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') continue;
+            return null; // 非数字字符
+        }
+        if (!hasDigit) return null; // 空字符串或纯符号
+        try {
+            if (s.indexOf('.') >= 0 || s.indexOf('e') >= 0 || s.indexOf('E') >= 0) {
+                return Double.parseDouble(s);
+            }
+            long longVal = Long.parseLong(s);
+            if (longVal >= Integer.MIN_VALUE && longVal <= Integer.MAX_VALUE) {
+                return (int) longVal;
+            }
+            return longVal;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 }

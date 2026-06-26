@@ -61,6 +61,9 @@ public class HttpPanel extends AbstractCommandPanel {
         private JCheckBox tokenEnabledCb;
         private JComboBox<String> tokenTypeCombo;
 
+        // ---- 全局 Base URL ----
+        private JTextField baseUrlField;
+
         // ---- 请求行 ----
         private JComboBox<String> methodCombo;
         private JTextField urlField;
@@ -136,6 +139,16 @@ public class HttpPanel extends AbstractCommandPanel {
             tokenLeft.add(new JLabel("类型:"));
             tokenLeft.add(tokenTypeCombo);
             tokenBar.add(tokenLeft, BorderLayout.CENTER);
+
+            // 右侧：全局 Base URL
+            JPanel tokenRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+            tokenRight.add(new JLabel("Base URL:"));
+            baseUrlField = new JTextField("", 22);
+            baseUrlField.setFont(new Font("Consolas", Font.PLAIN, 11));
+            baseUrlField.setToolTipText("全局请求前缀，相对路径（如 /api/users）会自动拼接此前缀");
+            NetUtil.fixPaste(baseUrlField);
+            tokenRight.add(baseUrlField);
+            tokenBar.add(tokenRight, BorderLayout.EAST);
 
             // 请求行
             JPanel urlRow = new JPanel(new BorderLayout(4, 0));
@@ -544,7 +557,6 @@ public class HttpPanel extends AbstractCommandPanel {
 
             responseArea = new RSyntaxTextArea();
             responseArea.setEditable(false);
-            responseArea.setFocusable(false);
             responseArea.setSyntaxEditingStyle(SyntaxConstants.SYNTAX_STYLE_NONE);
             responseArea.setMarginLineEnabled(false);
             responseArea.setCodeFoldingEnabled(false);
@@ -554,6 +566,17 @@ public class HttpPanel extends AbstractCommandPanel {
             responseArea.setForeground(new Color(0xD4D4D4));
             responseArea.setCaretColor(new Color(0xD4D4D4));
             responseArea.setCurrentLineHighlightColor(new Color(0x2A2A2A));
+
+            // 右键弹出菜单：复制 + 全选
+            JPopupMenu respPopup = new JPopupMenu();
+            JMenuItem respCopy = new JMenuItem("复制 Ctrl+C");
+            respCopy.addActionListener(e -> responseArea.copy());
+            respPopup.add(respCopy);
+            JMenuItem respSelectAll = new JMenuItem("全选 Ctrl+A");
+            respSelectAll.addActionListener(e -> responseArea.selectAll());
+            respPopup.add(respSelectAll);
+            responseArea.setComponentPopupMenu(respPopup);
+
             RTextScrollPane respScroll = new RTextScrollPane(responseArea);
             respScroll.setLineNumbersEnabled(true);
             respScroll.setBorder(BorderFactory.createTitledBorder(
@@ -598,9 +621,20 @@ public class HttpPanel extends AbstractCommandPanel {
             String url = urlField.getText().trim();
             if (url.isEmpty()) { logWarn(logPane, "请输入 URL"); return; }
 
-            // 自动补全协议
+            // 自动补全协议 / Base URL
             if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                url = "http://" + url;
+                String baseUrl = baseUrlField.getText().trim();
+                if (!baseUrl.isEmpty()) {
+                    if (baseUrl.endsWith("/") && url.startsWith("/")) {
+                        url = baseUrl + url.substring(1);
+                    } else if (!baseUrl.endsWith("/") && !url.startsWith("/")) {
+                        url = baseUrl + "/" + url;
+                    } else {
+                        url = baseUrl + url;
+                    }
+                } else {
+                    url = "http://" + url;
+                }
                 urlField.setText(url);
             }
 
@@ -1124,6 +1158,11 @@ public class HttpPanel extends AbstractCommandPanel {
                 }
             }
         }
+        // 全局 Base URL
+        if (httpPanel.baseUrlField != null) {
+            String savedBase = config.get("http.baseUrl", "");
+            httpPanel.baseUrlField.setText(savedBase != null ? savedBase : "");
+        }
     }
 
     @Override
@@ -1134,6 +1173,10 @@ public class HttpPanel extends AbstractCommandPanel {
         config.set("http.token.enabled", String.valueOf(httpPanel.tokenEnabledCb.isSelected()));
         if (httpPanel.tokenTypeCombo != null) {
             config.set("http.token.type", (String) httpPanel.tokenTypeCombo.getSelectedItem());
+        }
+        // 全局 Base URL
+        if (httpPanel.baseUrlField != null) {
+            config.set("http.baseUrl", httpPanel.baseUrlField.getText().trim());
         }
     }
 }

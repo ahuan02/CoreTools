@@ -191,6 +191,13 @@ public class NetUtil {
         pane.setFont(FONT_TEXT);
 
         JPopupMenu popup = new JPopupMenu();
+        JMenuItem copyItem = new JMenuItem("复制 Ctrl+C");
+        copyItem.addActionListener(e -> pane.copy());
+        popup.add(copyItem);
+        JMenuItem selectAllItem = new JMenuItem("全选 Ctrl+A");
+        selectAllItem.addActionListener(e -> pane.selectAll());
+        popup.add(selectAllItem);
+        popup.addSeparator();
         JMenuItem clearItem = new JMenuItem("清空日志");
         clearItem.addActionListener(e -> pane.setText(""));
         popup.add(clearItem);

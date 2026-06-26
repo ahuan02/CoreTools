@@ -2074,7 +2074,6 @@ public class AiChatPanel extends AbstractCommandPanel {
 
             add(content);
             pack();
-            setResizable(false);
             setLocationRelativeTo(SwingUtilities.getWindowAncestor(this));
         }
 
@@ -2154,7 +2153,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgUrlArea.setWrapStyleWord(true);
             imgUrlArea.setToolTipText("每行一个URL或本地图片路径（图生图/多图合成时需要）");
             imgUrlScroll = new JScrollPane(imgUrlArea);
-            imgUrlScroll.setPreferredSize(new Dimension(300, 45));
+            imgUrlScroll.setPreferredSize(new Dimension(300, 65));
             p.add(imgUrlScroll, g);
 
             // 选择本地图片按钮
@@ -2170,8 +2169,37 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgPickBtn.addActionListener(e -> pickLocalImages(imgUrlArea));
             p.add(imgPickBtn, g);
 
+            // 隧道穿透按钮（点击直接跳转）
+            g.gridx = 3; g.gridy = 2; g.weightx = 0;
+            JButton imgTunnelBtn = new JButton("网络穿透");
+            imgTunnelBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            imgTunnelBtn.setForeground(new Color(255, 145, 0));
+            imgTunnelBtn.setBackground(C_BTN_BG);
+            imgTunnelBtn.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(255, 145, 0)),
+                    BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+            imgTunnelBtn.setFocusPainted(false);
+            imgTunnelBtn.setToolTipText("本地图片需公网链接，点击前往隧道穿透面板");
+            imgTunnelBtn.addActionListener(e -> navigateToTunnelTab());
+            p.add(imgTunnelBtn, g);
+
+            // 预览图片标签
+            g.gridx = 4; g.gridy = 2; g.weightx = 0;
+            JLabel imgPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
+            imgPreviewLbl.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            imgPreviewLbl.setForeground(new Color(0x4CAF50));
+            imgPreviewLbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            imgPreviewLbl.setToolTipText("点击预览文本框中的图片");
+            imgPreviewLbl.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    showImagePreview(imgUrlArea);
+                }
+            });
+            p.add(imgPreviewLbl, g);
+
             // 图片URL输入提示（点击可跳转到隧道穿透面板）
-            g.gridx = 0; g.gridy = 3; g.gridwidth = 3; g.weightx = 1;
+            g.gridx = 0; g.gridy = 3; g.gridwidth = 5; g.weightx = 1;
             imgUrlHint = new JLabel("<html><u>本地图片需公网链接，点击此处设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，图生图需1张，多图合成需2张+</html>");
             imgUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             imgUrlHint.setForeground(new Color(255, 145, 0));
@@ -2191,6 +2219,8 @@ public class AiChatPanel extends AbstractCommandPanel {
                 imgUrlLabel.setVisible(show);
                 imgUrlScroll.setVisible(show);
                 imgPickBtn.setVisible(show);
+                imgTunnelBtn.setVisible(show);
+                imgPreviewLbl.setVisible(show);
                 imgUrlHint.setVisible(show);
                 p.revalidate(); p.repaint();
                 pack();
@@ -2198,6 +2228,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgUrlLabel.setVisible(false);
             imgUrlScroll.setVisible(false);
             imgPickBtn.setVisible(false);
+            imgTunnelBtn.setVisible(false);
+            imgPreviewLbl.setVisible(false);
             imgUrlHint.setVisible(false);
 
             return p;
@@ -2415,7 +2447,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidUrlArea.setWrapStyleWord(true);
             vidUrlArea.setToolTipText("每行一个URL或本地图片路径（图生视频/多图视频/关键帧动画时需要）");
             vidUrlScroll = new JScrollPane(vidUrlArea);
-            vidUrlScroll.setPreferredSize(new Dimension(300, 45));
+            vidUrlScroll.setPreferredSize(new Dimension(300, 65));
             p.add(vidUrlScroll, g);
 
             // 选择本地图片按钮
@@ -2445,6 +2477,21 @@ public class AiChatPanel extends AbstractCommandPanel {
             tunnelHintBtn.addActionListener(e -> navigateToTunnelTab());
             p.add(tunnelHintBtn, g);
 
+            // 预览图片标签
+            g.gridx = 4; g.gridy = 5; g.weightx = 0;
+            JLabel vidPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
+            vidPreviewLbl.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
+            vidPreviewLbl.setForeground(new Color(0x4CAF50));
+            vidPreviewLbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            vidPreviewLbl.setToolTipText("点击预览文本框中的图片");
+            vidPreviewLbl.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    showImagePreview(vidUrlArea);
+                }
+            });
+            p.add(vidPreviewLbl, g);
+
             // 图片URL输入提示（点击可跳转到隧道穿透面板）
             g.gridx = 1; g.gridy = 6; g.weightx = 1;
             vidUrlHint = new JLabel("<html><u>本地图片需公网链接，点击设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，关键帧动画/多图视频至少2张</html>");
@@ -2464,6 +2511,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 vidUrlLabel.setVisible(show);
                 vidUrlScroll.setVisible(show);
                 vidPickBtn.setVisible(show);
+                vidPreviewLbl.setVisible(show);
                 vidUrlHint.setVisible(show);
                 tunnelHintBtn.setVisible(show);
                 p.revalidate(); p.repaint();
@@ -2472,6 +2520,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidUrlLabel.setVisible(false);
             vidUrlScroll.setVisible(false);
             vidPickBtn.setVisible(false);
+            vidPreviewLbl.setVisible(false);
             vidUrlHint.setVisible(false);
             tunnelHintBtn.setVisible(false);
 
@@ -2744,8 +2793,11 @@ public class AiChatPanel extends AbstractCommandPanel {
                     mc.putExtra("ff", (String) seedFormatCombo.getSelectedItem());
                 }
             } else if (name != null && name.startsWith("agnes-video") && vidResCombo != null) {
-                mc.putExtra("video.size", ((String) vidResCombo.getSelectedItem()).split(" ")[0]);
-                mc.putExtra("video.duration", (String) vidDurCombo.getSelectedItem());
+                // 保存 UI 回填用的 video.* 键
+                String sizeStr = ((String) vidResCombo.getSelectedItem()).split(" ")[0]; // "768x768"
+                mc.putExtra("video.size", sizeStr);
+                String durStr = (String) vidDurCombo.getSelectedItem(); // "121 帧"
+                mc.putExtra("video.duration", durStr);
                 mc.putExtra("video.fps", ((String) vidFpsCombo.getSelectedItem()).split(" ")[0]);
                 mc.putExtra("video.mode", (String) vidModeCombo.getSelectedItem());
                 if (!"文生视频".equals(vidModeCombo.getSelectedItem())) {
@@ -2758,6 +2810,25 @@ public class AiChatPanel extends AbstractCommandPanel {
                 } else {
                     mc.getExtraConfig().remove("video.seed");
                 }
+                // 同步写入请求模板上下文键（context 读取 width/height/numFrames/frameRate/seed/mode/images）
+                String[] wh = sizeStr.split("x");
+                if (wh.length == 2) {
+                    mc.putExtra("width", wh[0]);
+                    mc.putExtra("height", wh[1]);
+                }
+                mc.putExtra("numFrames", durStr.replaceAll("[^0-9]", "")); // "121 帧" → "121"
+                mc.putExtra("frameRate", ((String) vidFpsCombo.getSelectedItem()).split(" ")[0]);
+                if (!vidSeedField.getText().trim().isEmpty()) {
+                    mc.putExtra("seed", vidSeedField.getText().trim());
+                } else {
+                    mc.getExtraConfig().remove("seed");
+                }
+                mc.putExtra("mode", (String) vidModeCombo.getSelectedItem());
+                if (!"文生视频".equals(vidModeCombo.getSelectedItem())) {
+                    mc.putExtra("images", vidUrlArea.getText().trim());
+                } else {
+                    mc.getExtraConfig().remove("images");
+                }
             }
         }
 
@@ -2767,7 +2838,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 e -> cancelBtn.doClick(), esc, JComponent.WHEN_IN_FOCUSED_WINDOW);
         }
 
-        /** 打开文件选择器，将选中的本地图片路径追加到文本域（发请求时才转 base64） */
+        /** 打开文件选择器，选中图片后自动注册到文件服务器/bore，文本域显示公网 URL */
         private void pickLocalImages(JTextArea targetArea) {
             JFileChooser chooser = new JFileChooser();
             chooser.setMultiSelectionEnabled(true);
@@ -2781,10 +2852,182 @@ public class AiChatPanel extends AbstractCommandPanel {
             StringBuilder sb = new StringBuilder();
             String existing = targetArea.getText().trim();
             if (!existing.isEmpty()) sb.append(existing).append('\n');
+
+            boolean fsAvailable = NgrokPanel.isFileServerRunning();
+            int publicCount = 0, localCount = 0;
+
             for (File file : files) {
+                if (fsAvailable) {
+                    String publicUrl = NgrokPanel.registerFile(file);
+                    if (publicUrl != null) {
+                        sb.append(publicUrl).append('\n');
+                        publicCount++;
+                        continue;
+                    }
+                }
                 sb.append(file.getAbsolutePath()).append('\n');
+                localCount++;
             }
+
             targetArea.setText(sb.toString().trim());
+
+            // 如果文件服务器未启动，提示用户前往隧道穿透面板
+            if (!fsAvailable && localCount > 0) {
+                int choice = JOptionPane.showConfirmDialog(this,
+                        "文件服务器未启动，已使用本地路径（" + localCount + " 个文件）。\n\n"
+                        + "AI 服务器无法直接访问本地文件，需要转换为公网链接。\n"
+                        + "是否前往 [隧道穿透] 面板启动文件服务器？",
+                        "本地路径提示", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (choice == JOptionPane.YES_OPTION) {
+                    navigateToTunnelTab();
+                }
+            }
+        }
+
+        /** 弹出预览对话框，展示文本框中的图片 */;
+        private void showImagePreview(JTextArea sourceArea) {
+            String text = sourceArea.getText().trim();
+            if (text.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "文本框中没有图片URL或路径", "提示", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            String[] lines = text.split("\\n");
+            java.util.List<String> urls = new java.util.ArrayList<>();
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty()) urls.add(trimmed);
+            }
+            if (urls.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "文本框中没有有效的图片URL或路径", "提示", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+
+            // 创建预览对话框
+            JDialog previewDlg = new JDialog(this, "图片预览", true);
+            previewDlg.setLayout(new BorderLayout());
+
+            JPanel contentPanel = new JPanel();
+            contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+            contentPanel.setBackground(new Color(0x1E1E1E));
+            contentPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+
+            JScrollPane scrollPane = new JScrollPane(contentPanel);
+            scrollPane.setBorder(null);
+            scrollPane.setPreferredSize(new Dimension(640, 400));
+            scrollPane.getVerticalScrollBar().setUnitIncrement(20);
+            previewDlg.add(scrollPane, BorderLayout.CENTER);
+
+            // 加载提示
+            JLabel loadingLbl = new JLabel("正在加载图片...", SwingConstants.CENTER);
+            loadingLbl.setForeground(NetUtil.TEXT_COLOR);
+            loadingLbl.setFont(NetUtil.FONT_TEXT);
+            contentPanel.add(loadingLbl);
+
+            // 关闭按钮
+            JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+            btnPanel.setBackground(new Color(0x1E1E1E));
+            JButton closeBtn = new JButton("关闭");
+            closeBtn.setFont(NetUtil.FONT_TEXT);
+            closeBtn.addActionListener(ev -> previewDlg.dispose());
+            btnPanel.add(closeBtn);
+            previewDlg.add(btnPanel, BorderLayout.SOUTH);
+
+            // 限制最大尺寸不超过屏幕
+            Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+            int maxW = Math.min(screen.width - 100, 900);
+            int maxH = Math.min(screen.height - 100, 750);
+            previewDlg.pack();
+            previewDlg.setLocationRelativeTo(this);
+
+            // 异步加载图片
+            new SwingWorker<java.util.List<ImageIcon>, Void>() {
+                @Override
+                protected java.util.List<ImageIcon> doInBackground() {
+                    java.util.List<ImageIcon> icons = new java.util.ArrayList<>();
+                    for (String url : urls) {
+                        try {
+                            BufferedImage img = null;
+                            // 先尝试作为本地文件
+                            File file = new File(url);
+                            if (file.exists() && file.isFile()) {
+                                try {
+                                    img = ImageIO.read(file);
+                                } catch (IOException ignored) { }
+                            }
+                            // 再尝试作为HTTP URL
+                            if (img == null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                                try {
+                                    img = ImageIO.read(new URL(url));
+                                } catch (IOException ignored) { }
+                            }
+                            if (img != null) {
+                                // 限制最大尺寸
+                                int maxW = 640, maxH = 480;
+                                int w = img.getWidth(), h = img.getHeight();
+                                if (w > maxW || h > maxH) {
+                                    double scale = Math.min((double) maxW / w, (double) maxH / h);
+                                    w = (int) (w * scale);
+                                    h = (int) (h * scale);
+                                    java.awt.Image scaled = img.getScaledInstance(w, h, java.awt.Image.SCALE_SMOOTH);
+                                    icons.add(new ImageIcon(scaled));
+                                } else {
+                                    icons.add(new ImageIcon(img));
+                                }
+                            }
+                        } catch (Exception ignored) { }
+                    }
+                    return icons;
+                }
+
+                @Override
+                protected void done() {
+                    contentPanel.removeAll();
+                    try {
+                        java.util.List<ImageIcon> icons = get();
+                        if (icons.isEmpty()) {
+                            JLabel emptyLbl = new JLabel("未能加载任何图片", SwingConstants.CENTER);
+                            emptyLbl.setForeground(new Color(0x888888));
+                            emptyLbl.setFont(NetUtil.FONT_TEXT);
+                            contentPanel.add(emptyLbl);
+                        } else {
+                            for (int i = 0; i < icons.size(); i++) {
+                                ImageIcon icon = icons.get(i);
+                                String src = i < urls.size() ? urls.get(i) : "";
+                                // 文件名/URL 标签
+                                JLabel srcLabel = new JLabel(src);
+                                srcLabel.setForeground(new Color(0xAAAAAA));
+                                srcLabel.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 10));
+                                srcLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+                                contentPanel.add(srcLabel);
+                                // 图片
+                                JLabel imgLabel = new JLabel(icon);
+                                imgLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+                                imgLabel.setBorder(BorderFactory.createEmptyBorder(4, 0, 16, 0));
+                                contentPanel.add(imgLabel);
+                            }
+                        }
+                    } catch (Exception ex) {
+                        JLabel errLbl = new JLabel("加载图片出错: " + ex.getMessage(), SwingConstants.CENTER);
+                        errLbl.setForeground(new Color(0xFF5555));
+                        errLbl.setFont(NetUtil.FONT_TEXT);
+                        contentPanel.add(errLbl);
+                    }
+                    contentPanel.revalidate();
+                    contentPanel.repaint();
+                    // 自适应内容大小
+                    previewDlg.pack();
+                    Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+                    int maxW = Math.min(screen.width - 100, 900);
+                    int maxH = Math.min(screen.height - 100, 750);
+                    Dimension cur = previewDlg.getSize();
+                    if (cur.width > maxW || cur.height > maxH) {
+                        previewDlg.setSize(Math.min(cur.width, maxW), Math.min(cur.height, maxH));
+                    }
+                    previewDlg.setLocationRelativeTo(ModelConfigDialog.this);
+                }
+            }.execute();
+
+            previewDlg.setVisible(true);
         }
 
         /** 跳转到隧道穿透面板 */
