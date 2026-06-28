@@ -926,20 +926,20 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         String modelName = selectedModel.getModelName();
 
-        // === 非聊天模型：走通用 API 调用器 (sync / task) ===
-        if (!selectedModel.isChat()
-                && selectedModel.getRequestTemplate() != null
-                && !selectedModel.getRequestTemplate().isEmpty()) {
-            handleGenericApiSend(text, selectedModel);
-            return;
-        }
-        // === Agnes 图片/视频生成路由（兼容旧逻辑，无 requestTemplate 时回退） ===
+        // === Agnes 图片/视频生成路由（必须在通用 API 之前，因其也带有 requestTemplate） ===
         if (modelName != null && modelName.startsWith("agnes-image")) {
             handleAgnesImageSend(text, selectedModel);
             return;
         }
         if (modelName != null && modelName.startsWith("agnes-video")) {
             handleAgnesVideoSend(text, selectedModel);
+            return;
+        }
+        // === 非聊天模型：走通用 API 调用器 (sync / task) ===
+        if (!selectedModel.isChat()
+                && selectedModel.getRequestTemplate() != null
+                && !selectedModel.getRequestTemplate().isEmpty()) {
+            handleGenericApiSend(text, selectedModel);
             return;
         }
 
@@ -1930,6 +1930,7 @@ public class AiChatPanel extends AbstractCommandPanel {
         private JComboBox<String> imgSizeCombo, imgModeCombo;
         private JComboBox<String> seedSubdivCombo, seedFormatCombo;
         private JTextArea imgUrlArea;
+        private JTextArea seedImageUrlArea; // Seed3D 等模型的独立图片 URL 文本域
         private JComboBox<String> vidResCombo, vidDurCombo, vidFpsCombo, vidModeCombo;
         private JTextField vidSeedField;
         private JTextArea vidUrlArea;
@@ -1938,8 +1939,12 @@ public class AiChatPanel extends AbstractCommandPanel {
         private JLabel imgUrlHint;
         private JLabel vidUrlLabel;
         private JScrollPane vidUrlScroll;
+        private JButton imgPickBtn;
+        private JButton imgTunnelBtn;
+        private JLabel imgPreviewLbl;
         private JButton vidPickBtn;
         private JButton tunnelHintBtn;
+        private JLabel vidPreviewLbl;
         private JLabel vidUrlHint;
 
         ModelConfigDialog(Window owner, ModelConfig editing) {
@@ -2138,12 +2143,21 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgModeCombo.setBackground(C_FIELD_BG);
             p.add(imgModeCombo, g);
 
-            // 输入图片URL（图生图时显示）
-            g.gridx = 0; g.gridy = 2; g.weightx = 0;
+            // ---- 图片URL输入包装面板（g.gridy=2，gridwidth=5）----
+            // 用包装 JPanel 避免 remove/re-add 导致 GridBagLayout NPE
+            JPanel imgInputRow = new JPanel(new GridBagLayout());
+            imgInputRow.setOpaque(false);
+            GridBagConstraints rg = new GridBagConstraints();
+            rg.insets = new Insets(2, 2, 2, 2);
+            rg.anchor = GridBagConstraints.WEST;
+            rg.fill = GridBagConstraints.HORIZONTAL;
+
+            rg.gridx = 0; rg.gridy = 0; rg.weightx = 0;
             imgUrlLabel = new JLabel("图片URL：");
             imgUrlLabel.setFont(NetUtil.FONT_TEXT); imgUrlLabel.setForeground(NetUtil.TEXT_COLOR);
-            p.add(imgUrlLabel, g);
-            g.gridx = 1; g.weightx = 1;
+            imgInputRow.add(imgUrlLabel, rg);
+
+            rg.gridx = 1; rg.weightx = 1;
             imgUrlArea = new JTextArea(2, 30);
             imgUrlArea.setFont(NetUtil.FONT_TEXT);
             imgUrlArea.setForeground(NetUtil.TEXT_COLOR);
@@ -2152,13 +2166,29 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgUrlArea.setLineWrap(true);
             imgUrlArea.setWrapStyleWord(true);
             imgUrlArea.setToolTipText("每行一个URL或本地图片路径（图生图/多图合成时需要）");
+            // 右键菜单：删除选中的图片 URL 行
+            JPopupMenu imgUrlPopup = new JPopupMenu();
+            JMenuItem delUrlItem = new JMenuItem("删除此行");
+            delUrlItem.addActionListener(ev -> {
+                try {
+                    int pos = imgUrlArea.getCaretPosition();
+                    String text = imgUrlArea.getText();
+                    int lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+                    int lineEnd = text.indexOf('\n', pos);
+                    if (lineEnd < 0) lineEnd = text.length();
+                    String before = (lineStart > 0) ? text.substring(0, lineStart) : "";
+                    String after = (lineEnd < text.length()) ? text.substring(lineEnd) : "";
+                    imgUrlArea.setText(before + after.trim());
+                } catch (Exception ignored) { }
+            });
+            imgUrlPopup.add(delUrlItem);
+            imgUrlArea.setComponentPopupMenu(imgUrlPopup);
             imgUrlScroll = new JScrollPane(imgUrlArea);
             imgUrlScroll.setPreferredSize(new Dimension(300, 65));
-            p.add(imgUrlScroll, g);
+            imgInputRow.add(imgUrlScroll, rg);
 
-            // 选择本地图片按钮
-            g.gridx = 2; g.gridy = 2; g.weightx = 0;
-            JButton imgPickBtn = new JButton("选择图片");
+            rg.gridx = 2; rg.weightx = 0;
+            imgPickBtn = new JButton("选择图片");
             imgPickBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             imgPickBtn.setForeground(C_PRIMARY);
             imgPickBtn.setBackground(C_BTN_BG);
@@ -2167,11 +2197,10 @@ public class AiChatPanel extends AbstractCommandPanel {
                     BorderFactory.createEmptyBorder(2, 8, 2, 8)));
             imgPickBtn.setFocusPainted(false);
             imgPickBtn.addActionListener(e -> pickLocalImages(imgUrlArea));
-            p.add(imgPickBtn, g);
+            imgInputRow.add(imgPickBtn, rg);
 
-            // 隧道穿透按钮（点击直接跳转）
-            g.gridx = 3; g.gridy = 2; g.weightx = 0;
-            JButton imgTunnelBtn = new JButton("网络穿透");
+            rg.gridx = 3; rg.weightx = 0;
+            imgTunnelBtn = new JButton("网络穿透");
             imgTunnelBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             imgTunnelBtn.setForeground(new Color(255, 145, 0));
             imgTunnelBtn.setBackground(C_BTN_BG);
@@ -2181,11 +2210,10 @@ public class AiChatPanel extends AbstractCommandPanel {
             imgTunnelBtn.setFocusPainted(false);
             imgTunnelBtn.setToolTipText("本地图片需公网链接，点击前往隧道穿透面板");
             imgTunnelBtn.addActionListener(e -> navigateToTunnelTab());
-            p.add(imgTunnelBtn, g);
+            imgInputRow.add(imgTunnelBtn, rg);
 
-            // 预览图片标签
-            g.gridx = 4; g.gridy = 2; g.weightx = 0;
-            JLabel imgPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
+            rg.gridx = 4; rg.weightx = 0;
+            imgPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
             imgPreviewLbl.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             imgPreviewLbl.setForeground(new Color(0x4CAF50));
             imgPreviewLbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -2196,10 +2224,10 @@ public class AiChatPanel extends AbstractCommandPanel {
                     showImagePreview(imgUrlArea);
                 }
             });
-            p.add(imgPreviewLbl, g);
+            imgInputRow.add(imgPreviewLbl, rg);
 
-            // 图片URL输入提示（点击可跳转到隧道穿透面板）
-            g.gridx = 0; g.gridy = 3; g.gridwidth = 5; g.weightx = 1;
+            // 提示行放包装面板第二行
+            rg.gridx = 0; rg.gridy = 1; rg.gridwidth = 5; rg.weightx = 1;
             imgUrlHint = new JLabel("<html><u>本地图片需公网链接，点击此处设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，图生图需1张，多图合成需2张+</html>");
             imgUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             imgUrlHint.setForeground(new Color(255, 145, 0));
@@ -2210,27 +2238,33 @@ public class AiChatPanel extends AbstractCommandPanel {
                     navigateToTunnelTab();
                 }
             });
-            p.add(imgUrlHint, g);
+            imgInputRow.add(imgUrlHint, rg);
+
+            // 将包装面板添加到父 p（gridy=2，占满整行）
+            g.gridx = 0; g.gridy = 2; g.gridwidth = 5; g.weightx = 1; g.fill = GridBagConstraints.HORIZONTAL;
+            p.add(imgInputRow, g);
             g.gridwidth = 1; // 恢复
 
-            // 模式切换
+            // ---- 模式切换：只需切换包装面板的可见性 ----
+            imgInputRow.setVisible(false); // 初始文生图，隐藏
             imgModeCombo.addActionListener(e -> {
                 boolean show = !"文生图".equals(imgModeCombo.getSelectedItem());
-                imgUrlLabel.setVisible(show);
-                imgUrlScroll.setVisible(show);
-                imgPickBtn.setVisible(show);
-                imgTunnelBtn.setVisible(show);
-                imgPreviewLbl.setVisible(show);
-                imgUrlHint.setVisible(show);
-                p.revalidate(); p.repaint();
-                pack();
+                System.out.println("[imgMode] show=" + show + " mode=" + imgModeCombo.getSelectedItem());
+                imgInputRow.setVisible(show);
+                p.revalidate();
+                p.repaint();
+                extraPanel.revalidate();
+                extraPanel.repaint();
+                SwingUtilities.invokeLater(() -> {
+                    System.out.println("[imgMode] pack后 imgInputRow size=" + imgInputRow.getSize()
+                            + " vis=" + imgInputRow.isVisible());
+                    if (show) {
+                        System.out.println("[imgMode] imgUrlScroll size=" + imgUrlScroll.getSize()
+                                + " imgUrlArea text=[" + imgUrlArea.getText() + "]");
+                    }
+                    pack();
+                });
             });
-            imgUrlLabel.setVisible(false);
-            imgUrlScroll.setVisible(false);
-            imgPickBtn.setVisible(false);
-            imgTunnelBtn.setVisible(false);
-            imgPreviewLbl.setVisible(false);
-            imgUrlHint.setVisible(false);
 
             return p;
         }
@@ -2319,10 +2353,8 @@ public class AiChatPanel extends AbstractCommandPanel {
             seedFormatCombo.setBackground(C_FIELD_BG);
             p.add(seedFormatCombo, g);
 
-            // 将 urlArea 保存到实例字段，方便保存/回填
-            imgUrlArea = urlArea;
-            imgUrlScroll = urlScroll;
-            imgUrlHint = hint;
+            // 将 Seed3D 文本域保存到独立字段，避免覆盖 Agnes 面板的 imgUrlArea
+            seedImageUrlArea = urlArea;
 
             return p;
         }
@@ -2432,12 +2464,20 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidModeCombo.setBackground(C_FIELD_BG);
             p.add(vidModeCombo, g);
 
-            // 输入图片URL
-            g.gridx = 0; g.gridy = 5; g.weightx = 0;
+            // ---- 图片URL输入包装面板（g.gridy=5，gridwidth=5）----
+            JPanel vidInputRow = new JPanel(new GridBagLayout());
+            vidInputRow.setOpaque(false);
+            GridBagConstraints vg = new GridBagConstraints();
+            vg.insets = new Insets(2, 2, 2, 2);
+            vg.anchor = GridBagConstraints.WEST;
+            vg.fill = GridBagConstraints.HORIZONTAL;
+
+            vg.gridx = 0; vg.gridy = 0; vg.weightx = 0;
             vidUrlLabel = new JLabel("图片URL：");
             vidUrlLabel.setFont(NetUtil.FONT_TEXT); vidUrlLabel.setForeground(NetUtil.TEXT_COLOR);
-            p.add(vidUrlLabel, g);
-            g.gridx = 1; g.weightx = 1;
+            vidInputRow.add(vidUrlLabel, vg);
+
+            vg.gridx = 1; vg.weightx = 1;
             vidUrlArea = new JTextArea(2, 30);
             vidUrlArea.setFont(NetUtil.FONT_TEXT);
             vidUrlArea.setForeground(NetUtil.TEXT_COLOR);
@@ -2446,12 +2486,28 @@ public class AiChatPanel extends AbstractCommandPanel {
             vidUrlArea.setLineWrap(true);
             vidUrlArea.setWrapStyleWord(true);
             vidUrlArea.setToolTipText("每行一个URL或本地图片路径（图生视频/多图视频/关键帧动画时需要）");
+            // 右键菜单：删除选中的图片 URL 行
+            JPopupMenu vidUrlPopup = new JPopupMenu();
+            JMenuItem delVidUrlItem = new JMenuItem("删除此行");
+            delVidUrlItem.addActionListener(ev -> {
+                try {
+                    int pos = vidUrlArea.getCaretPosition();
+                    String text = vidUrlArea.getText();
+                    int lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+                    int lineEnd = text.indexOf('\n', pos);
+                    if (lineEnd < 0) lineEnd = text.length();
+                    String before = (lineStart > 0) ? text.substring(0, lineStart) : "";
+                    String after = (lineEnd < text.length()) ? text.substring(lineEnd) : "";
+                    vidUrlArea.setText(before + after.trim());
+                } catch (Exception ignored) { }
+            });
+            vidUrlPopup.add(delVidUrlItem);
+            vidUrlArea.setComponentPopupMenu(vidUrlPopup);
             vidUrlScroll = new JScrollPane(vidUrlArea);
             vidUrlScroll.setPreferredSize(new Dimension(300, 65));
-            p.add(vidUrlScroll, g);
+            vidInputRow.add(vidUrlScroll, vg);
 
-            // 选择本地图片按钮
-            g.gridx = 2; g.gridy = 5; g.weightx = 0;
+            vg.gridx = 2; vg.weightx = 0;
             vidPickBtn = new JButton("选择图片");
             vidPickBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             vidPickBtn.setForeground(C_PRIMARY);
@@ -2461,10 +2517,9 @@ public class AiChatPanel extends AbstractCommandPanel {
                     BorderFactory.createEmptyBorder(2, 8, 2, 8)));
             vidPickBtn.setFocusPainted(false);
             vidPickBtn.addActionListener(e -> pickLocalImages(vidUrlArea));
-            p.add(vidPickBtn, g);
+            vidInputRow.add(vidPickBtn, vg);
 
-            // 隧道穿透提示按钮（点击直接跳转）
-            g.gridx = 3; g.gridy = 5; g.weightx = 0;
+            vg.gridx = 3; vg.weightx = 0;
             tunnelHintBtn = new JButton("网络穿透");
             tunnelHintBtn.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             tunnelHintBtn.setForeground(new Color(255, 145, 0));
@@ -2475,11 +2530,10 @@ public class AiChatPanel extends AbstractCommandPanel {
             tunnelHintBtn.setFocusPainted(false);
             tunnelHintBtn.setToolTipText("本地图片需公网链接，点击前往隧道穿透面板");
             tunnelHintBtn.addActionListener(e -> navigateToTunnelTab());
-            p.add(tunnelHintBtn, g);
+            vidInputRow.add(tunnelHintBtn, vg);
 
-            // 预览图片标签
-            g.gridx = 4; g.gridy = 5; g.weightx = 0;
-            JLabel vidPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
+            vg.gridx = 4; vg.weightx = 0;
+            vidPreviewLbl = new JLabel("<html><u style='color:#4CAF50'>预览</u></html>");
             vidPreviewLbl.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             vidPreviewLbl.setForeground(new Color(0x4CAF50));
             vidPreviewLbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -2490,10 +2544,10 @@ public class AiChatPanel extends AbstractCommandPanel {
                     showImagePreview(vidUrlArea);
                 }
             });
-            p.add(vidPreviewLbl, g);
+            vidInputRow.add(vidPreviewLbl, vg);
 
-            // 图片URL输入提示（点击可跳转到隧道穿透面板）
-            g.gridx = 1; g.gridy = 6; g.weightx = 1;
+            // 提示行放包装面板第二行
+            vg.gridx = 0; vg.gridy = 1; vg.gridwidth = 5; vg.weightx = 1;
             vidUrlHint = new JLabel("<html><u>本地图片需公网链接，点击设置网络穿透</u> &nbsp;|&nbsp; 每行一个URL，关键帧动画/多图视频至少2张</html>");
             vidUrlHint.setFont(new Font(NetUtil.FONT_TEXT.getFamily(), Font.PLAIN, 11));
             vidUrlHint.setForeground(new Color(255, 145, 0));
@@ -2504,25 +2558,29 @@ public class AiChatPanel extends AbstractCommandPanel {
                     navigateToTunnelTab();
                 }
             });
-            p.add(vidUrlHint, g);
+            vidInputRow.add(vidUrlHint, vg);
 
+            // 将包装面板添加到父 p（gridy=5，占满整行）
+            g.gridx = 0; g.gridy = 5; g.gridwidth = 5; g.weightx = 1; g.fill = GridBagConstraints.HORIZONTAL;
+            p.add(vidInputRow, g);
+            g.gridwidth = 1; // 恢复
+
+            // ---- 模式切换：只需切换包装面板的可见性 ----
+            vidInputRow.setVisible(false); // 初始文生视频，隐藏
             vidModeCombo.addActionListener(e -> {
                 boolean show = !"文生视频".equals(vidModeCombo.getSelectedItem());
-                vidUrlLabel.setVisible(show);
-                vidUrlScroll.setVisible(show);
-                vidPickBtn.setVisible(show);
-                vidPreviewLbl.setVisible(show);
-                vidUrlHint.setVisible(show);
-                tunnelHintBtn.setVisible(show);
-                p.revalidate(); p.repaint();
-                pack();
+                System.out.println("[vidMode] show=" + show + " mode=" + vidModeCombo.getSelectedItem());
+                vidInputRow.setVisible(show);
+                p.revalidate();
+                p.repaint();
+                extraPanel.revalidate();
+                extraPanel.repaint();
+                SwingUtilities.invokeLater(() -> {
+                    System.out.println("[vidMode] pack后 vidInputRow size=" + vidInputRow.getSize()
+                            + " vis=" + vidInputRow.isVisible());
+                    pack();
+                });
             });
-            vidUrlLabel.setVisible(false);
-            vidUrlScroll.setVisible(false);
-            vidPickBtn.setVisible(false);
-            vidPreviewLbl.setVisible(false);
-            vidUrlHint.setVisible(false);
-            tunnelHintBtn.setVisible(false);
 
             // Seed
             g.gridx = 0; g.gridy = 7; g.weightx = 0;
@@ -2590,7 +2648,7 @@ public class AiChatPanel extends AbstractCommandPanel {
                 if (editing != null) {
                     Map<String, String> ext = editing.getExtraConfig();
                     if (ext != null) {
-                        if (ext.containsKey("image")) imgUrlArea.setText(ext.get("image"));
+                        if (ext.containsKey("image")) seedImageUrlArea.setText(ext.get("image"));
                         if (ext.containsKey("sl") && seedSubdivCombo != null) {
                             String sl = ext.get("sl");
                             for (int i = 0; i < seedSubdivCombo.getItemCount(); i++) {
@@ -2774,9 +2832,9 @@ public class AiChatPanel extends AbstractCommandPanel {
                 } else {
                     mc.getExtraConfig().remove("image.urls");
                 }
-            } else if (isImageInputModel(name) && imgUrlArea != null) {
+            } else if (isImageInputModel(name) && seedImageUrlArea != null) {
                 // Seed3D 等需要图片输入的模型：保存图片 URL + 面数 + 格式
-                String imageUrl = imgUrlArea.getText().trim();
+                String imageUrl = seedImageUrlArea.getText().trim();
                 if (!imageUrl.isEmpty()) {
                     mc.putExtra("image", imageUrl);
                 } else {
@@ -2840,13 +2898,18 @@ public class AiChatPanel extends AbstractCommandPanel {
 
         /** 打开文件选择器，选中图片后自动注册到文件服务器/bore，文本域显示公网 URL */
         private void pickLocalImages(JTextArea targetArea) {
+            System.out.println("[pickLocalImages] 开始 targetArea=" + (targetArea == imgUrlArea ? "imgUrlArea" : targetArea == vidUrlArea ? "vidUrlArea" : "other")
+                    + " visible=" + targetArea.isVisible() + " parent=" + (targetArea.getParent() != null));
             JFileChooser chooser = new JFileChooser();
             chooser.setMultiSelectionEnabled(true);
             chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
                     "图片文件 (jpg, png, gif, bmp, webp)", "jpg", "jpeg", "png", "gif", "bmp", "webp"));
-            if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+            int result = chooser.showOpenDialog(this);
+            System.out.println("[pickLocalImages] showOpenDialog result=" + result + " APPROVE=" + JFileChooser.APPROVE_OPTION);
+            if (result != JFileChooser.APPROVE_OPTION) return;
 
             File[] files = chooser.getSelectedFiles();
+            System.out.println("[pickLocalImages] 选中文件数=" + (files != null ? files.length : 0));
             if (files == null || files.length == 0) return;
 
             StringBuilder sb = new StringBuilder();
@@ -2869,7 +2932,11 @@ public class AiChatPanel extends AbstractCommandPanel {
                 localCount++;
             }
 
-            targetArea.setText(sb.toString().trim());
+            String newText = sb.toString().trim();
+            System.out.println("[pickLocalImages] 设置文本 len=" + newText.length() + " text=" + newText.substring(0, Math.min(80, newText.length())));
+            targetArea.setText(newText);
+            targetArea.revalidate();
+            targetArea.repaint();
 
             // 如果文件服务器未启动，提示用户前往隧道穿透面板
             if (!fsAvailable && localCount > 0) {
@@ -2947,14 +3014,23 @@ public class AiChatPanel extends AbstractCommandPanel {
                     for (String url : urls) {
                         try {
                             BufferedImage img = null;
-                            // 先尝试作为本地文件
+                            // 1. 先尝试作为本地文件路径
                             File file = new File(url);
                             if (file.exists() && file.isFile()) {
                                 try {
                                     img = ImageIO.read(file);
                                 } catch (IOException ignored) { }
                             }
-                            // 再尝试作为HTTP URL
+                            // 2. 尝试作为文件服务器注册的 URL，反向解析回本地文件（避免走公网）
+                            if (img == null) {
+                                File resolved = com.szh.ui.panel.NgrokPanel.resolveFileUrl(url);
+                                if (resolved != null && resolved.exists() && resolved.isFile()) {
+                                    try {
+                                        img = ImageIO.read(resolved);
+                                    } catch (IOException ignored) { }
+                                }
+                            }
+                            // 3. 最后尝试作为 HTTP URL（真正的网络图片）
                             if (img == null && (url.startsWith("http://") || url.startsWith("https://"))) {
                                 try {
                                     img = ImageIO.read(new URL(url));
@@ -3056,7 +3132,7 @@ public class AiChatPanel extends AbstractCommandPanel {
             boolean running = NgrokPanel.isRunning();
             Color hintColor = running ? new Color(46, 204, 113) : new Color(255, 145, 0);
 
-            // 更新按钮
+            // 更新视频面板按钮
             if (tunnelHintBtn != null) {
                 tunnelHintBtn.setText(running ? "穿透已成功开启" : "网络穿透");
                 tunnelHintBtn.setForeground(hintColor);
@@ -3064,6 +3140,16 @@ public class AiChatPanel extends AbstractCommandPanel {
                         BorderFactory.createLineBorder(hintColor),
                         BorderFactory.createEmptyBorder(2, 8, 2, 8)));
                 tunnelHintBtn.setToolTipText(running ? "穿透已开启，本地图片可公网访问" : "本地图片需公网链接，点击前往隧道穿透面板");
+            }
+
+            // 更新图片面板按钮（样式与视频面板保持一致）
+            if (imgTunnelBtn != null) {
+                imgTunnelBtn.setText(running ? "穿透已成功开启" : "网络穿透");
+                imgTunnelBtn.setForeground(hintColor);
+                imgTunnelBtn.setBorder(BorderFactory.createCompoundBorder(
+                        BorderFactory.createLineBorder(hintColor),
+                        BorderFactory.createEmptyBorder(2, 8, 2, 8)));
+                imgTunnelBtn.setToolTipText(running ? "穿透已开启，本地图片可公网访问" : "本地图片需公网链接，点击前往隧道穿透面板");
             }
 
             // 更新视频面板提示

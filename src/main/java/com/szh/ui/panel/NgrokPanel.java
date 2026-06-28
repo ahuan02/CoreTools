@@ -96,6 +96,21 @@ public class NgrokPanel extends AbstractCommandPanel {
         return getFileServerBaseUrl() + "/temp/" + fileId;
     }
 
+    /** 根据文件服务器 URL 反向解析回本地文件（用于图片预览），若不是文件服务器注册的 URL 则返回 null */
+    public static File resolveFileUrl(String url) {
+        if (url == null || !isFileServerRunning()) return null;
+        try {
+            if (!url.contains("/temp/")) return null;
+            String fileId = url.substring(url.indexOf("/temp/") + 6);
+            // 去掉可能的查询参数
+            int qIdx = fileId.indexOf('?');
+            if (qIdx >= 0) fileId = fileId.substring(0, qIdx);
+            return fileMap.get(fileId);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     // ==================== 目录模式内置 HTTP 文件服务器 ====================
 
     private static Object dirHttpServer;

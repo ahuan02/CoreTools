@@ -153,8 +153,18 @@ public class MainFrame extends JFrame {
         if (trayMenu == null) return;
         hideTrayPopup(); // 关旧的
 
+        // 根据菜单项文字实际宽度 + 内边距计算弹窗宽度，避免文字被省略号截断
         trayMenu.pack();
-        int w = trayMenu.getPreferredSize().width;
+        FontMetrics fm = getFontMetrics(trayMenu.getFont());
+        if (fm == null) fm = getFontMetrics(getFont());
+        int maxTextWidth = 0;
+        for (int i = 0; i < trayMenu.getComponentCount(); i++) {
+            Component c = trayMenu.getComponent(i);
+            if (c instanceof JMenuItem item) {
+                maxTextWidth = Math.max(maxTextWidth, fm.stringWidth(item.getText()));
+            }
+        }
+        int w = Math.max(maxTextWidth + 48, 140); // 文字宽度 + 左右内边距 + 最小宽度保底
         int h = trayMenu.getPreferredSize().height;
         Point screenLoc = MouseInfo.getPointerInfo().getLocation();
         final int targetX = screenLoc.x - 10;
@@ -928,41 +938,13 @@ public class MainFrame extends JFrame {
         // ---- 视图菜单 ----
         JMenu viewMenu = new JMenu("视图");
 
-        // 面板子菜单（默认不可见，隐藏表头后出现）
-        JMenu panelSubMenu = new JMenu("面板");
-        panelSubMenu.setVisible(false);
-        // 菜单打开时同步选中项到当前 Tab
-        panelSubMenu.addMenuListener(new javax.swing.event.MenuListener() {
-            @Override public void menuSelected(javax.swing.event.MenuEvent e) {
-                int sel = tabbedPane.getSelectedIndex();
-                for (int i = 0; i < panelSubMenu.getItemCount(); i++) {
-                    JMenuItem mi = panelSubMenu.getItem(i);
-                    if (mi instanceof JRadioButtonMenuItem rb) {
-                        rb.setSelected(i == sel);
-                    }
-                }
-            }
-            @Override public void menuDeselected(javax.swing.event.MenuEvent e) {}
-            @Override public void menuCanceled(javax.swing.event.MenuEvent e) {}
-        });
-        ButtonGroup panelGroup = new ButtonGroup();
-        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
-            String title = tabbedPane.getTitleAt(i);
-            JRadioButtonMenuItem panelItem = new JRadioButtonMenuItem(title);
-            if (i == tabbedPane.getSelectedIndex()) {
-                panelItem.setSelected(true);
-            }
-            final int idx = i;
-            panelItem.addActionListener(e -> tabbedPane.setSelectedIndex(idx));
-            panelGroup.add(panelItem);
-            panelSubMenu.add(panelItem);
-        }
-
         JCheckBoxMenuItem hideTabItem = new JCheckBoxMenuItem("隐藏Tab表头");
+        viewMenu.add(hideTabItem);
+        // 初始不添加面板子菜单
+
         hideTabItem.addActionListener(e -> {
             boolean hide = hideTabItem.isSelected();
             if (hide) {
-                // 使用自定义 UI：tab area 高度为 0 + 不绘制背景/边框
                 tabbedPane.setUI(new javax.swing.plaf.basic.BasicTabbedPaneUI() {
                     @Override
                     protected int calculateTabAreaHeight(int tabPlacement, int horizRunCount, int maxTabHeight) {
@@ -970,25 +952,35 @@ public class MainFrame extends JFrame {
                     }
                     @Override
                     protected void paintTabArea(Graphics g, int tabPlacement, int selectedIndex) {
-                        // 不绘制 tab 区域
                     }
                     @Override
                     protected void paintContentBorder(Graphics g, int tabPlacement, int selectedIndex) {
-                        // 不绘制内容边框，避免覆盖背景图
                     }
                     @Override
                     public void update(Graphics g, JComponent c) {
-                        // 跳过 opaque 检查和背景填充，直接 paint，让背景图透出
                         paint(g, c);
                     }
                 });
+                // 动态创建全新 JMenu 并插入到 "隐藏Tab表头" 之后
+                JMenu dynSubMenu = buildPanelSubMenu();
+                // 先移除旧的（如果存在），再添加新的
+                for (int i = viewMenu.getItemCount() - 1; i >= 0; i--) {
+                    javax.swing.JMenuItem mi = viewMenu.getItem(i);
+                    if (mi != null && mi != hideTabItem && "面板".equals(mi.getText())) {
+                        viewMenu.remove(i);
+                    }
+                }
+                viewMenu.insert(dynSubMenu, 1);
             } else {
                 tabbedPane.updateUI();
+                // 删除面板子菜单
+                for (int i = viewMenu.getItemCount() - 1; i >= 0; i--) {
+                    javax.swing.JMenuItem mi = viewMenu.getItem(i);
+                    if (mi != null && mi != hideTabItem && "面板".equals(mi.getText())) {
+                        viewMenu.remove(i);
+                    }
+                }
             }
-            // setUI/updateUI 的内部逻辑（installDefaults / FlatLaf 递归 updateUI）
-            // 会重置 tabbedPane 和子组件的 opaque / background，所以需要：
-            // 1) 立即设 tabbedPane 透明
-            // 2) 延迟到 UI 变更完全落定后再恢复 AI 面板子组件透明
             if (backgroundImage != null) {
                 tabbedPane.setOpaque(false);
                 tabbedPane.setBackground(null);
@@ -1000,11 +992,9 @@ public class MainFrame extends JFrame {
                     getContentPane().repaint();
                 });
             }
-            // 面板子菜单可见性随隐藏状态切换
-            panelSubMenu.setVisible(hide);
+            javax.swing.JMenuBar mb = getJMenuBar();
+            if (mb != null) { mb.revalidate(); mb.repaint(); }
         });
-        viewMenu.add(hideTabItem);
-        viewMenu.add(panelSubMenu);
 
         bar.add(viewMenu);
 
@@ -1312,6 +1302,41 @@ public class MainFrame extends JFrame {
             getRootPane().revalidate();
             getRootPane().repaint();
         });
+    }
+
+    /**
+     * 动态创建"面板"子菜单（每次调用返回全新 JMenu，避免切换可见性导致的 popup 展开失效）
+     */
+    private JMenu buildPanelSubMenu() {
+        JMenu menu = new JMenu("面板");
+        menu.addMenuListener(new javax.swing.event.MenuListener() {
+            @Override public void menuSelected(javax.swing.event.MenuEvent e) {
+                try {
+                    int sel = tabbedPane.getSelectedIndex();
+                    for (int i = 0; i < menu.getItemCount(); i++) {
+                        JMenuItem mi = menu.getItem(i);
+                        if (mi instanceof JRadioButtonMenuItem rb) {
+                            rb.setSelected(i == sel);
+                        }
+                    }
+                } catch (Exception ignored) { }
+            }
+            @Override public void menuDeselected(javax.swing.event.MenuEvent e) {}
+            @Override public void menuCanceled(javax.swing.event.MenuEvent e) {}
+        });
+        ButtonGroup group = new ButtonGroup();
+        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
+            String title = tabbedPane.getTitleAt(i);
+            JRadioButtonMenuItem item = new JRadioButtonMenuItem(title);
+            if (i == tabbedPane.getSelectedIndex()) {
+                item.setSelected(true);
+            }
+            final int idx = i;
+            item.addActionListener(e -> tabbedPane.setSelectedIndex(idx));
+            group.add(item);
+            menu.add(item);
+        }
+        return menu;
     }
 
     /**
