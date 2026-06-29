@@ -11,7 +11,6 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
-import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.Charset;
@@ -124,6 +123,12 @@ public class UdpPanel extends AbstractCommandPanel {
             replyArea = new JTextArea(1, 20);
             replyArea.setFont(FONT_TEXT);
             NetUtil.fixPaste(replyArea);
+            replyArea.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+                @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                private void syncReply() { cachedReplyText = replyArea.getText().trim(); }
+            });
             replyPanel.add(new JScrollPane(replyArea), BorderLayout.CENTER);
 
             clientListModel = new DefaultListModel<>();
@@ -312,6 +317,12 @@ public class UdpPanel extends AbstractCommandPanel {
         private JComboBox<String> encCombo, formatCombo;
         private final List<String> history = new ArrayList<>();
         private static final int MAX_HISTORY = 50;
+        // 持久化 UDP 通道 + 持续接收
+        private DatagramChannel clientChannel;
+        private final AtomicBoolean clientReceiving = new AtomicBoolean(false);
+        private java.util.concurrent.Future<?> clientReceiveFuture;
+        private volatile FormatMode clientMode;
+        private volatile Charset clientCharset;
 
         UdpClientPanel() {
             setLayout(new BorderLayout(4, 4));
@@ -409,6 +420,8 @@ public class UdpPanel extends AbstractCommandPanel {
 
             FormatMode mode = fromComboIndex(formatCombo.getSelectedIndex());
             String enc = (String) encCombo.getSelectedItem();
+            clientMode = mode;
+            try { clientCharset = Charset.forName(enc); } catch (Exception e) { clientCharset = StandardCharsets.UTF_8; }
 
             String finalContent;
             String nickname = nicknameField.getText().trim();
@@ -418,43 +431,77 @@ public class UdpPanel extends AbstractCommandPanel {
                 finalContent = content;
             }
 
+            // 确保持久通道存在，保持同一本地端口以便硬件持续回推数据
+            if (clientChannel == null || !clientChannel.isOpen()) {
+                try {
+                    clientChannel = DatagramChannel.open();
+                    clientChannel.configureBlocking(false);
+                    clientChannel.bind(null);
+                } catch (IOException e) {
+                    logErr(logPane, "创建通道失败: " + e.getMessage());
+                    return;
+                }
+            }
+
+            final DatagramChannel ch = clientChannel;
             threadPool.submit(() -> {
-                try (DatagramChannel ch = DatagramChannel.open()) {
-                    ch.configureBlocking(true);
-                    ch.socket().setSoTimeout(3000);
+                try {
                     byte[] sendData = encodeByMode(finalContent, mode, enc);
                     InetSocketAddress target = new InetSocketAddress(InetAddress.getByName(host), port);
                     ByteBuffer sendBuf = ByteBuffer.wrap(sendData);
                     ch.send(sendBuf, target);
                     logSend(logPane, "发送 → " + host + ":" + port + " " + formatBytes(sendData, mode));
 
-                    ByteBuffer recvBuf = ByteBuffer.allocate(65535);
-                    SocketAddress from = ch.receive(recvBuf);
-                    if (from != null) {
-                        recvBuf.flip();
-                        byte[] recvData = new byte[recvBuf.remaining()];
-                        recvBuf.get(recvData);
-                        String recvStr = formatBytes(recvData, mode);
-                        if (mode == FormatMode.TEXT) {
-                            String[] parts = parseNickname(recvStr);
-                            if (parts[0] != null) {
-                                logRecv(logPane, "响应 ← [" + parts[0] + "]: " + parts[1]);
+                    // 如果未启动持续接收，则启动
+                    if (!clientReceiving.get()) {
+                        startContinuousReceive(ch, mode);
+                    }
+                } catch (Exception e) {
+                    logErr(logPane, "发送失败: " + e.getMessage());
+                }
+            });
+        }
+
+        private void startContinuousReceive(DatagramChannel ch, FormatMode mode) {
+            if (!clientReceiving.compareAndSet(false, true)) return;
+
+            clientReceiveFuture = ThreadPoolUtil.submitVirtual(() -> {
+                ByteBuffer recvBuf = ByteBuffer.allocate(65535);
+                while (clientReceiving.get() && ch.isOpen()) {
+                    try {
+                        recvBuf.clear();
+                        SocketAddress from = ch.receive(recvBuf);
+                        if (from != null) {
+                            recvBuf.flip();
+                            byte[] recvData = new byte[recvBuf.remaining()];
+                            recvBuf.get(recvData);
+                            FormatMode m = clientMode != null ? clientMode : mode;
+                            String recvStr = formatBytes(recvData, m);
+                            if (m == FormatMode.TEXT) {
+                                String[] parts = parseNickname(recvStr);
+                                if (parts[0] != null) {
+                                    logRecv(logPane, "响应 ← [" + parts[0] + "]: " + parts[1]);
+                                } else {
+                                    logRecv(logPane, "响应 ← " + recvStr);
+                                }
                             } else {
                                 logRecv(logPane, "响应 ← " + recvStr);
                             }
                         } else {
-                            logRecv(logPane, "响应 ← " + recvStr);
+                            // 非阻塞模式下无数据，短暂休眠避免空转
+                            Thread.sleep(50);
                         }
-                    } else {
-                        logWarn(logPane, "超时: 无响应 (3秒)");
+                    } catch (ClosedChannelException | InterruptedException e) {
+                        break;
+                    } catch (IOException e) {
+                        if (clientReceiving.get()) logErr(logPane, "接收错误: " + e.getMessage());
                     }
-                } catch (SocketTimeoutException e) {
-                    logWarn(logPane, "超时: 无响应 (3秒)");
-                } catch (Exception e) {
-                    logErr(logPane, "错误: " + e.getMessage());
                 }
+                // 循环退出后置标志
+                clientReceiving.set(false);
             });
         }
+
 
         private void addHistory(String c) { history.remove(c); history.add(0, c); while (history.size() > MAX_HISTORY) history.remove(history.size() - 1); }
 

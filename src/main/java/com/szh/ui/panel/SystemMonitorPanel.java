@@ -130,6 +130,7 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
     private long lastProcessRefreshTime;
     private volatile java.util.List<OSProcess> cachedRawProcesses; // 缓存的原始进程列表，展开/折叠时直接复用
     private final Map<String, Icon> iconCache = new ConcurrentHashMap<>();
+    private volatile Icon cachedFallbackIcon; // 预加载的兜底图标，避免监控线程调用 getSystemIcon() 触发 COM 异常
     private int selectedPid = -1; // 用户选中的进程 PID（刷新时按 PID 保持选中状态）
     private String selectedGroupName = null; // 选中的组头行纯名称（PID=-1 时用于区分各组）
     private final Set<String> expandedGroups = new HashSet<>(); // 展开的进程组名（纯名称）
@@ -360,6 +361,9 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         tabbedPane.addTab("进程", procPanel);
 
         add(tabbedPane, BorderLayout.CENTER);
+
+        // 预加载兜底图标（避免监控线程调用 getSystemIcon() 触发 COM 线程 InterruptedException）
+        preloadFallbackIcon();
     }
 
     // ==================== 顶部概览面板 ====================
@@ -1545,8 +1549,8 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
         return null;
     }
 
-    /** 跨平台获取一个系统原生可执行文件图标作为兜底 */
-    private Icon getPlatformFallbackIcon() {
+    /** 预加载兜底图标（仅在 EDT 初始化时调用一次，避免 COM shell 调用在线程池中引发异常） */
+    private void preloadFallbackIcon() {
         try {
             String os = System.getProperty("os.name").toLowerCase();
             java.io.File fallback;
@@ -1558,10 +1562,16 @@ public class SystemMonitorPanel extends AbstractCommandPanel {
                 fallback = new java.io.File("/bin/bash");
             }
             if (fallback.exists()) {
-                return javax.swing.filechooser.FileSystemView.getFileSystemView().getSystemIcon(fallback);
+                cachedFallbackIcon = javax.swing.filechooser.FileSystemView.getFileSystemView().getSystemIcon(fallback);
             }
-        } catch (Exception ignored) {}
-        return null;
+        } catch (Exception ignored) {
+            // 预加载失败，getPlatformFallbackIcon 返回 null，不影响功能
+        }
+    }
+
+    /** 跨平台获取一个系统原生可执行文件图标作为兜底（仅返回预加载缓存，不调用 getSystemIcon） */
+    private Icon getPlatformFallbackIcon() {
+        return cachedFallbackIcon;
     }
 
     /** 结束指定 PID 的进程（Windows 用 /T 结束整个进程树，Linux 用 kill -9） */

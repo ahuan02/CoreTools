@@ -135,6 +135,12 @@ public class TcpPanel extends AbstractCommandPanel {
             replyArea = new JTextArea(1, 20);
             replyArea.setFont(FONT_TEXT);
             NetUtil.fixPaste(replyArea);
+            replyArea.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+                @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { syncReply(); }
+                private void syncReply() { cachedReplyText = replyArea.getText().trim(); }
+            });
             replyPanel.add(new JScrollPane(replyArea), BorderLayout.CENTER);
 
             clientListModel = new DefaultListModel<>();
