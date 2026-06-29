@@ -17,15 +17,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+
 
 /**
  * 内网穿透 + 文件服务器面板（Bore 隧道 — 零认证、零注册）
@@ -45,44 +44,18 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     private static final Logger logger = LogManager.getLogger(NgrokPanel.class);
 
-    // ==================== bore 资源提取 ====================
-    /** bore 二进制文件持久化目录 */
-    private static final Path BORE_EXTRACT_DIR = Paths.get(System.getProperty("user.home"), ".coretools", "bore");
-    private static final AtomicBoolean boreExtracted = new AtomicBoolean(false);
+    // ==================== bore 资源管理 ====================
+    /** 提取目录：始终在程序自身目录下（user.dir/bore/） */
+    private static final Path BORE_DIR = Paths.get(System.getProperty("user.dir"), "bore");
+    /** 已提取文件缓存：资源名 → 绝对路径 */
+    private static final Map<String, String> extractedCache = new ConcurrentHashMap<>();
 
-    /** 初次访问时从 classpath resources/bore/ 提取二进制到用户目录 */
-    private static synchronized Path ensureBoreDir() {
-        if (!boreExtracted.get()) {
-            try {
-                Files.createDirectories(BORE_EXTRACT_DIR);
-                // 列出 resources/bore/ 下的文件并提取
-                String[] boreFiles = {
-                    "bore_apple_new", "bore_apple_old",
-                    "bore_linux_arm64", "bore_linux_x86_64",
-                    "bore.exe", "bore"
-                };
-                for (String name : boreFiles) {
-                    Path target = BORE_EXTRACT_DIR.resolve(name);
-                    if (!Files.exists(target)) {
-                        try (InputStream in = NgrokPanel.class.getResourceAsStream("/bore/" + name)) {
-                            if (in != null) {
-                                Files.copy(in, target);
-                                // 设置可执行权限（Linux/macOS）
-                                target.toFile().setExecutable(true);
-                                logger.info("已提取 bore 二进制: {}", target);
-                            }
-                        }
-                    }
-                }
-                boreExtracted.set(true);
-            } catch (IOException e) {
-                logger.warn("提取 bore 二进制失败: {}", e.getMessage());
-                // 回退到旧的 bore/ 目录（开发环境兼容）
-                return Paths.get("bore").toAbsolutePath();
-            }
-        }
-        return BORE_EXTRACT_DIR;
-    }
+    /** classpath resources/bore/ 下已知的 bore 二进制文件名列表 */
+    private static final String[] KNOWN_BORE_RESOURCES = {
+        "bore_apple_new", "bore_apple_old",
+        "bore_linux_arm64", "bore_linux_x86_64",
+        "bore_windows.exe", "bore.exe", "bore"
+    };
 
     // ==================== 共享状态（AiChatPanel 通过此处获取公网 URL） ====================
 
@@ -213,6 +186,20 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     @Override
     protected void initPanel() {
+        try {
+            initPanelImpl();
+        } catch (Throwable t) {
+            logger.error("NgrokPanel 初始化失败", t);
+            // 兜底：至少显示一个错误提示面板，避免完全空白
+            setLayout(new BorderLayout());
+            JLabel errLabel = new JLabel("<html><b>NgrokPanel 初始化失败:</b><br>" + t.toString().replace("\n", "<br>") + "</html>");
+            errLabel.setForeground(Color.RED);
+            errLabel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+            add(errLabel, BorderLayout.CENTER);
+        }
+    }
+
+    private void initPanelImpl() {
         setLayout(new BorderLayout(8, 8));
         JPanel northPanel = new JPanel();
         northPanel.setLayout(new BoxLayout(northPanel, BoxLayout.Y_AXIS));
@@ -275,10 +262,11 @@ public class NgrokPanel extends AbstractCommandPanel {
         downloadBtn.addActionListener(e -> downloadBore());
         providerPanel.add(downloadBtn);
 
+
         configPanel.add(providerPanel, gbc(0, row, 4));
         row++;
 
-        // 二进制架构选择（扫描 bore/ 文件夹）
+        // 二进制架构选择（扫描 bore/ 文件夹，默认选中当前系统）
         configPanel.add(new JLabel("架构："), gbc(0, row));
         boreArchToPath = new LinkedHashMap<>(); // 父类构造函数中 initPanel() 回调时字段初始化器尚未执行
         binaryComboModel = new DefaultComboBoxModel<>();
@@ -380,7 +368,21 @@ public class NgrokPanel extends AbstractCommandPanel {
         configPanel.add(btnPanel, btnGbc);
 
         northPanel.add(configPanel);
-        add(northPanel, BorderLayout.NORTH);
+
+        // 安全软件误报提示
+        JLabel defenderHint = new JLabel("⚠ Bore 启动时可能被 Windows Defender 误拦，如弹出提示请选择允许");
+        defenderHint.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+        defenderHint.setForeground(new Color(255, 145, 0));
+        defenderHint.setAlignmentX(Component.CENTER_ALIGNMENT);
+        defenderHint.setBorder(BorderFactory.createEmptyBorder(4, 0, 2, 0));
+        northPanel.add(defenderHint);
+
+        // 北部区域可滚动
+        JScrollPane northScroll = new JScrollPane(northPanel);
+        northScroll.setBorder(null);
+        northScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        northScroll.getVerticalScrollBar().setUnitIncrement(16);
+        northScroll.setMinimumSize(new Dimension(200, 150));
 
         // ======== 中间：状态 ========
         JPanel statusPanel = new JPanel(new BorderLayout(8, 4));
@@ -414,13 +416,12 @@ public class NgrokPanel extends AbstractCommandPanel {
             }
         });
         statusPanel.add(publicUrlLabel, BorderLayout.SOUTH);
-        add(statusPanel, BorderLayout.CENTER);
 
         // ======== 底部：日志 ========
         JPanel logPanel = new JPanel(new BorderLayout());
         logPanel.setBorder(new TitledBorder("运行日志"));
 
-        logArea = new JTextArea(8, 50);
+        logArea = new JTextArea(6, 50);
         logArea.setEditable(false);
         logArea.setFont(NetUtil.FONT_TEXT);
         logArea.setBackground(UIManager.getColor("TextArea.background"));
@@ -435,7 +436,16 @@ public class NgrokPanel extends AbstractCommandPanel {
         logBtnPanel.add(clearLogBtn);
         logPanel.add(logBtnPanel, BorderLayout.SOUTH);
 
-        add(logPanel, BorderLayout.SOUTH);
+        // 状态+日志 合并到底部面板
+        JPanel bottomPanel = new JPanel(new BorderLayout());
+        bottomPanel.add(statusPanel, BorderLayout.NORTH);
+        bottomPanel.add(logPanel, BorderLayout.CENTER);
+
+        // 用 JSplitPane 分割配置区和状态/日志区，确保都可见
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, northScroll, bottomPanel);
+        splitPane.setDividerLocation(260);
+        splitPane.setResizeWeight(0.5);
+        add(splitPane, BorderLayout.CENTER);
 
         // JVM 退出时自动停止服务器（ShutdownHook 必须用平台线程，虚拟线程在 JVM 关闭时无法调度）
         Runtime.getRuntime().addShutdownHook(new Thread(NgrokPanel::shutdownAll, "file-server-shutdown"));
@@ -551,57 +561,74 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     // ==================== 路径查找 ====================
 
-    /** bore 二进制文件目录（自动从 classpath 提取到 ~/.coretools/bore/） */
-    private static Path getBoreDir() {
-        return ensureBoreDir();
-    }
-
-    /** 扫描 bore/ 文件夹，收集所有 bore 二进制文件 */
+    /** 扫描 bore 二进制并填充下拉列表（用 getResourceAsStream 检测 classpath 中存在哪些） */
     private void scanBoreBinaries() {
         boreArchToPath.clear();
         binaryComboModel.removeAllElements();
 
-        Path boreDir = getBoreDir();
-        File boreFolder = boreDir.toFile();
-        if (boreFolder.isDirectory()) {
-            File[] files = boreFolder.listFiles(File::isFile);
-            if (files != null) {
-                // 按名称排序
-                Arrays.sort(files, Comparator.comparing(File::getName));
-                for (File f : files) {
-                    String name = f.getName();
-                    // 过滤掉非 bore 文件（README, .md 等）
-                    if (name.startsWith("bore_") || name.equals("bore") || name.equals("bore.exe")) {
-                        String label = mapArchLabel(name);
-                        boreArchToPath.put(label, f.getAbsolutePath());
-                        binaryComboModel.addElement(label);
-                    }
+        for (String name : KNOWN_BORE_RESOURCES) {
+            try (InputStream in = NgrokPanel.class.getResourceAsStream("/bore/" + name)) {
+                if (in != null) {
+                    String label = mapArchLabel(name);
+                    boreArchToPath.put(label, name);
+                    binaryComboModel.addElement(label);
                 }
-            }
+            } catch (Exception ignored) {}
         }
 
-        // 如果没有扫描到任何二进制，添加一个提示项
         if (binaryComboModel.getSize() == 0) {
             binaryComboModel.addElement("未检测到 - 请点[浏览...]选择");
         }
 
-        // 恢复上次保存的选择
         String savedArch = loadSavedArch();
         if (savedArch != null && boreArchToPath.containsKey(savedArch)) {
             binaryComboModel.setSelectedItem(savedArch);
-        } else if (binaryComboModel.getSize() > 0) {
-            // 没有保存过选择 → 用 oshi 自动检测当前系统架构
+        } else {
             String autoLabel = autoSelectArchForCurrentSystem();
             if (autoLabel != null) {
                 binaryComboModel.setSelectedItem(autoLabel);
-                appendLog("自动检测系统: " + autoLabel);
             } else if (binaryComboModel.getSize() > 0) {
                 binaryComboModel.setSelectedItem(binaryComboModel.getElementAt(0));
             }
         }
     }
 
-    /** 将 bore 文件名映射为友好的架构名称 */
+    /** 从 classpath 提取 bore 二进制到程序目录，返回绝对路径 */
+    private static synchronized String extractBoreIfNeeded(String resourceName) {
+        String cached = extractedCache.get(resourceName);
+        if (cached != null && Files.exists(Paths.get(cached))) return cached;
+
+        try {
+            Files.createDirectories(BORE_DIR);
+            Path target = BORE_DIR.resolve(resourceName);
+            try (InputStream in = NgrokPanel.class.getResourceAsStream("/bore/" + resourceName)) {
+                if (in == null) return "";
+                Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+                target.toFile().setExecutable(true);
+                String abs = target.toString();
+                extractedCache.put(resourceName, abs);
+                // Windows Defender 可能误拦，尝试加入排除列表
+                addDefenderExclusion(BORE_DIR.toFile());
+                return abs;
+            }
+        } catch (IOException e) {
+            logger.error("提取 bore 失败: {}", resourceName, e);
+            return "";
+        }
+    }
+
+    /** 以管理员权限将目录加入 Windows Defender 排除列表 */
+    private static void addDefenderExclusion(File dir) {
+        try {
+            String os = System.getProperty("os.name").toLowerCase();
+            if (!os.contains("win")) return;
+            String cmd = "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList 'Add-MpPreference -ExclusionPath \"" + dir.getAbsolutePath() + "\"'";
+            new ProcessBuilder("powershell", "-Command", cmd)
+                    .redirectErrorStream(true)
+                    .start();
+        } catch (Exception ignored) {}
+    }
+
     private static String mapArchLabel(String fileName) {
         String lower = fileName.toLowerCase();
         if (lower.contains("apple_new") || (lower.contains("apple") && lower.contains("new")))
@@ -617,7 +644,7 @@ public class NgrokPanel extends AbstractCommandPanel {
         return fileName;
     }
 
-    /** 用 oshi 检测当前系统架构，从已有 bore 二进制中匹配最合适的项 */
+    /** 用 System.getProperty 检测当前系统架构，从已有 bore 二进制中匹配最合适的项 */
     private String autoSelectArchForCurrentSystem() {
         try {
             String osName = System.getProperty("os.name").toLowerCase();
@@ -633,7 +660,6 @@ public class NgrokPanel extends AbstractCommandPanel {
                     matcher = label -> label.startsWith("macOS (Intel) - ");
                 }
             } else {
-                // Linux
                 if (osArch.contains("aarch64") || osArch.contains("arm64")) {
                     matcher = label -> label.startsWith("Linux ARM64 - ");
                 } else {
@@ -653,10 +679,12 @@ public class NgrokPanel extends AbstractCommandPanel {
         Object selected = binaryComboModel.getSelectedItem();
         if (selected == null) return "";
         String label = selected.toString();
-        // 先查映射表
-        String path = boreArchToPath.get(label);
-        if (path != null) return path;
-        // fallback: 如果是选择了通过"浏览"添加的路径，直接返回 label（那本身就是路径）
+        String resourceName = boreArchToPath.get(label);
+        if (resourceName != null) {
+            // 从 classpath 提取到程序目录
+            return extractBoreIfNeeded(resourceName);
+        }
+        // 浏览添加的自定义路径
         if (new File(label).exists()) return label;
         return "";
     }
@@ -665,9 +693,6 @@ public class NgrokPanel extends AbstractCommandPanel {
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle("选择 bore 可执行文件");
         chooser.setFileHidingEnabled(false);
-        // 优先打开 bore/ 文件夹
-        File boreDir = getBoreDir().toFile();
-        if (boreDir.isDirectory()) chooser.setCurrentDirectory(boreDir);
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             String absPath = chooser.getSelectedFile().getAbsolutePath();
             String label = "自定义: " + absPath;
@@ -1175,6 +1200,7 @@ public class NgrokPanel extends AbstractCommandPanel {
     private static final DateTimeFormatter LOG_TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private void appendLog(String msg) {
+        if (logArea == null) return; // initPanel 阶段 logArea 尚未创建
         String timestamp = LOG_TIME_FMT.format(LocalTime.now());
         logArea.append(String.format("[%s] %s%n", timestamp, msg));
         logArea.setCaretPosition(logArea.getDocument().getLength());
@@ -1190,10 +1216,15 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     private static final String ARCH_CACHE_FILE = "bore_selected_arch.txt";
 
-    /** 保存当前选中的架构到缓存文件 */
+    /** 架构缓存目录 */
+    private static Path archCacheDir() {
+        return BORE_DIR;
+    }
+
+    /** 读取上次选中的架构 */
     private String loadSavedArch() {
         try {
-            Path cacheFile = getBoreDir().resolve(ARCH_CACHE_FILE);
+            Path cacheFile = archCacheDir().resolve(ARCH_CACHE_FILE);
             if (Files.exists(cacheFile)) {
                 return Files.readString(cacheFile).trim();
             }
@@ -1201,13 +1232,17 @@ public class NgrokPanel extends AbstractCommandPanel {
         return null;
     }
 
-    /** 从缓存文件读取上次选中的架构 */
+    /** 保存当前选中的架构到缓存文件 */
     private void saveSelectedArch(String archLabel) {
         try {
-            Path cacheFile = getBoreDir().resolve(ARCH_CACHE_FILE);
-            Files.writeString(cacheFile, archLabel);
+            Path dir = archCacheDir();
+            Files.createDirectories(dir);
+            Files.writeString(dir.resolve(ARCH_CACHE_FILE), archLabel);
         } catch (Exception ignored) {}
     }
+
+
+
 
     @Override
     public void loadConfig(com.szh.manager.ConfigManager config) {
