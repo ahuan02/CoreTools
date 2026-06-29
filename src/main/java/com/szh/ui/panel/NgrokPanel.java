@@ -25,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 内网穿透 + 文件服务器面板（Bore 隧道 — 零认证、零注册）
@@ -43,6 +44,45 @@ import java.util.concurrent.TimeUnit;
 public class NgrokPanel extends AbstractCommandPanel {
 
     private static final Logger logger = LogManager.getLogger(NgrokPanel.class);
+
+    // ==================== bore 资源提取 ====================
+    /** bore 二进制文件持久化目录 */
+    private static final Path BORE_EXTRACT_DIR = Paths.get(System.getProperty("user.home"), ".coretools", "bore");
+    private static final AtomicBoolean boreExtracted = new AtomicBoolean(false);
+
+    /** 初次访问时从 classpath resources/bore/ 提取二进制到用户目录 */
+    private static synchronized Path ensureBoreDir() {
+        if (!boreExtracted.get()) {
+            try {
+                Files.createDirectories(BORE_EXTRACT_DIR);
+                // 列出 resources/bore/ 下的文件并提取
+                String[] boreFiles = {
+                    "bore_apple_new", "bore_apple_old",
+                    "bore_linux_arm64", "bore_linux_x86_64",
+                    "bore.exe", "bore"
+                };
+                for (String name : boreFiles) {
+                    Path target = BORE_EXTRACT_DIR.resolve(name);
+                    if (!Files.exists(target)) {
+                        try (InputStream in = NgrokPanel.class.getResourceAsStream("/bore/" + name)) {
+                            if (in != null) {
+                                Files.copy(in, target);
+                                // 设置可执行权限（Linux/macOS）
+                                target.toFile().setExecutable(true);
+                                logger.info("已提取 bore 二进制: {}", target);
+                            }
+                        }
+                    }
+                }
+                boreExtracted.set(true);
+            } catch (IOException e) {
+                logger.warn("提取 bore 二进制失败: {}", e.getMessage());
+                // 回退到旧的 bore/ 目录（开发环境兼容）
+                return Paths.get("bore").toAbsolutePath();
+            }
+        }
+        return BORE_EXTRACT_DIR;
+    }
 
     // ==================== 共享状态（AiChatPanel 通过此处获取公网 URL） ====================
 
@@ -511,9 +551,9 @@ public class NgrokPanel extends AbstractCommandPanel {
 
     // ==================== 路径查找 ====================
 
-    /** bore/ 文件夹在项目根目录下的绝对路径 */
+    /** bore 二进制文件目录（自动从 classpath 提取到 ~/.coretools/bore/） */
     private static Path getBoreDir() {
-        return Paths.get("bore").toAbsolutePath();
+        return ensureBoreDir();
     }
 
     /** 扫描 bore/ 文件夹，收集所有 bore 二进制文件 */

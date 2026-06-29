@@ -19,30 +19,47 @@ public class ModelConfigLoader {
     /** 模型配置文件名 */
     private static final String MODELS_JSON = "models.json";
 
-    /** 项目根目录下的 models.json */
+    /** 用户目录下的 models.json（可读写，用户可修改 API Key 等） */
     private static File getRuntimeFile() {
         return new File(System.getProperty("user.dir"), MODELS_JSON);
     }
 
-    /** 加载全部模型：根目录 models.json 不存在则自动生成默认配置并写出 */
+    /** 加载全部模型：优先用户目录，其次 classpath 内置资源，最后硬编码默认配置 */
     @SuppressWarnings("unchecked")
     public static List<ModelConfig> loadAll() {
+        // 1) 优先加载用户目录下的 models.json（用户可能已修改 API Key 等）
         File runtimeFile = getRuntimeFile();
         if (runtimeFile.exists()) {
             return loadFromFile(runtimeFile);
         }
-        // 首次运行：生成默认聊天模型配置并写出到根目录
-        String defaultJson = buildDefaultModelsJson();
-        try {
-            try (Writer w = new OutputStreamWriter(
-                    new FileOutputStream(runtimeFile), StandardCharsets.UTF_8)) {
-                w.write(defaultJson);
+
+        // 2) 尝试从 classpath resources 加载内置 models.json
+        try (InputStream in = ModelConfigLoader.class.getResourceAsStream("/models.json")) {
+            if (in != null) {
+                StringBuilder sb = new StringBuilder();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
+                Map<String, Object> root = JsonUtil.parseObject(sb.toString());
+                List<Object> arr = (List<Object>) root.get("models");
+                if (arr != null) {
+                    System.out.println("[ModelConfigLoader] 从内置资源加载 models.json");
+                    List<ModelConfig> list = new ArrayList<>();
+                    for (Object obj : arr) {
+                        if (obj instanceof Map) list.add(fromMap((Map<String, Object>) obj));
+                    }
+                    // 将内置配置写出到用户目录（方便用户后续修改）
+                    saveToRuntimeFile(sb.toString());
+                    return list;
+                }
             }
-            System.out.println("[ModelConfigLoader] 已自动生成默认配置: " + runtimeFile.getAbsolutePath());
-        } catch (IOException e) {
-            System.err.println("[ModelConfigLoader] 创建 " + runtimeFile.getAbsolutePath() + " 失败: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("[ModelConfigLoader] 读取内置 models.json 失败: " + e.getMessage());
         }
-        // 直接用生成的 JSON 解析（避免写盘后重新读取）
+
+        // 3) 兜底：硬编码默认配置
+        String defaultJson = buildDefaultModelsJson();
+        saveToRuntimeFile(defaultJson);
         try {
             Map<String, Object> root = JsonUtil.parseObject(defaultJson);
             List<Object> arr = (List<Object>) root.get("models");
@@ -55,6 +72,20 @@ public class ModelConfigLoader {
         } catch (Exception e) {
             System.err.println("[ModelConfigLoader] 解析默认配置失败: " + e.getMessage());
             return List.of();
+        }
+    }
+
+    /** 将 JSON 字符串写出到用户目录下的 models.json */
+    private static void saveToRuntimeFile(String json) {
+        File runtimeFile = getRuntimeFile();
+        try {
+            try (Writer w = new OutputStreamWriter(
+                    new FileOutputStream(runtimeFile), StandardCharsets.UTF_8)) {
+                w.write(json);
+            }
+            System.out.println("[ModelConfigLoader] 已写出默认配置: " + runtimeFile.getAbsolutePath());
+        } catch (IOException e) {
+            System.err.println("[ModelConfigLoader] 创建 " + runtimeFile.getAbsolutePath() + " 失败: " + e.getMessage());
         }
     }
 
